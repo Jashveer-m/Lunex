@@ -17,6 +17,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 	"github.com/jashveer/lifeos/backend/internal/users"
@@ -69,10 +70,29 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	// tests run against a deterministic embedder: what these tests measure is
 	// the routing and the SQL scoping, not whether a model understood a
 	// sentence. The genuine end-to-end check is scripts/e2e.sh.
+	// Phase 5 runs on the same mock model and the same deterministic embedder:
+	// what these tests measure is whether a memory belongs to the caller and
+	// reaches the right prompt, not whether a model chose a good fact.
+	memorySvc := memories.NewService(memories.Deps{
+		Store: memories.NewRepository(pool), Provider: provider, Embedder: &hashingEmbedder{},
+		Logger: discard,
+	})
 	chatSvc := chat.NewService(chat.Deps{
 		Store: chat.NewRepository(pool), Provider: provider,
-		Documents: docSvc, Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc,
+		Documents: docSvc, Memories: memorySvc, MemoryExtractor: memorySvc,
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc,
 		Logger: discard,
+		Options: chat.Options{
+			// The memory floor is named here rather than left at its default.
+			// memories.DefaultMinSimilarity is calibrated for
+			// nomic-embed-text; hashingEmbedder is a bag of words, and its
+			// scores are on a different scale, so carrying the production
+			// number over would be testing an arbitrary threshold. What these
+			// tests measure is whose memories are searched and where the
+			// retrieved ones end up -- the floor itself is pinned in
+			// internal/chat and internal/db, against numbers those tests set.
+			MemoryMinSimilarity: 0.5,
+		},
 	})
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(svc, discard),
@@ -81,6 +101,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Notes:       notes.NewHandler(noteSvc, discard),
 		Documents:   documents.NewHandler(docSvc, discard, 0),
 		Chat:        chat.NewHandler(chatSvc, discard),
+		Memories:    memories.NewHandler(memorySvc, discard),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(100, 100),
 		DB:          pool, // nil degrades healthz to a liveness check
@@ -241,6 +262,10 @@ func TestResourceRoutesRequireAuth(t *testing.T) {
 		{http.MethodGet, "/api/v1/conversations/" + id},
 		{http.MethodDelete, "/api/v1/conversations/" + id},
 		{http.MethodPost, "/api/v1/conversations/" + id + "/messages"},
+		{http.MethodGet, "/api/v1/memories"},
+		{http.MethodDelete, "/api/v1/memories"},
+		{http.MethodPatch, "/api/v1/memories/" + id},
+		{http.MethodDelete, "/api/v1/memories/" + id},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			resp, _ := doJSON(t, srv, tc.method, tc.path, "", nil)

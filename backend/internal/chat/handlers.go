@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jashveer/lifeos/backend/internal/httpx"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 )
 
 // Handler adapts Service to HTTP.
@@ -93,6 +94,27 @@ type doneEvent struct {
 	UserMessage    messageResponse `json:"user_message"`
 	Message        messageResponse `json:"message"`
 	Model          string          `json:"model"`
+	// Remembered is what the assistant learned from this exchange, so a client
+	// can show it. It is [] on the great majority of turns. The full record,
+	// with the scores and the switches, is at /api/v1/memories -- this is the
+	// notification, not the management surface.
+	Remembered []rememberedResponse `json:"remembered"`
+}
+
+// rememberedResponse is one newly stored memory, reported on the turn that
+// produced it.
+type rememberedResponse struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Content string `json:"content"`
+}
+
+func toRememberedResponse(stored []memories.Memory) []rememberedResponse {
+	out := make([]rememberedResponse, 0, len(stored))
+	for _, m := range stored {
+		out = append(out, rememberedResponse{ID: m.ID.String(), Type: m.Type, Content: m.Content})
+	}
+	return out
 }
 
 func toResponse(c Conversation, withMessages bool) conversationResponse {
@@ -258,6 +280,7 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		UserMessage:    toMessageResponse(turn.User),
 		Message:        toMessageResponse(turn.Assistant),
 		Model:          turn.Model,
+		Remembered:     toRememberedResponse(turn.Remembered),
 	})
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
@@ -233,4 +234,70 @@ func (f *fakeNotes) List(_ context.Context, userID uuid.UUID, filter notes.Filte
 		return nil, f.err
 	}
 	return f.byUser[userID], nil
+}
+
+// --- Phase 5 fakes ----------------------------------------------------------
+
+type fakeMemories struct {
+	mu      sync.Mutex
+	byUser  map[uuid.UUID][]memories.SearchResult
+	err     error
+	callers []uuid.UUID
+	queries []memories.SearchQuery
+}
+
+func (f *fakeMemories) Search(_ context.Context, userID uuid.UUID, q memories.SearchQuery) ([]memories.SearchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callers = append(f.callers, userID)
+	f.queries = append(f.queries, q)
+	if f.err != nil {
+		return nil, f.err
+	}
+	// The floor is applied here as well as recorded, so a test can seed a weak
+	// match and see it dropped rather than only assert on the query.
+	out := []memories.SearchResult{}
+	for _, m := range f.byUser[userID] {
+		if m.Similarity < q.MinSimilarity {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// fakeExtractor records what the orchestrator handed it after a turn.
+type fakeExtractor struct {
+	mu    sync.Mutex
+	calls []extraction
+	err   error
+	// stored is what the extractor claims to have written.
+	stored []memories.Memory
+}
+
+type extraction struct {
+	userID    uuid.UUID
+	convID    uuid.UUID
+	question  string
+	answer    string
+	ctxWasSet bool
+}
+
+func (f *fakeExtractor) ExtractFromTurn(ctx context.Context, userID, convID uuid.UUID, question, answer string) ([]memories.Memory, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, extraction{
+		userID: userID, convID: convID, question: question, answer: answer,
+		ctxWasSet: ctx != nil,
+	})
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.stored, nil
+}
+
+func (f *fakeExtractor) seen() []extraction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]extraction(nil), f.calls...)
 }

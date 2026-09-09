@@ -240,3 +240,49 @@ func TestOllamaRejectsAnEmptyPrompt(t *testing.T) {
 		t.Fatal("want an error for an empty prompt")
 	}
 }
+
+// JSON mode is the difference between asking a model for JSON and constraining
+// it to produce JSON, and the memory extractor depends on it. It must be sent
+// only when a caller asked for it: an ordinary chat turn constrained to JSON
+// would answer every question with a quoted string.
+func TestOllamaSendsFormatOnlyWhenAsked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts Options
+		want string
+	}{
+		{"an ordinary turn", Options{}, ""},
+		{"the extractor", Options{Format: FormatJSON}, "json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			provider := serve(t, func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				io.WriteString(w, frames("ok"))
+			})
+
+			stream, err := provider.Chat(context.Background(),
+				[]Message{{Role: RoleUser, Content: "hi"}}, tc.opts)
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			defer stream.Close()
+			if _, err := Collect(stream); err != nil {
+				t.Fatal(err)
+			}
+
+			got, present := body["format"]
+			if tc.want == "" {
+				if present {
+					t.Fatalf("format = %v, want the field absent", got)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("format = %v, want %q", got, tc.want)
+			}
+		})
+	}
+}

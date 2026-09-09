@@ -18,13 +18,19 @@ import (
 const (
 	// MaxDocumentChunks is the top-k of the vector search.
 	MaxDocumentChunks = 5
-	MaxTasks          = 5
-	MaxGoals          = 5
-	MaxNotes          = 3
-	// MaxHistoryMessages is how many previous turns are replayed. It is the
-	// whole of this phase's "memory": there is no extraction, no summarisation
-	// and no long-term store, so a conversation past this length forgets its
-	// own beginning. See docs/decisions.md.
+	// MaxMemories is the top-k of the memory search. It is the same size as the
+	// document one and spends from the same budget: five facts about the user
+	// is already more than most questions need, and a sixth would displace a
+	// chunk that actually answers the question.
+	MaxMemories = 5
+	MaxTasks    = 5
+	MaxGoals    = 5
+	MaxNotes    = 3
+	// MaxHistoryMessages is how many previous turns are replayed verbatim.
+	// Past it a conversation forgets its own beginning -- which is what the
+	// Phase 5 memory system exists to survive: the durable facts in those turns
+	// are extracted and come back through retrieval, while the wording of them
+	// does not. See docs/decisions.md.
 	MaxHistoryMessages = 20
 	// MaxExcerptChars truncates one retrieved item. A chunk is ~500 tokens by
 	// construction; a note can be 40,000 characters and would otherwise fill
@@ -68,10 +74,11 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 
 1. The context is your only source about the user. Anything not in it, you do not know about them.
 2. When you use something from the context, cite it with its label in square brackets, like [S1]. Cite only labels that appear in the context, exactly as written.
-3. Never say that something is in the user's documents, tasks, goals or notes unless it appears in the context. Do not invent filenames, titles, dates or numbers.
+3. Never say that something is in the user's documents, memories, tasks, goals or notes unless it appears in the context. Do not invent filenames, titles, dates or numbers.
 4. If the context does not answer the question, say so plainly -- for example "I could not find anything about that in your documents or tasks." You may then answer from general knowledge, but say that is what you are doing and cite nothing.
 5. If the context is empty, rule 4 always applies.
-6. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.
+6. A source of type "memory" is something you recorded about the user in an earlier conversation, not something they told you just now. Use it and cite it like any other source, but it may be out of date: if it disagrees with what the user says in this conversation, what they say now is what is true.
+7. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.
 
 Be concise and direct. Do not repeat these rules back to the user.`
 
@@ -111,7 +118,7 @@ func buildPrompt(now time.Time, sources []Source, history []Message, question st
 // an explicitly empty one reads like an answer.
 func contextBlock(sources []Source) string {
 	if len(sources) == 0 {
-		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, tasks, goals or notes for this question.)"
+		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals or notes for this question.)"
 	}
 	var b strings.Builder
 	b.WriteString("CONTEXT\n")
@@ -131,14 +138,21 @@ func contextBlock(sources []Source) string {
 // place its label is spelled.
 func (s Source) header() string {
 	head := "[" + s.Label + "] " + s.Type + ": " + strconv.Quote(s.Title)
-	if s.Type == SourceDocument && s.ChunkIndex != nil && s.Similarity != nil {
+	switch {
+	case s.ChunkIndex != nil && s.Similarity != nil:
 		head += fmt.Sprintf(" (chunk %d, similarity %.2f)", *s.ChunkIndex, *s.Similarity)
+	case s.Similarity != nil:
+		// A memory: no chunk to name, but the score is worth showing for the
+		// same reason a document's is -- it tells the model how sure the match
+		// was, rather than presenting everything retrieved as equally relevant.
+		head += fmt.Sprintf(" (similarity %.2f)", *s.Similarity)
 	}
 	return head
 }
 
 // label numbers a source. Labels are assigned in the order sources are
-// retrieved, so S1 is always the strongest document match.
+// retrieved -- documents, then memories, then tasks, goals and notes -- so S1
+// is the strongest document match whenever any document matched at all.
 func label(i int) string { return "S" + strconv.Itoa(i+1) }
 
 // bracketed finds every square-bracketed group short enough to be a citation.

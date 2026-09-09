@@ -67,7 +67,7 @@ func TestMigrationsUpDownUp(t *testing.T) {
 	}
 	// Bump this with every migration added; a stale value here is how a
 	// migration that never runs in CI goes unnoticed.
-	const wantVersion = 4
+	const wantVersion = 5
 	if version != wantVersion || dirty {
 		t.Fatalf("version = %d dirty = %t, want %d / false", version, dirty, wantVersion)
 	}

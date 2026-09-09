@@ -7,6 +7,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/chat"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 )
 
 const validSecret = "0123456789abcdef0123456789abcdef" // 32 bytes
@@ -153,5 +154,80 @@ func TestWriteTimeoutCoversTheLongestRequest(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want at least %v", got, tc.wantAtLeast)
 			}
 		})
+	}
+}
+
+// --- Phase 5 ---------------------------------------------------------------
+
+func TestMemoryDefaults(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
+	t.Setenv("JWT_SECRET", validSecret)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Extraction is on by default: an assistant that never learns anything is
+	// the Phase 4 assistant, and this phase is the one that changes that.
+	if !cfg.MemoryExtraction {
+		t.Fatal("memory extraction defaults to off")
+	}
+	if cfg.MemoryModel != "" {
+		t.Fatalf("MemoryModel = %q, want empty -- the chat model extracts unless told otherwise", cfg.MemoryModel)
+	}
+	if cfg.MemoryMinSimilarity != memories.DefaultMinSimilarity {
+		t.Fatalf("MemoryMinSimilarity = %v, want %v", cfg.MemoryMinSimilarity, memories.DefaultMinSimilarity)
+	}
+	// The floors are tuned separately, and the memory one is the higher of the
+	// two; see memories.DefaultMinSimilarity.
+	if cfg.MemoryMinSimilarity <= cfg.ChatMinSimilarity {
+		t.Fatalf("the memory floor (%v) is not above the document floor (%v)",
+			cfg.MemoryMinSimilarity, cfg.ChatMinSimilarity)
+	}
+	// Extraction has to finish inside the turn it runs in.
+	if cfg.MemoryExtractTimeout >= cfg.ChatTimeout {
+		t.Fatalf("MemoryExtractTimeout (%v) does not fit inside ChatTimeout (%v)",
+			cfg.MemoryExtractTimeout, cfg.ChatTimeout)
+	}
+}
+
+func TestMemoryKnobsAreBounded(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
+	t.Setenv("JWT_SECRET", validSecret)
+
+	for _, tc := range []struct{ key, value string }{
+		{"MEMORY_MIN_SIMILARITY", "1.5"},
+		{"MEMORY_MIN_SIMILARITY", "-0.2"},
+		{"MEMORY_MIN_SIMILARITY", "close enough"},
+		{"MEMORY_TEMPERATURE", "9"},
+		{"MEMORY_MAX_TOKENS", "0"},
+		{"MEMORY_EXTRACT_TIMEOUT", "a minute"},
+		// The one that would otherwise fail silently: a value that is not a
+		// boolean must not quietly switch the feature off.
+		{"MEMORY_EXTRACTION", "no"},
+		{"MEMORY_EXTRACTION", "off"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("err = %v, want a %s error", err, tc.key)
+			}
+		})
+	}
+
+	t.Setenv("MEMORY_MIN_SIMILARITY", "0.7")
+	t.Setenv("MEMORY_TEMPERATURE", "0")
+	t.Setenv("MEMORY_MAX_TOKENS", "256")
+	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "20s")
+	t.Setenv("MEMORY_EXTRACTION", "false")
+	t.Setenv("MEMORY_MODEL", "qwen2.5:1.5b")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MemoryMinSimilarity != 0.7 || cfg.MemoryMaxTokens != 256 ||
+		cfg.MemoryExtractTimeout != 20*time.Second || cfg.MemoryExtraction ||
+		cfg.MemoryModel != "qwen2.5:1.5b" {
+		t.Fatalf("cfg = %+v, want the values from the environment", cfg)
 	}
 }

@@ -10,14 +10,16 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
-// The four things the orchestrator can retrieve from. Each is the narrowest
-// slice of an existing Phase 2/3 service, and each takes the owner id as an
-// argument -- so the orchestrator cannot reach another user's data even by
-// mistake, for the same structural reason the repositories cannot.
+// The five things the orchestrator can retrieve from, and the one thing it
+// writes to. Each is the narrowest slice of an existing Phase 2/3/5 service,
+// and each takes the owner id as an argument -- so the orchestrator cannot
+// reach another user's data even by mistake, for the same structural reason the
+// repositories cannot.
 //
 // They are interfaces rather than concrete *documents.Service and friends so
 // the orchestrator's tests can hand it a corpus without a database.
@@ -26,6 +28,20 @@ type (
 	// rather than over HTTP.
 	DocumentSearcher interface {
 		Search(ctx context.Context, userID uuid.UUID, q documents.SearchQuery) ([]documents.SearchResult, error)
+	}
+	// MemorySearcher is Phase 5's search over what the assistant has learned
+	// about this user in earlier conversations.
+	MemorySearcher interface {
+		Search(ctx context.Context, userID uuid.UUID, q memories.SearchQuery) ([]memories.SearchResult, error)
+	}
+	// MemoryExtractor is the other half of Phase 5: it reads a finished
+	// exchange and stores the durable facts in it. It is separate from
+	// MemorySearcher rather than one interface with two methods because the two
+	// are independently switchable -- an operator who wants the assistant to
+	// use what it already knows without learning anything new wires the first
+	// and not the second (MEMORY_EXTRACTION=false).
+	MemoryExtractor interface {
+		ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]memories.Memory, error)
 	}
 	TaskLister interface {
 		List(ctx context.Context, userID uuid.UUID, f tasks.Filter) ([]tasks.Task, error)
@@ -39,15 +55,20 @@ type (
 )
 
 // retrieve gathers the context for one question, strongest first: document
-// chunks that actually match it, then the user's current tasks, goals and
-// notes.
+// chunks that actually match it, then the memories that match it, then the
+// user's current tasks, goals and notes.
 //
-// Documents are matched semantically. Tasks, goals and notes are not -- they
-// are selected by a plain heuristic (in progress, due soonest, recently
-// touched), because they have no embeddings in this phase. That difference is
-// visible to the model: a chunk arrives with a similarity score, an item
-// arrives as background the question may or may not be about, and the system
-// prompt forbids citing anything that does not answer the question.
+// Documents and memories are matched semantically. Tasks, goals and notes are
+// not -- they are selected by a plain heuristic (in progress, due soonest,
+// recently touched), because they have no embeddings yet. That difference is
+// visible to the model: a chunk or a memory arrives with a similarity score, an
+// item arrives as background the question may or may not be about, and the
+// system prompt forbids citing anything that does not answer the question.
+//
+// Memories come after documents and before the heuristic items because that is
+// their standing: a fact the assistant recorded about the user is stronger
+// evidence than "here is a task you have open", and weaker than the user's own
+// document saying so.
 //
 // Any retrieval failure fails the whole turn. Answering without the tasks
 // table because its query errored would produce "I could not find anything in
@@ -72,6 +93,12 @@ func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question strin
 			Excerpt: truncate(r.Content, MaxExcerptChars),
 		})
 	}
+
+	remembered, err := s.recall(ctx, userID, question)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, remembered...)
 
 	found2, err := s.currentTasks(ctx, userID)
 	if err != nil {
@@ -104,6 +131,35 @@ func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question strin
 	}
 
 	return labelled(out), nil
+}
+
+// recall is the memory half of retrieval. It is a no-op when no memory service
+// is wired, which is what an assistant with the memory system switched off
+// looks like: it retrieves documents and items exactly as Phase 4 did.
+//
+// The memory's type becomes the source title, because a memory has no title of
+// its own and its type is the one word that says what kind of claim it is.
+func (s *Service) recall(ctx context.Context, userID uuid.UUID, question string) ([]Source, error) {
+	if s.memories == nil {
+		return nil, nil
+	}
+	found, err := s.memories.Search(ctx, userID, memories.SearchQuery{
+		Query:         truncate(question, memories.MaxQueryLen),
+		Limit:         MaxMemories,
+		MinSimilarity: s.opts.MemoryMinSimilarity,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve memories: %w", err)
+	}
+	out := make([]Source, 0, len(found))
+	for _, m := range found {
+		sim := m.Similarity
+		out = append(out, Source{
+			Type: SourceMemory, ID: m.ID, Title: m.Type, Similarity: &sim,
+			Excerpt: truncate(m.Content, MaxExcerptChars),
+		})
+	}
+	return out, nil
 }
 
 // currentTasks is the task heuristic: what the user is working on, then what

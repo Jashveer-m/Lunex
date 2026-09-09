@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# End-to-end check for the Phase 3 retrieval pipeline and the Phase 4
-# assistant.
+# End-to-end check for the Phase 3 retrieval pipeline, the Phase 4 assistant
+# and the Phase 5 memory system.
 #
 # Boots the API against TEST_DATABASE_URL, registers a user, uploads a small
 # text file, searches for a phrase from it, then asks the assistant two
 # questions: one the document answers -- which must come back citing it -- and
 # one nothing in the corpus answers, which must come back citing nothing.
+#
+# Then the memory check: a conversation that states a durable fact about the
+# user, a look at what was extracted from it, and a *separate* conversation
+# whose answer must retrieve and cite that memory -- followed by switching the
+# memory off and watching the assistant stop using it.
+#
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
-# generation.
+# generation, real extraction.
 #
 #   ./scripts/e2e.sh
 #
@@ -135,14 +141,23 @@ done, err, srcs = by("done"), by("error"), by("sources")
 if err:
     sys.exit("stream failed: %s" % err)
 sources = (done or {}).get("message", {}).get("sources", [])
+memories = [s for s in sources if s["type"] == "memory"]
 out = {
     "answer": answer,
     "source_count": len(sources),
     "sources_event_count": (srcs or {}).get("count", -1),
     "cited": ",".join(s["title"] for s in sources if s["cited"]),
     "titles": ",".join(s["title"] for s in sources),
+    "types": ",".join(s["type"] for s in sources),
     "first_event": events[0][0] if events else "",
     "model": (done or {}).get("model", ""),
+    # Phase 5: what was retrieved from memory, what of it the answer used, and
+    # what the turn itself put into memory.
+    "memory_count": len(memories),
+    "memories": " | ".join(s["excerpt"] for s in memories),
+    "memories_cited": len([s for s in memories if s["cited"]]),
+    "remembered": " | ".join(m["content"] for m in (done or {}).get("remembered", [])),
+    "remembered_count": len((done or {}).get("remembered", [])),
 }
 print(out[want])
 PYEOF
@@ -215,6 +230,115 @@ echo "${CONV_BODY}" | json 'd["title"]' | grep -qi "field notes" \
   || fail "the conversation was not named from its first question"
 ok "two turns stored in order, sources on the grounded answer only"
 
+# --- Phase 5: the memory system ---------------------------------------------
+#
+# The check the phase turns on: a fact stated in one conversation has to reach
+# the prompt of a different one, be used, and be cited -- with nothing shared
+# between the two conversations but the memory itself.
+
+step "Stating a durable fact in a new conversation"
+MEM_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+[ -n "${MEM_CONV}" ] || fail "conversation was not created"
+
+STATING="$(mktemp)"
+# A plain statement, not a question about the user's own data. Asking one --
+# "plan my week around this" -- makes the assistant answer "I could not find
+# anything about your schedule", and llama3.2:3b then reads that sentence as
+# evidence that the exchange contained nothing worth keeping. See
+# docs/decisions.md.
+ask "${MEM_CONV}" "Something to keep in mind about me: I always study in the early morning before class, and this term's systems programming coursework is in Rust." "${STATING}"
+sse "${STATING}" answer >/dev/null || fail "the stating turn failed"
+ok "stated the fact, assistant answered"
+printf '     %s\n' "$(sse "${STATING}" answer | tr '\n' ' ' | head -c 200)"
+
+step "Checking what was extracted"
+MEMS=$(curl -s "${API}/api/v1/memories" -H "${AUTH}")
+MEM_COUNT=$(echo "${MEMS}" | json 'd["count"]')
+[ "${MEM_COUNT}" -ge 1 ] \
+  || fail "nothing was extracted from an exchange stating a durable fact: ${MEMS}"
+
+echo "${MEMS}" | json '" | ".join(m["content"] for m in d["memories"])' | grep -qi "morning\|rust\|stud" \
+  || fail "the extracted memories are not about what was said: $(echo "${MEMS}" | json 'd["memories"]')"
+
+# Every memory carries the conversation it came from, a type from the closed
+# set, and scores inside [0, 1] -- the columns the CHECK constraints guard.
+echo "${MEMS}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+kinds = {"episodic", "semantic", "preference", "project", "goal"}
+for m in d["memories"]:
+    assert m["type"] in kinds, "unknown type %r" % m["type"]
+    assert 0 <= m["importance"] <= 1, "importance out of range: %r" % m["importance"]
+    assert 0 <= m["confidence"] <= 1, "confidence out of range: %r" % m["confidence"]
+    assert m["source_conversation_id"], "memory has no provenance: %r" % m
+    assert m["enabled"] is True, "a new memory is not enabled: %r" % m
+' || fail "an extracted memory is malformed: ${MEMS}"
+
+ok "extracted ${MEM_COUNT} memory/memories"
+echo "${MEMS}" | python3 -c '
+import sys, json
+for m in json.load(sys.stdin)["memories"]:
+    print("     %-11s %.2f/%.2f  %s" % (m["type"], m["importance"], m["confidence"], m["content"]))
+'
+
+step "Asking about it in a different conversation"
+# A brand new conversation: no shared history, so anything the assistant knows
+# here came out of the memory store.
+RECALL_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+RECALL="$(mktemp)"
+ask "${RECALL_CONV}" "What time of day do I prefer to study, and what language am I using for my coursework?" "${RECALL}"
+
+MEM_RETRIEVED=$(sse "${RECALL}" memory_count)
+[ "${MEM_RETRIEVED}" -ge 1 ] \
+  || fail "the new conversation retrieved no memories: types=$(sse "${RECALL}" types)"
+[ "$(sse "${RECALL}" memories_cited)" -ge 1 ] \
+  || fail "the answer did not cite the memory it was given: $(sse "${RECALL}" answer)"
+RECALL_ANSWER="$(sse "${RECALL}" answer)"
+echo "${RECALL_ANSWER}" | grep -qi "morning\|rust" \
+  || fail "the answer does not use what was remembered: ${RECALL_ANSWER}"
+ok "retrieved ${MEM_RETRIEVED} memory/memories in a fresh conversation and cited one"
+printf '     %s\n' "$(sse "${RECALL}" memories | head -c 200)"
+printf '     %s\n' "$(echo "${RECALL_ANSWER}" | tr '\n' ' ' | head -c 260)"
+
+step "Switching the memories off"
+# All of them, so the assertion below can be "nothing was retrieved" rather
+# than "the one I disabled was missing from a list of several".
+for id in $(echo "${MEMS}" | json '" ".join(m["id"] for m in d["memories"])'); do
+  curl -s -o /dev/null -w '%{http_code}' -X PATCH "${API}/api/v1/memories/${id}" -H "${AUTH}" \
+    -H 'Content-Type: application/json' -d '{"enabled":false}' | grep -q 200 \
+    || fail "PATCH /memories/${id} did not return 200"
+done
+
+OFF_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+OFF="$(mktemp)"
+ask "${OFF_CONV}" "What time of day do I prefer to study, and what language am I using for my coursework?" "${OFF}"
+[ "$(sse "${OFF}" memory_count)" = "0" ] \
+  || fail "a disabled memory was still retrieved: $(sse "${OFF}" memories)"
+
+# Switched off, not deleted: still listed, and listed as disabled.
+[ "$(curl -s "${API}/api/v1/memories" -H "${AUTH}" | json 'd["count"]')" = "${MEM_COUNT}" ] \
+  || fail "disabling a memory removed it from the list"
+[ "$(curl -s "${API}/api/v1/memories?enabled=true" -H "${AUTH}" | json 'd["count"]')" = "0" ] \
+  || fail "a disabled memory is still listed as enabled"
+ok "disabled memories are out of retrieval and still on the list"
+
+step "Forgetting everything"
+curl -s -o /dev/null -w '%{http_code}' -X DELETE "${API}/api/v1/memories" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{"confirm":false}' | grep -q 400 \
+  || fail "an unconfirmed clear was not rejected"
+[ "$(curl -s "${API}/api/v1/memories" -H "${AUTH}" | json 'd["count"]')" = "${MEM_COUNT}" ] \
+  || fail "an unconfirmed clear deleted memories"
+
+DELETED=$(curl -s -X DELETE "${API}/api/v1/memories" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{"confirm":true}' | json 'd["deleted"]')
+[ "${DELETED}" = "${MEM_COUNT}" ] || fail "cleared ${DELETED} memories, want ${MEM_COUNT}"
+[ "$(curl -s "${API}/api/v1/memories" -H "${AUTH}" | json 'd["count"]')" = "0" ] \
+  || fail "memories survived a confirmed clear"
+ok "confirmed clear removed all ${DELETED}"
+
 step "Deleting the document"
 curl -s -o /dev/null -w '%{http_code}' -X DELETE "${API}/api/v1/documents/${DOC_ID}" -H "${AUTH}" \
   | grep -q 204 || fail "delete did not return 204"
@@ -222,4 +346,4 @@ LEFT=$(psql "${DB}" -tAc 'SELECT count(*) FROM document_chunks')
 [ "${LEFT}" = "0" ] || fail "${LEFT} chunks survived the deleted document"
 ok "document deleted, chunks cascaded"
 
-printf '\n\033[32mPASS\033[0m upload -> extract -> chunk -> embed -> store -> retrieve -> ask -> cite\n'
+printf '\n\033[32mPASS\033[0m upload -> extract -> chunk -> embed -> store -> retrieve -> ask -> cite -> remember -> recall\n'

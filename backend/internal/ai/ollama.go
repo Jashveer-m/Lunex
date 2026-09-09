@@ -70,7 +70,10 @@ type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []wireMessage `json:"messages"`
 	Stream   bool          `json:"stream"`
-	Options  *wireOptions  `json:"options,omitempty"`
+	// Format is Ollama's structured-output switch. Sent only when the caller
+	// asked for one, so an ordinary chat turn's request is unchanged.
+	Format  string       `json:"format,omitempty"`
+	Options *wireOptions `json:"options,omitempty"`
 }
 
 type wireMessage struct {
@@ -106,7 +109,7 @@ func (o *Ollama) Chat(ctx context.Context, msgs []Message, opts Options) (Stream
 	for i, m := range msgs {
 		wire[i] = wireMessage{Role: m.Role, Content: m.Content}
 	}
-	req := chatRequest{Model: o.model, Messages: wire, Stream: true}
+	req := chatRequest{Model: o.model, Messages: wire, Stream: true, Format: opts.Format}
 	if opts.Model != "" {
 		req.Model = opts.Model
 	}

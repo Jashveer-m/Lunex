@@ -2,15 +2,18 @@
 // orchestrator that grounds an answer in the user's own data.
 //
 // The orchestrator is the core of the package. For each user message it
-// retrieves document chunks through internal/documents' service-level search,
-// picks up the user's current tasks, goals and notes, assembles a prompt, and
-// streams the model's reply back while recording exactly what was retrieved
-// and which of it the answer actually cited.
+// retrieves document chunks through internal/documents' service-level search
+// and long-term facts through internal/memories', picks up the user's current
+// tasks, goals and notes, assembles a prompt, and streams the model's reply
+// back while recording exactly what was retrieved and which of it the answer
+// actually cited. When the turn is done it hands the exchange to the memory
+// extractor, which is the only writing this package does and the only one that
+// cannot fail the request.
 //
-// What it deliberately is not: there is no memory extraction, no agents, no
-// knowledge graph and no action engine. The assistant reads and answers. It
-// cannot create, modify or delete anything, and the system prompt says so, so
-// a user who asks for an action is told rather than quietly ignored.
+// What it deliberately is not: there are no agents, no knowledge graph and no
+// action engine. The assistant reads and answers. It cannot create, modify or
+// delete tasks, goals, notes or documents, and the system prompt says so, so a
+// user who asks for an action is told rather than quietly ignored.
 package chat
 
 import (
@@ -79,6 +82,7 @@ type NewMessage struct {
 // The kinds of thing that can ground an answer.
 const (
 	SourceDocument = "document"
+	SourceMemory   = "memory"
 	SourceTask     = "task"
 	SourceGoal     = "goal"
 	SourceNote     = "note"
@@ -91,16 +95,19 @@ const (
 // wire shape at once, so what the API returns is what the column holds.
 type Source struct {
 	Type string `json:"type"`
-	// ID is the document, task, goal or note id -- something the client can
-	// follow to the underlying record.
+	// ID is the document, memory, task, goal or note id -- something the client
+	// can follow to the underlying record.
 	ID uuid.UUID `json:"id"`
 	// Label is the marker the prompt showed the model ("S1", "S2", ...). It is
 	// stored because Cited is derived from finding it in the answer, and
 	// because a client rendering "[S1]" needs to know what S1 was.
 	Label string `json:"label"`
-	// Title is the filename, or the task/goal/note title.
+	// Title is the filename, the task/goal/note title, or -- for a memory,
+	// which has no title -- its type.
 	Title string `json:"title"`
-	// ChunkIndex and Similarity are set for documents only.
+	// ChunkIndex is set for documents only. Similarity is set for everything
+	// retrieved semantically, which is documents and memories; the task, goal
+	// and note heuristic has no score to report.
 	ChunkIndex *int     `json:"chunk_index,omitempty"`
 	Similarity *float64 `json:"similarity,omitempty"`
 	// Excerpt is the text the model was actually shown, truncated the same way

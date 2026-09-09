@@ -16,6 +16,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
@@ -28,6 +29,7 @@ type Deps struct {
 	Notes       *notes.Handler
 	Documents   *documents.Handler
 	Chat        *chat.Handler
+	Memories    *memories.Handler
 	Tokens      *auth.TokenIssuer
 	RateLimiter *auth.IPRateLimiter
 	DB          *sql.DB
@@ -93,6 +95,13 @@ func NewRouter(d Deps) http.Handler {
 			r.Mount("/tasks", d.Tasks.Routes())
 			r.Mount("/goals", d.Goals.Routes())
 			r.Mount("/notes", d.Notes.Routes())
+
+			// Phase 5. Managing memories is database work: listing, editing
+			// and deleting rows. The model and the embedder are only involved
+			// in the chat turn that creates one -- and in the re-embed a PATCH
+			// to `content` triggers, which is a single vector and comfortably
+			// inside the ordinary budget.
+			r.Mount("/memories", d.Memories.Routes())
 		})
 
 		// Phase 3. The upload pipeline runs inside the request -- extract,

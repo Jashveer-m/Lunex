@@ -12,6 +12,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 )
 
 type Config struct {
@@ -49,6 +50,33 @@ type Config struct {
 	// not shown to the model at all, which is the main defence against an
 	// unrelated question coming back with a confident citation.
 	ChatMinSimilarity float64
+
+	// Phase 5: the memory system.
+	//
+	// MemoryExtraction switches the *writing* half on and off. Retrieval is
+	// always wired: an assistant that has memories should use them, and one
+	// with none loses nothing by looking. Extraction is the half that costs a
+	// second model call on every substantial turn, so it is the half with a
+	// switch.
+	MemoryExtraction bool
+	// MemoryModel overrides the chat model for extraction. Empty means the
+	// same model answers and extracts. A smaller one is a reasonable choice:
+	// extraction reads and classifies, it does not converse.
+	MemoryModel string
+	// MemoryExtractTimeout bounds one extraction. It is the latency memory adds
+	// to the end of a chat turn, so it is the knob to turn when `done` arrives
+	// too late -- and it fits inside ChatTimeout, since extraction runs on the
+	// turn's own context.
+	MemoryExtractTimeout time.Duration
+	MemoryMaxTokens      int
+	MemoryTemperature    float64
+	// MemoryJSONMode asks the provider to constrain extraction to well-formed
+	// JSON. Off by default: it makes llama3.2:3b strictly worse. See
+	// memories.Options.JSONMode.
+	MemoryJSONMode bool
+	// MemoryMinSimilarity is the retrieval floor for memories, separate from
+	// the document floor and higher; see memories.DefaultMinSimilarity.
+	MemoryMinSimilarity float64
 }
 
 // WriteTimeout is how long the HTTP server will spend producing a response.
@@ -89,6 +117,12 @@ func Load() (Config, error) {
 		ChatTemperature:   0.2, // low: the assistant quotes the user's own data back
 		ChatMaxTokens:     1024,
 		ChatMinSimilarity: chat.DefaultMinSimilarity,
+
+		MemoryExtraction:    true,
+		MemoryModel:         os.Getenv("MEMORY_MODEL"),
+		MemoryMaxTokens:     memories.DefaultExtractionMaxTokens,
+		MemoryTemperature:   memories.DefaultExtractionTemperature,
+		MemoryMinSimilarity: memories.DefaultMinSimilarity,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -120,6 +154,28 @@ func Load() (Config, error) {
 	// floor admits everything and is never what an operator means.
 	if cfg.ChatMinSimilarity, err = floatOr("CHAT_MIN_SIMILARITY", cfg.ChatMinSimilarity, 0, 1); err != nil {
 		return Config{}, err
+	}
+	if cfg.MemoryExtractTimeout, err = durationOr("MEMORY_EXTRACT_TIMEOUT", memories.DefaultExtractionTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.MemoryTemperature, err = floatOr("MEMORY_TEMPERATURE", cfg.MemoryTemperature, 0, 2); err != nil {
+		return Config{}, err
+	}
+	if cfg.MemoryMinSimilarity, err = floatOr("MEMORY_MIN_SIMILARITY", cfg.MemoryMinSimilarity, 0, 1); err != nil {
+		return Config{}, err
+	}
+	if cfg.MemoryExtraction, err = boolOr("MEMORY_EXTRACTION", cfg.MemoryExtraction); err != nil {
+		return Config{}, err
+	}
+	if cfg.MemoryJSONMode, err = boolOr("MEMORY_JSON_MODE", cfg.MemoryJSONMode); err != nil {
+		return Config{}, err
+	}
+	if v := os.Getenv("MEMORY_MAX_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("MEMORY_MAX_TOKENS: want a positive integer, got %q", v)
+		}
+		cfg.MemoryMaxTokens = n
 	}
 	if v := os.Getenv("CHAT_MAX_TOKENS"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -177,6 +233,21 @@ func floatOr(key string, fallback, min, max float64) (float64, error) {
 		return 0, fmt.Errorf("%s: want a number between %g and %g, got %q", key, min, max, v)
 	}
 	return f, nil
+}
+
+// boolOr reads a flag. An unparseable value is an error rather than a silent
+// false: "MEMORY_EXTRACTION=no" quietly disabling the feature is exactly the
+// kind of typo an operator would not find for a week.
+func boolOr(key string, fallback bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s: want true or false, got %q", key, v)
+	}
+	return b, nil
 }
 
 func durationOr(key string, fallback time.Duration) (time.Duration, error) {

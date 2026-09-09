@@ -805,3 +805,383 @@ func TestConversationAndUserDeletionCascade(t *testing.T) {
 		}
 	}
 }
+
+// --- Phase 5: the memory system ---------------------------------------------
+
+// The fact used throughout the memory tests, and the question that should
+// retrieve it. Both are phrased to overlap lexically because hashingEmbedder is
+// a bag of words; against a real embedding model the question would not have to
+// echo the fact. See embedder_test.go.
+const (
+	rememberedFact  = "The user prefers studying in the morning."
+	recallQuestion  = "When do I prefer studying in the morning?"
+	statingTheFact  = "I prefer studying in the morning before class, so please keep my revision blocks early in the day."
+	unrelatedAsking = "quarterly revenue forecast spreadsheet"
+)
+
+// rememberingProvider is a mock that plays both parts: it answers an extraction
+// call with the JSON the prompt asks for, and an ordinary chat turn by citing
+// whatever memory it was given. One provider serves both because the service
+// wiring does -- and keeping them in one function is what makes it obvious the
+// two calls are told apart by their prompts, not by their order.
+func rememberingProvider() *ai.Mock {
+	return &ai.Mock{ReplyFunc: func(msgs []ai.Message) string {
+		prompt := ai.PromptText(msgs)
+		switch {
+		case strings.Contains(prompt, "Return the JSON array now."):
+			return `[{"type":"preference","content":"` + rememberedFact +
+				`","importance":0.8,"confidence":0.9}]`
+		case strings.Contains(prompt, "[S1] memory:"):
+			return "You told me before that you prefer studying in the morning [S1]."
+		default:
+			return "I could not find anything about that in your documents, tasks, goals or notes."
+		}
+	}}
+}
+
+// listMemories reads the caller's memories through the API.
+func listMemories(t *testing.T, srv *httptest.Server, token, query string) map[string]any {
+	t.Helper()
+	resp, body := doJSON(t, srv, http.MethodGet, "/api/v1/memories"+query, token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /memories%s: status %d: %v", query, resp.StatusCode, body)
+	}
+	return body
+}
+
+// remember runs one conversation that states a durable fact, and returns the
+// memory the assistant extracted from it.
+func remember(t *testing.T, srv *httptest.Server, token string) map[string]any {
+	t.Helper()
+	convID := create(t, srv, token, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, token, convID, statingTheFact)
+	if _, done := answer(t, events); done == nil {
+		t.Fatal("the stating turn produced no done event")
+	}
+
+	list := listMemories(t, srv, token, "")
+	items, _ := list["memories"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("the exchange produced %d memories, want 1: %v", len(items), list)
+	}
+	m, _ := items[0].(map[string]any)
+	return m
+}
+
+// The end-to-end property Phase 5 exists for, over HTTP: a fact stated in one
+// conversation is extracted, and a *different* conversation retrieves it, uses
+// it and cites it.
+func TestAFactLearnedInOneConversationIsUsedInAnother(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+
+	stored := remember(t, srv, alice)
+	if stored["content"] != rememberedFact {
+		t.Fatalf("content = %v, want the extracted fact", stored["content"])
+	}
+	if stored["type"] != "preference" {
+		t.Fatalf("type = %v, want preference", stored["type"])
+	}
+	if stored["enabled"] != true {
+		t.Fatalf("a new memory is not enabled: %v", stored)
+	}
+	// Provenance: the memory says which conversation taught it.
+	if stored["source_conversation_id"] == nil {
+		t.Fatalf("the memory has no source conversation: %v", stored)
+	}
+	if imp, _ := stored["importance"].(float64); imp != 0.8 {
+		t.Fatalf("importance = %v, want the extracted 0.8", stored["importance"])
+	}
+
+	// A new conversation: no shared history, nothing but the memory.
+	second := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, alice, second, recallQuestion)
+	text, done := answer(t, events)
+
+	message, _ := done["message"].(map[string]any)
+	sources, _ := message["sources"].([]any)
+	if len(sources) != 1 {
+		t.Fatalf("retrieved %d sources, want the one memory: %v", len(sources), sources)
+	}
+	cited, _ := sources[0].(map[string]any)
+	switch {
+	case cited["type"] != "memory":
+		t.Fatalf("source type = %v, want memory", cited["type"])
+	case cited["id"] != stored["id"]:
+		t.Fatalf("source id = %v, want the stored memory %v", cited["id"], stored["id"])
+	case cited["title"] != "preference":
+		t.Fatalf("source title = %v, want the memory's type", cited["title"])
+	case cited["cited"] != true:
+		t.Fatalf("the answer cited the memory but the record says otherwise: %v", cited)
+	}
+	if !strings.Contains(text, "[S1]") {
+		t.Fatalf("answer = %q, want it to carry the citation", text)
+	}
+
+	// And a question about something else retrieves nothing: the floor is what
+	// keeps a standing fact about the user out of every unrelated answer.
+	_, events = ask(t, srv, alice, second, unrelatedAsking)
+	text, done = answer(t, events)
+	message, _ = done["message"].(map[string]any)
+	if sources, _ = message["sources"].([]any); len(sources) != 0 {
+		t.Fatalf("an unrelated question retrieved %v", sources)
+	}
+	if strings.Contains(text, "[S") {
+		t.Fatalf("an unrelated question produced a citation: %q", text)
+	}
+}
+
+// The Phase 5 half of the property the whole ownership design exists for.
+func TestCrossUserMemoryIsolation(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+	bob := register(t, srv, "bob@example.com")
+
+	stored := remember(t, srv, alice)
+	aliceMemoryID, _ := stored["id"].(string)
+
+	// Alice's memory exists and Bob does not own it. The answer must be 404 --
+	// a 403 would confirm the id is real.
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{"patch memory", http.MethodPatch, "/api/v1/memories/" + aliceMemoryID, map[string]any{"content": "hijacked"}},
+		{"disable memory", http.MethodPatch, "/api/v1/memories/" + aliceMemoryID, map[string]any{"enabled": false}},
+		{"delete memory", http.MethodDelete, "/api/v1/memories/" + aliceMemoryID, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := doJSON(t, srv, tc.method, tc.path, bob, tc.body)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s %s as the wrong user = %d, want 404: %v", tc.method, tc.path, resp.StatusCode, body)
+			}
+			if body["error"] != "not_found" {
+				t.Fatalf("error = %v, want not_found", body["error"])
+			}
+		})
+	}
+
+	// Bob's list never contains Alice's memory.
+	list := listMemories(t, srv, bob, "")
+	if count, _ := list["count"].(float64); count != 0 {
+		t.Fatalf("Bob sees %v memories, want 0: %v", count, list)
+	}
+
+	// Bob forgetting everything forgets only his own.
+	resp, cleared := doJSON(t, srv, http.MethodDelete, "/api/v1/memories", bob, map[string]any{"confirm": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Bob's clear = %d: %v", resp.StatusCode, cleared)
+	}
+	if deleted, _ := cleared["deleted"].(float64); deleted != 0 {
+		t.Fatalf("Bob's clear deleted %v memories, want 0", deleted)
+	}
+
+	// And none of that touched Alice's memory: every attempt was a no-op, not
+	// just an unhelpful status code.
+	list = listMemories(t, srv, alice, "")
+	items, _ := list["memories"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("Alice has %d memories after Bob's attempts, want 1: %v", len(items), list)
+	}
+	survivor, _ := items[0].(map[string]any)
+	if survivor["content"] != rememberedFact || survivor["enabled"] != true {
+		t.Fatalf("Alice's memory after Bob's attempts = %v", survivor)
+	}
+}
+
+// The retrieval path is the one that could leak another user's memory without
+// ever naming an id: Bob asks the assistant the question that retrieves it.
+func TestChatRetrievalCannotReachAnotherUsersMemories(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+	bob := register(t, srv, "bob@example.com")
+
+	remember(t, srv, alice)
+
+	convID := create(t, srv, bob, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, bob, convID, recallQuestion)
+	text, done := answer(t, events)
+
+	message, _ := done["message"].(map[string]any)
+	sources, _ := message["sources"].([]any)
+	if len(sources) != 0 {
+		t.Fatalf("Bob retrieved %d sources from an empty memory: %v", len(sources), sources)
+	}
+	if strings.Contains(text, "You told me before") {
+		t.Fatalf("Bob's assistant answered from Alice's memory: %q", text)
+	}
+	if !strings.Contains(text, "could not find") {
+		t.Fatalf("answer = %q, want it to say nothing was found", text)
+	}
+	// Bob's own memory is still empty afterwards: the question was short and
+	// nothing durable was in it.
+	if count, _ := listMemories(t, srv, bob, "")["count"].(float64); count != 0 {
+		t.Fatalf("Bob's memory holds %v facts", count)
+	}
+}
+
+// A disabled memory stops reaching the model but stays on the user's list --
+// the difference between "stop using this" and "delete this".
+func TestDisablingAMemoryRemovesItFromRetrievalOnly(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+
+	stored := remember(t, srv, alice)
+	id, _ := stored["id"].(string)
+
+	resp, patched := doJSON(t, srv, http.MethodPatch, "/api/v1/memories/"+id, alice,
+		map[string]any{"enabled": false})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH = %d: %v", resp.StatusCode, patched)
+	}
+	if patched["enabled"] != false {
+		t.Fatalf("enabled = %v after disabling it", patched["enabled"])
+	}
+
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, alice, convID, recallQuestion)
+	text, done := answer(t, events)
+	message, _ := done["message"].(map[string]any)
+	if sources, _ := message["sources"].([]any); len(sources) != 0 {
+		t.Fatalf("a disabled memory was retrieved: %v", sources)
+	}
+	if strings.Contains(text, "[S") {
+		t.Fatalf("a disabled memory was cited: %q", text)
+	}
+
+	// Still listed, and the ?enabled= filter tells the two apart.
+	if count, _ := listMemories(t, srv, alice, "")["count"].(float64); count != 1 {
+		t.Fatal("the disabled memory disappeared from the list")
+	}
+	if count, _ := listMemories(t, srv, alice, "?enabled=true")["count"].(float64); count != 0 {
+		t.Fatal("the disabled memory is still listed as enabled")
+	}
+	if count, _ := listMemories(t, srv, alice, "?enabled=false")["count"].(float64); count != 1 {
+		t.Fatal("the disabled memory is not listed as disabled")
+	}
+	if count, _ := listMemories(t, srv, alice, "?type=preference")["count"].(float64); count != 1 {
+		t.Fatal("the ?type= filter does not find the memory")
+	}
+	if count, _ := listMemories(t, srv, alice, "?type=goal")["count"].(float64); count != 0 {
+		t.Fatal("the ?type= filter matched the wrong type")
+	}
+}
+
+// Editing a memory's text has to move its vector, or the correction is
+// retrievable by what it used to say and invisible to what it now says.
+func TestEditingAMemoryChangesWhatItIsRetrievedBy(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+
+	stored := remember(t, srv, alice)
+	id, _ := stored["id"].(string)
+
+	const corrected = "The user prefers revising late at night."
+	resp, patched := doJSON(t, srv, http.MethodPatch, "/api/v1/memories/"+id, alice,
+		map[string]any{"content": corrected})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH = %d: %v", resp.StatusCode, patched)
+	}
+	if patched["content"] != corrected {
+		t.Fatalf("content = %v", patched["content"])
+	}
+
+	// The old wording no longer retrieves it.
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, alice, convID, recallQuestion)
+	_, done := answer(t, events)
+	message, _ := done["message"].(map[string]any)
+	if sources, _ := message["sources"].([]any); len(sources) != 0 {
+		t.Fatalf("the edited memory is still retrievable by its old text: %v", sources)
+	}
+
+	// The new wording does.
+	_, events = ask(t, srv, alice, convID, "When do I prefer revising late at night?")
+	_, done = answer(t, events)
+	message, _ = done["message"].(map[string]any)
+	sources, _ := message["sources"].([]any)
+	if len(sources) != 1 {
+		t.Fatalf("the edited memory is not retrievable by its new text: %v", sources)
+	}
+	if got, _ := sources[0].(map[string]any); got["id"] != id {
+		t.Fatalf("retrieved %v, want the edited memory %v", got["id"], id)
+	}
+}
+
+// "Forget everything about me" is irreversible, so an unconfirmed request must
+// not be treated as one.
+func TestClearingEveryMemoryNeedsConfirmation(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+	remember(t, srv, alice)
+
+	for _, body := range []any{map[string]any{}, map[string]any{"confirm": false}} {
+		resp, out := doJSON(t, srv, http.MethodDelete, "/api/v1/memories", alice, body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("DELETE /memories %v = %d, want 400: %v", body, resp.StatusCode, out)
+		}
+		if out["error"] != "validation_failed" {
+			t.Fatalf("error = %v, want validation_failed", out["error"])
+		}
+	}
+	if count, _ := listMemories(t, srv, alice, "")["count"].(float64); count != 1 {
+		t.Fatal("an unconfirmed clear deleted the memory")
+	}
+
+	resp, cleared := doJSON(t, srv, http.MethodDelete, "/api/v1/memories", alice, map[string]any{"confirm": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("confirmed clear = %d: %v", resp.StatusCode, cleared)
+	}
+	if deleted, _ := cleared["deleted"].(float64); deleted != 1 {
+		t.Fatalf("deleted = %v, want 1", cleared["deleted"])
+	}
+	if count, _ := listMemories(t, srv, alice, "")["count"].(float64); count != 0 {
+		t.Fatal("a memory survived the confirmed clear")
+	}
+
+	// The assistant stops using what it no longer knows.
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, alice, convID, recallQuestion)
+	_, done := answer(t, events)
+	message, _ := done["message"].(map[string]any)
+	if sources, _ := message["sources"].([]any); len(sources) != 0 {
+		t.Fatalf("a cleared memory was retrieved: %v", sources)
+	}
+}
+
+// Deleting a conversation must not delete what was learned in it, and deleting
+// a user must take everything.
+func TestMemoryDeletionCascades(t *testing.T) {
+	srv := isolationServerWithProvider(t, rememberingProvider())
+	alice := register(t, srv, "alice@example.com")
+
+	stored := remember(t, srv, alice)
+	source, _ := stored["source_conversation_id"].(string)
+
+	resp, body := doJSON(t, srv, http.MethodDelete, "/api/v1/conversations/"+source, alice, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete conversation = %d: %v", resp.StatusCode, body)
+	}
+	list := listMemories(t, srv, alice, "")
+	items, _ := list["memories"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("the memory went with its conversation: %v", list)
+	}
+	if survivor, _ := items[0].(map[string]any); survivor["source_conversation_id"] != nil {
+		t.Fatalf("source_conversation_id = %v, want null once the conversation is gone", survivor["source_conversation_id"])
+	}
+
+	pool := mustPool(t)
+	if _, err := pool.Exec(`DELETE FROM users`); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := pool.QueryRow(`SELECT count(*) FROM memories`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d memories survived the deleted user", n)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 	"github.com/jashveer/lifeos/backend/internal/users"
@@ -96,6 +97,35 @@ func run(logger *slog.Logger) error {
 	logger.Info("chat provider configured",
 		"base_url", cfg.OllamaBaseURL, "model", provider.Model(),
 		"min_similarity", cfg.ChatMinSimilarity)
+	// The memory system. It shares the chat provider and the embedder: a fact
+	// is extracted by the same kind of model that answered, and embedded by the
+	// same one that embedded the documents -- which it has to be, since both
+	// kinds of vector live in `vector(768)` columns and are compared with the
+	// same operator.
+	memorySvc := memories.NewService(memories.Deps{
+		Store:    memories.NewRepository(pool),
+		Provider: provider,
+		Embedder: embedder,
+		Logger:   logger,
+		Options: memories.Options{
+			Model:       cfg.MemoryModel,
+			Temperature: cfg.MemoryTemperature,
+			MaxTokens:   cfg.MemoryMaxTokens,
+			Timeout:     cfg.MemoryExtractTimeout,
+			JSONMode:    cfg.MemoryJSONMode,
+		},
+	})
+	// Extraction is the half with a switch: it costs a second model call on
+	// every substantial turn. Switching it off leaves retrieval running, so the
+	// assistant still uses what it already knows.
+	var extractor chat.MemoryExtractor
+	if cfg.MemoryExtraction {
+		extractor = memorySvc
+	}
+	logger.Info("memory configured",
+		"extraction", cfg.MemoryExtraction, "model", orElse(cfg.MemoryModel, provider.Model()),
+		"min_similarity", cfg.MemoryMinSimilarity, "extract_timeout", cfg.MemoryExtractTimeout)
+
 	chatSvc := chat.NewService(chat.Deps{
 		Store:    chat.NewRepository(pool),
 		Provider: provider,
@@ -103,14 +133,18 @@ func run(logger *slog.Logger) error {
 		// repositories: the assistant sees exactly what the API would return,
 		// validation and ownership included.
 		Documents: docSvc,
-		Tasks:     taskSvc,
-		Goals:     goalSvc,
-		Notes:     noteSvc,
-		Logger:    logger,
+		// Both halves of Phase 5, wired separately so either can be absent.
+		Memories:        memorySvc,
+		MemoryExtractor: extractor,
+		Tasks:           taskSvc,
+		Goals:           goalSvc,
+		Notes:           noteSvc,
+		Logger:          logger,
 		Options: chat.Options{
-			Temperature:   cfg.ChatTemperature,
-			MaxTokens:     cfg.ChatMaxTokens,
-			MinSimilarity: cfg.ChatMinSimilarity,
+			Temperature:         cfg.ChatTemperature,
+			MaxTokens:           cfg.ChatMaxTokens,
+			MinSimilarity:       cfg.ChatMinSimilarity,
+			MemoryMinSimilarity: cfg.MemoryMinSimilarity,
 		},
 	})
 
@@ -121,6 +155,7 @@ func run(logger *slog.Logger) error {
 		Notes:       notes.NewHandler(noteSvc, logger),
 		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
 		Chat:        chat.NewHandler(chatSvc, logger),
+		Memories:    memories.NewHandler(memorySvc, logger),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(cfg.LoginRateLimit, cfg.LoginRateLimitBurst),
 		DB:          pool,
@@ -165,6 +200,15 @@ func run(logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// orElse is the fallback for a logged value that is only set when it overrides
+// something else.
+func orElse(v, fallback string) string {
+	if v != "" {
+		return v
+	}
+	return fallback
 }
 
 // sweepExpiredSessions keeps the sessions table from accumulating dead rows.

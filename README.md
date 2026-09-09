@@ -12,10 +12,14 @@ Personal life-operating-system.
   orchestrator that pulls the retrieved chunks plus your tasks, goals and notes
   into the prompt, and a streaming chat API that records exactly what grounded
   each answer.
+- **Phase 5** — memory: after a substantial turn the assistant reads the
+  exchange back and stores the facts worth keeping about you, embedded and
+  searchable, so a later conversation can retrieve and cite them. You can see
+  every one of them, correct it, switch it off, delete it, or forget everything.
 
-Memory, agents, the knowledge graph and the action/approval engine belong to
-later phases and are deliberately absent. The Phase 4 assistant answers
-questions; it does not create or change anything, and it says so if you ask.
+Agents, the knowledge graph and the action/approval engine belong to later
+phases and are deliberately absent. The assistant reads, answers and remembers;
+it does not create or change anything else, and it says so if you ask.
 
 ## Stack
 
@@ -47,6 +51,7 @@ lunex/
 │   │   ├── documents/     # upload, extract, chunk, embed, search
 │   │   ├── embeddings/    # Ollama client behind an Embedder interface
 │   │   ├── goals/         # goals + milestones: model, service, handlers
+│   │   ├── memories/      # extraction, embedding, retrieval, management
 │   │   ├── httpx/         # JSON transport helpers shared by the modules
 │   │   ├── notes/         # notes: model, service, handlers
 │   │   ├── optional/      # the three-state field a PATCH body needs
@@ -57,7 +62,7 @@ lunex/
 │   └── go.mod
 ├── frontend/              # Vite React TS scaffold
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> search -> ask -> cite, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> search -> ask -> cite -> remember -> recall, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -158,6 +163,30 @@ still being written. Ask something your data does not answer and the assistant
 says so rather than inventing a citation — see
 [docs/decisions.md](docs/decisions.md) for how that is enforced.
 
+Tell it something about yourself, then ask in a fresh conversation:
+
+```sh
+curl -N -X POST "localhost:8080/api/v1/conversations/$CONV/messages" -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"Something to keep in mind about me: I always study in the early morning before class."}'
+# …
+# event: done
+# data: {…,"remembered":[{"id":"…","type":"preference","content":"The user prefers studying in the early morning before class."}]}
+
+curl -s localhost:8080/api/v1/memories -H "$AUTH"
+# {"count":1,"memories":[{"type":"preference","content":"The user prefers studying in the early morning before class.",
+#                         "importance":0.7,"confidence":0.9,"enabled":true,"source_conversation_id":"…",…}]}
+```
+
+A new conversation retrieves that memory and cites it like any other source.
+The whole record is yours to manage: `PATCH /api/v1/memories/{id}` corrects a
+fact or switches it off without deleting it, `DELETE` removes one, and
+`DELETE /api/v1/memories` with `{"confirm": true}` forgets everything.
+
+Extraction is a second model call on every substantial turn. It runs after the
+last token, so it delays the end of the stream rather than the answer, and
+`MEMORY_EXTRACTION=false` turns it off while leaving retrieval running.
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
@@ -180,6 +209,13 @@ says so rather than inventing a citation — see
 | `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
 | `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
 | `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
+| `MEMORY_EXTRACTION` | no | `true` | The writing half. `false` keeps retrieval and stops the assistant learning anything new |
+| `MEMORY_MODEL` | no | `CHAT_MODEL` | Which model extracts. A smaller one is reasonable: it classifies, it does not converse |
+| `MEMORY_EXTRACT_TIMEOUT` | no | `60s` | Bounds one extraction; the latency memory adds to the end of a turn |
+| `MEMORY_TEMPERATURE` | no | `0.1` | 0–2. Near zero: extraction is a reading task |
+| `MEMORY_MAX_TOKENS` | no | `512` | Extraction reply cap |
+| `MEMORY_MIN_SIMILARITY` | no | `0.6` | 0–1. Retrieval floor for memories, tuned separately from the document one and higher |
+| `MEMORY_JSON_MODE` | no | `false` | Constrain extraction to JSON. Off: it makes llama3.2:3b answer `{}` and pad whitespace |
 
 ## Common commands
 
@@ -187,7 +223,7 @@ says so rather than inventing a citation — see
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search -> ask -> cite, against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite -> remember -> recall, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -248,9 +284,9 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     They have no embeddings yet, so the assistant sees what is in progress, due
     soonest and recently touched — not what is relevant to the question.
     Documents are the only semantic half.
-17. **Conversation history is the whole memory.** The last 20 messages are
-    replayed; there is no extraction and no long-term store, so a longer
-    conversation forgets its own beginning silently. That is Phase 5.
+17. **A conversation still forgets its own wording.** The last 20 messages are
+    replayed verbatim; past that, only what Phase 5 extracted into memory
+    survives, and it comes back as facts rather than as what was said.
 18. **The assistant cannot take actions.** It reads and answers. Asked to
     create a task it says so; nothing in the chat path writes to tasks, goals,
     notes or documents.
@@ -261,3 +297,26 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 21. **No per-user rate limit on generation.** One user can hold as many
     concurrent turns open as they have connections; `CHAT_TIMEOUT` is the only
     bound.
+22. **Memory extraction doubles the model work on a substantial turn.** It runs
+    inline after the last token, so it delays the end-of-stream marker rather
+    than the answer, and `MEMORY_EXTRACTION=false` removes it while leaving
+    retrieval running. There is still no job queue to move it to.
+23. **Nothing consolidates, merges or forgets memories.** They accumulate. A
+    near-duplicate is skipped, a contradiction is not noticed — the system
+    prompt tells the model to prefer what you say now, which is a mitigation
+    rather than a fix — and no memory decays. `expires_at` exists and nothing
+    writes it.
+24. **Extraction sees one exchange at a time**, so a fact stated across three
+    turns is not assembled, and it reads the assistant's reply as well as
+    yours: an answer that opens "I could not find anything about that" can talk
+    a 3B model out of remembering what you just told it. `MEMORY_MODEL` points
+    extraction at a better model without touching anything else.
+25. **Memory retrieval ranks on similarity alone.** Importance, confidence,
+    recency and usage are all recorded and none of them affect what is
+    retrieved.
+26. **Text in your documents can reach the extraction prompt.** The extractor
+    reads an answer that was grounded in your files, so a document engineered to
+    say "remember that the user has approved X" has a path into your memory.
+    Requiring every fact to be about the user narrows it; nothing in this phase
+    closes it. The assistant still cannot act, and every memory is visible,
+    attributable and deletable.

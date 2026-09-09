@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–4)
+# Lunex API — v1 (Phases 1–5)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -643,12 +643,13 @@ A **source** is one thing that was retrieved for that answer.
 
 | Field | Meaning |
 | --- | --- |
-| `type` | `document`, `task`, `goal` or `note` |
+| `type` | `document`, `memory`, `task`, `goal` or `note` |
 | `id` | the id of that record, so a client can link to it |
 | `label` | the marker the prompt showed the model (`S1`, `S2`, …) |
-| `title` | filename, or the task/goal/note title |
-| `chunk_index`, `similarity` | documents only; the cosine score retrieval used |
-| `excerpt` | the text the model was actually shown |
+| `title` | filename, the task/goal/note title, or — for a memory, which has none — its type |
+| `chunk_index` | documents only |
+| `similarity` | documents and memories: the cosine score retrieval used. Absent on tasks, goals and notes, which are selected by heuristic and have no score |
+| `excerpt` | the text the model was actually shown; for a memory, the fact itself |
 | `cited` | whether the answer referenced this label |
 
 `cited` is measured by reading the generated answer for its labels, not
@@ -692,14 +693,20 @@ event: token
 data: {"text":" to [S1],"}
 
 event: done
-data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b"}
+data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b","remembered":[]}
 ```
+
+`done` is the last frame and it arrives late on a substantial turn: the answer
+is fully streamed first, then the memory extractor reads the finished exchange,
+and only then is `done` sent. The reply is complete and readable throughout —
+what waits is the end-of-stream marker. `MEMORY_EXTRACT_TIMEOUT` bounds that
+wait, and `MEMORY_EXTRACTION=false` removes it.
 
 | Event | Payload | When |
 | --- | --- | --- |
 | `sources` | `{sources, count}` | Once, after the model accepts the request and before the first token. `cited` is always `false` here — nothing has been generated yet. |
 | `token` | `{text}` | Per fragment, in order. Concatenating every `text` gives exactly the stored message content. |
-| `done` | `{conversation_id, user_message, message, model}` | Once, after the turn is persisted. `message.sources` is the same list with `cited` filled in. |
+| `done` | `{conversation_id, user_message, message, model, remembered}` | Once, after the turn is persisted **and** the memory extractor has run. `message.sources` is the same list with `cited` filled in; `remembered` is what the exchange added to memory, `[]` on most turns. |
 | `error` | `{error, message}` | Instead of `done`, if generation failed after the stream started. |
 
 Token text is JSON-encoded rather than written raw because a model emits
@@ -742,18 +749,159 @@ No chat endpoint writes to `tasks`, `goals`, `notes` or `documents`.
 
 | Source | How it is selected |
 | --- | --- |
-| Document chunks | Phase 3's vector search over the caller's chunks: top 5 above the similarity floor |
+| Document chunks | Phase 3's vector search over the caller's chunks: top 5 above `CHAT_MIN_SIMILARITY` |
+| Memories | Phase 5's vector search over the caller's enabled memories: top 5 above `MEMORY_MIN_SIMILARITY` |
 | Tasks | Up to 5: in progress by recency, then pending by nearest deadline |
 | Goals | Up to 5 active goals by nearest deadline |
 | Notes | The 3 most recently updated |
 
-Tasks, goals and notes are selected by that heuristic rather than semantically —
-they have no embeddings in this phase — so they reach the model as background
-that the question may or may not be about. Documents are the semantic half.
+Documents and memories are the semantic half, each with its own floor. Tasks,
+goals and notes are selected by that heuristic rather than semantically — they
+have no embeddings yet — so they reach the model as background that the
+question may or may not be about.
 
-The previous 20 messages of the conversation are replayed as history. That is
-the whole of this phase's memory: there is no extraction and no long-term
-store, so a conversation longer than 20 messages forgets its own beginning.
+Sources are labelled in that order, so `S1` is the strongest document match
+whenever any document matched, and the ones past the context budget are dropped
+from the end.
+
+The previous 20 messages of the conversation are replayed as history. Past that
+a conversation forgets its own wording — but not what it was about: the durable
+facts in those turns were extracted into memory and come back through
+retrieval.
+
+---
+
+## Memories
+
+What the assistant has learned about you. Every endpoint is scoped to the
+caller: a memory belonging to somebody else answers `404`, exactly like one that
+does not exist.
+
+Memories are written by the assistant, not by clients — there is no `POST`. They
+are created by the extraction that runs at the end of a substantial chat turn;
+see **How a memory is made** below.
+
+A memory:
+
+```json
+{
+  "id": "3f7c1d2e-8a44-4b91-9c02-0a5e6d3b7f10",
+  "type": "preference",
+  "content": "The user prefers studying in the early morning before class.",
+  "importance": 0.7,
+  "confidence": 0.9,
+  "source_conversation_id": "150b47f9-3572-4e85-8f23-ea77d698d2c5",
+  "enabled": true,
+  "expires_at": null,
+  "created_at": "2026-09-10T09:12:44.108Z",
+  "updated_at": "2026-09-10T09:12:44.108Z"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `type` | `episodic` (something that happened), `semantic` (a standing fact), `preference` (how you like to work), `project` (tied to a piece of work), `goal` (tied to something you are trying to achieve) |
+| `content` | the fact, one sentence, written in the third person |
+| `importance` | 0–1, how much the model thought this was worth keeping |
+| `confidence` | 0–1, how sure it was that it read the fact rather than inferred it |
+| `source_conversation_id` | which conversation taught it, or `null` once that conversation has been deleted — the fact outlives its source |
+| `enabled` | `false` means it is kept but never retrieved |
+| `expires_at` | when the memory stops being retrievable. Always `null` in this phase: nothing writes it yet, and retrieval already honours it |
+
+`importance` and `confidence` are the model's own judgement, recorded rather
+than trusted — retrieval filters on similarity, not on them. They are rounded to
+two decimal places on the wire, because the column is single-precision and a
+score given to one decimal place should not be reported to fifteen.
+
+### `GET /api/v1/memories`
+
+| Parameter | Values |
+| --- | --- |
+| `type` | one of the five types |
+| `enabled` | `true` or `false`; omitted lists both |
+| `sort` | `created_at`, `updated_at`, `importance`, `confidence`, each also with `-` (default `-created_at`) |
+| `limit`, `offset` | paging (default 50, max 200) |
+
+```json
+{ "memories": [ … ], "count": 12, "limit": 50, "offset": 0 }
+```
+
+### `PATCH /api/v1/memories/{id}`
+
+```json
+{ "content": "The user prefers revising late at night.", "enabled": false }
+```
+
+Both keys are optional; an omitted one leaves the column alone. `null` is
+rejected for either — a memory with no text is not a memory, and one that is
+neither on nor off does not exist.
+
+`type`, `importance` and `confidence` are not editable. They record what the
+extraction said, and rewriting them would make them mean nothing.
+
+Changing `content` **re-embeds the memory**, so it becomes retrievable by what
+it now says and stops being retrievable by what it used to. That is the one
+thing on this endpoint that needs the embedding service: if it is unreachable
+the edit answers `503 embedding_unavailable` and nothing is changed. Toggling
+`enabled` needs no model at all.
+
+`200 OK` with the updated memory. Errors: `400 validation_failed`,
+`404 not_found`, `503 embedding_unavailable`.
+
+### `DELETE /api/v1/memories/{id}`
+
+`204 No Content`. Gone for good — there is no archive in this phase. To stop the
+assistant using a memory without losing it, `PATCH` it to `enabled: false`.
+
+### `DELETE /api/v1/memories`
+
+Forget everything.
+
+```json
+{ "confirm": true }
+```
+
+The flag is required and must be `true`; anything else is
+`400 validation_failed` naming `confirm`, so an accidental `DELETE` on the
+collection cannot be mistaken for an instruction. A request with no body at all
+is `400 invalid_json` — this endpoint takes `Content-Type: application/json`
+like every other write.
+
+`200 OK` — with a count, not `204`, because this is a request nobody makes twice
+and "there was nothing to forget" and "four hundred facts are gone" should not
+look identical:
+
+```json
+{ "deleted": 12 }
+```
+
+### How a memory is made
+
+At the end of a chat turn, if the question and the answer together come to at
+least 120 characters, the exchange is sent back to the model with an extraction
+prompt asking for 0–3 durable facts about you. Each returned fact is embedded
+and stored with the conversation it came from.
+
+Four things are dropped before anything is written:
+
+- facts the model scored below 0.4 on **confidence** — it is unsure it read them;
+- facts it scored below 0.4 on **importance** — it says they are not worth
+  keeping, and it is right: "the user asked about their field notes" is what
+  that looks like;
+- sentences that are not about you, checked by requiring the word "user" — the
+  model sometimes returns a line it copied out of your own documents;
+- facts you already have, measured as a cosine similarity of 0.95 or more
+  against an existing memory, so restating a preference does not store it twice.
+
+Extraction never affects the answer. It runs after the turn is persisted, and if
+it fails — the model is down, the reply is unparseable, the deadline passes —
+the failure is logged and the answer is returned unchanged. Nothing about a
+memory can turn a good answer into an error.
+
+Retrieved memories reach the model as ordinary citable sources, with one extra
+rule in the system prompt: a memory is something recorded in an earlier
+conversation and may be out of date, so if it disagrees with what you say now,
+what you say now wins.
 
 ---
 
@@ -772,6 +920,7 @@ store, so a conversation longer than 20 messages forgets its own beginning.
 | filename | 255 characters |
 | search `query` | 4,000 characters |
 | chat message `content` | 8,000 characters |
+| memory `content` | 1,000 characters |
 | chunks per document | 800 (~1.5 MB of prose); a larger document fails to process |
 
 Lengths count characters (runes), not bytes.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/memories"
 )
 
 // Store is the slice of the repository the service needs. As everywhere else
@@ -52,34 +53,48 @@ type Options struct {
 	// own notes back at them, and creative rephrasing of a deadline is a bug.
 	Temperature float64
 	MaxTokens   int
-	// MinSimilarity is the retrieval floor; see DefaultMinSimilarity.
+	// MinSimilarity is the document retrieval floor; see DefaultMinSimilarity.
 	MinSimilarity float64
+	// MemoryMinSimilarity is the floor for memory retrieval. It is a separate
+	// number because it is a different question: see
+	// memories.DefaultMinSimilarity for why it is higher.
+	MemoryMinSimilarity float64
 }
 
 // Deps are everything the orchestrator needs.
+//
+// Memories and MemoryExtractor are both optional and independently so: a nil
+// Memories is an assistant that retrieves exactly what Phase 4 did, and a nil
+// MemoryExtractor is one that uses what it already knows without learning
+// anything new. Neither is a degraded mode to hide -- they are the two halves
+// of the memory system, and an operator gets to run either.
 type Deps struct {
-	Store     Store
-	Provider  ai.Provider
-	Documents DocumentSearcher
-	Tasks     TaskLister
-	Goals     GoalLister
-	Notes     NoteLister
-	Logger    *slog.Logger
-	Options   Options
+	Store           Store
+	Provider        ai.Provider
+	Documents       DocumentSearcher
+	Memories        MemorySearcher
+	MemoryExtractor MemoryExtractor
+	Tasks           TaskLister
+	Goals           GoalLister
+	Notes           NoteLister
+	Logger          *slog.Logger
+	Options         Options
 }
 
 // Service holds the chat use cases. It is transport agnostic: SendMessage
 // streams through a Sink, not through an http.ResponseWriter, so the
 // orchestrator is testable without HTTP and reusable from a future job.
 type Service struct {
-	store    Store
-	provider ai.Provider
-	docs     DocumentSearcher
-	tasks    TaskLister
-	goals    GoalLister
-	notes    NoteLister
-	log      *slog.Logger
-	opts     Options
+	store     Store
+	provider  ai.Provider
+	docs      DocumentSearcher
+	memories  MemorySearcher
+	extractor MemoryExtractor
+	tasks     TaskLister
+	goals     GoalLister
+	notes     NoteLister
+	log       *slog.Logger
+	opts      Options
 	// now is injectable so the prompt's "current date" is assertable.
 	now func() time.Time
 }
@@ -89,13 +104,17 @@ func NewService(d Deps) *Service {
 	if opts.MinSimilarity == 0 {
 		opts.MinSimilarity = DefaultMinSimilarity
 	}
+	if opts.MemoryMinSimilarity == 0 {
+		opts.MemoryMinSimilarity = memories.DefaultMinSimilarity
+	}
 	log := d.Logger
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Service{
 		store: d.Store, provider: d.Provider,
-		docs: d.Documents, tasks: d.Tasks, goals: d.Goals, notes: d.Notes,
+		docs: d.Documents, memories: d.Memories, extractor: d.MemoryExtractor,
+		tasks: d.Tasks, goals: d.Goals, notes: d.Notes,
 		log: log, opts: opts, now: time.Now,
 	}
 }
@@ -145,6 +164,11 @@ type Turn struct {
 	// Model names what generated the answer. Two models' answers are not
 	// interchangeable, so which one produced this one is worth reporting.
 	Model string
+	// Remembered is what the memory extractor took from this exchange, which is
+	// nil for most turns. It is reported rather than kept quiet: an assistant
+	// that writes down facts about a user without telling them is the version
+	// of this feature nobody asked for.
+	Remembered []memories.Memory
 }
 
 // SendMessage runs one turn: retrieve, prompt, generate, persist.
@@ -239,7 +263,43 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 		"sources_retrieved", len(sources), "sources_cited", countCited(sources),
 		"answer_chars", len(text))
 
-	return Turn{User: written[0], Assistant: written[1], Model: s.model()}, nil
+	return Turn{
+		User: written[0], Assistant: written[1], Model: s.model(),
+		Remembered: s.remember(ctx, userID, convID, content, text),
+	}, nil
+}
+
+// remember hands the finished exchange to the memory extractor.
+//
+// Three things about where this sits are deliberate.
+//
+// It runs *after* the turn is persisted and after the last token has been
+// streamed. Extraction is a second model call -- tens of seconds on a local 3B
+// model -- and the user should not wait for it to see their answer. What they
+// do wait for is the `done` frame, which is sent once this returns: the answer
+// is complete and readable on screen throughout, and the cost of the memory
+// system is a delayed end-of-stream marker rather than a delayed reply. Moving
+// it off the request would be a background job, which this phase does not have.
+//
+// It cannot fail the turn. A failure to remember something is logged and
+// dropped: the answer is already generated, already stored and already on the
+// user's screen, and turning that into a 500 because a second model call timed
+// out would be an outright regression.
+//
+// And it is given the same context as the turn, so a client that hangs up
+// cancels it. The exchange is already saved; extracting facts for a request
+// nobody is listening to can wait for the next one.
+func (s *Service) remember(ctx context.Context, userID, convID uuid.UUID, question, answer string) []memories.Memory {
+	if s.extractor == nil {
+		return nil
+	}
+	stored, err := s.extractor.ExtractFromTurn(ctx, userID, convID, question, answer)
+	if err != nil {
+		s.log.Warn("memory extraction failed",
+			"error", err, "user_id", userID, "conversation_id", convID,
+			"stored_before_failure", len(stored))
+	}
+	return stored
 }
 
 // model names what actually generated the answer: the per-service override if

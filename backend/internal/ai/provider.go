@@ -55,7 +55,20 @@ type Options struct {
 	// MaxTokens caps the reply length. Zero or less means the provider's own
 	// limit.
 	MaxTokens int
+	// Format constrains the shape of the reply. Empty means free text;
+	// FormatJSON asks the provider to emit well-formed JSON and nothing else.
+	//
+	// It exists because one caller -- the memory extractor -- is a classifier
+	// rather than a conversation: it asks the model for a list of facts and has
+	// to parse the answer. Asking for JSON in the prompt gets valid JSON most
+	// of the time; a provider that can constrain decoding gets it nearly
+	// always, and the difference is a fact remembered or lost. A provider that
+	// does not support it ignores the field, so callers still parse defensively.
+	Format string
 }
+
+// FormatJSON is the only Format value in this phase.
+const FormatJSON = "json"
 
 // Provider is the model. Chat sends a whole prompt and returns the reply as a
 // Stream, because a local 3B model takes seconds to produce a paragraph and a
