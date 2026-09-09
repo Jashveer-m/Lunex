@@ -74,9 +74,130 @@ writing, so `Ada@Example.com` and `ada@example.com` cannot both register.
 
 ---
 
+# Phase 2 decisions
+
+## Ownership lives in the WHERE clause, not in a check after the fact
+
+Every repository method for tasks, goals and notes takes the owner id and puts
+`user_id = $n` in the statement itself. Nothing loads a row and then compares
+`row.UserID` to the caller.
+
+The difference matters when someone forgets. A post-hoc check is a line that can
+be omitted from a new method and still compile, still pass a happy-path test,
+and still return the row. A `WHERE` clause is not optional in the same way: the
+`Store` interfaces have no method that can be called without saying whose data
+it is, so the compiler is what keeps a new query scoped.
+
+Milestones have no `user_id` of their own; every milestone statement joins back
+to `goals` and filters there. The clause moves, it is never dropped.
+
+## A foreign resource is 404, not 403
+
+`403 Forbidden` on somebody else's task confirms the id exists. Enumerating ids
+would then tell an attacker how many tasks other users have, and a leaked id
+from a log or a URL could be confirmed as real. `404` says nothing.
+
+This extends past the obvious routes. A `parent_task_id` or
+`depends_on_task_id` naming another user's task also answers `404` rather than a
+`400` blaming the field, and a path id that is not even a valid UUID answers
+`404` too — one response for "not yours", "not there" and "not an id".
+
+## Enum columns are checked in the service, not by CHECK constraints
+
+`priority`, `status` and `type` are plain `text`. The allowed sets live in Go
+(`tasks.Priorities`, `goals.Types`, …) and are enforced in each module's
+validator.
+
+The trade is deliberate: a `CHECK` would catch a bad value written by hand in
+psql, but adding a status later would then need a migration, a deploy ordering
+between schema and code, and a rollback story. Values are only ever written
+through the service, and the service tests pin the sets. If a future phase adds
+another writer — an importer, a background job — the CHECK constraints become
+worth their cost and can be added then.
+
+## `sort` selects a fragment from a fixed map
+
+`ORDER BY` cannot be parameterised, so it has to be interpolated. Each module
+keeps a `Sorts` map from the public sort value to a literal SQL fragment, and
+the request is only ever used as a map key. A value that is not in the map is a
+`400` — not a silent fall back to the default, which would hide a typo behind
+plausible-looking results.
+
+`priority` sorts by rank via a `CASE`, because alphabetically `high` sorts below
+`low`. Date sorts are `NULLS LAST` in both directions: someone ordering by
+deadline wants the dated rows.
+
+## PATCH needs a three-state field
+
+`optional.Field[T]` distinguishes "key absent" from "key present and null". A
+plain `*T` collapses the two, which makes a nullable column impossible to clear
+over the wire — the handler cannot tell "leave the deadline alone" from "remove
+the deadline". `UnmarshalJSON` is only called when the key is present, which is
+what makes the `Set` flag trustworthy.
+
+The repository then builds its `SET` list from only the fields that carry an
+instruction. Two clients patching different fields of the same row do not
+overwrite each other, and an empty patch is a read rather than a write, so it
+does not fire the `updated_at` trigger.
+
+## Dependency edges are added under a per-user advisory lock
+
+`AddDependency` runs the ownership check, the cycle check and the insert in one
+transaction holding `pg_advisory_xact_lock(hashtext(user_id))`.
+
+Without the lock, two concurrent additions could each see an acyclic graph and
+together close a loop — the classic check-then-act race, and a cycle is not
+something a later reader can recover from. The lock is per user and held only
+for the length of one small transaction, so it serialises nothing that matters:
+a user is not adding two dependencies at once except by accident, which is
+exactly the case being defended against.
+
+Cycles are detected with a recursive CTE that asks whether the task is already
+reachable from its proposed dependency. Re-adding an existing edge is
+`ON CONFLICT DO NOTHING`: it is the state the caller asked for, not an error.
+
+## Every list endpoint is paged, whether or not it was asked for
+
+`limit` defaults to 50 and is clamped to 200; `offset` defaults to 0. An
+unbounded list over a table that grows without limit is a denial-of-service
+lever that costs one slow client and one large account to pull. Clamping rather
+than rejecting an oversized `limit` keeps the endpoint usable, and the effective
+values are echoed in the response so a client can tell it was clamped.
+
+Ordering always ends with `, id ASC`. Without a tiebreaker, two rows sharing a
+`created_at` can swap places between pages and a client would see one row twice
+and another never.
+
+## `text[]` is read back as JSON
+
+`database/sql` hands the driver's rendering of an array straight to `Scan`,
+which for pgx is the Postgres literal form (`{a,"b c"}`). Parsing that means
+re-implementing array quoting and escaping. The reads instead select
+`array_to_json(tags)` and `db.TextArray` unmarshals it. Writes need no adapter —
+pgx encodes a `[]string` parameter as `text[]` on its own — except that a nil
+slice would encode as SQL NULL, so `db.TextArrayParam` turns it into `{}`.
+
+## The shared transport helpers alias auth's error types
+
+`internal/httpx` provides the JSON helpers the three resource modules share.
+Its `ErrorBody` and `ValidationError` are Go type *aliases* of the ones
+`internal/auth` already defines, not copies: the API returns exactly one error
+shape, and an alias makes that a compile-time fact rather than a convention two
+packages have to keep agreeing on.
+
+## The module path still says `lifeos`
+
+The project is Lunex, and the docs, database names and comments say so. The Go
+module path is `github.com/jashveer/lifeos/backend`, which mirrors the
+repository URL — renaming it is a rename of the repository, not a code change,
+and guessing at that is not this phase's call. It is a one-line `go.mod` edit
+plus a `sed` over the imports whenever the repository moves.
+
+---
+
 # Explicitly deferred
 
-These are **not** silently skipped — they are known gaps in Phase 1.
+These are **not** silently skipped — they are known gaps.
 
 ## 1. Rate limiting is in-process, not distributed
 
@@ -119,3 +240,26 @@ token in JavaScript-reachable storage is XSS-exposed. Revisit with the auth UI.
 The frontend dev server proxies `/api` to the backend (see
 `frontend/vite.config.ts`), so same-origin holds in development. A deployment
 that serves the SPA from a different origin will need CORS configured.
+
+## 6. No recurring-task logic
+
+The brief leaves room for a `recurrence_rule` column on `tasks`. Nothing was
+added for it: a column nothing reads is a column that drifts out of date, and
+the interesting part is the expansion logic — does completing an occurrence
+create the next one, what happens to a rule edited mid-series — which is a phase
+of its own. The migration to add it later is additive and needs no backfill.
+
+## 7. List paging is limit/offset, not keyset
+
+`OFFSET n` makes the database walk and discard `n` rows, so deep pages get
+slower, and a row inserted while a client is paging shifts everything after it —
+the client sees one row twice and misses another. At Phase 2 sizes neither
+matters. The fix, when it does, is keyset paging on `(created_at, id)`, which
+the composite index already added on each table supports.
+
+## 8. No bulk or transactional multi-writes
+
+Each endpoint writes one row. Reordering a list of tasks, or completing a goal
+and all its milestones, takes one request per row and is not atomic. A
+`PATCH /tasks` accepting a list is the shape for it, and it should share the
+per-user advisory lock that dependency edits already use.

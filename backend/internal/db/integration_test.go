@@ -19,8 +19,8 @@ import (
 // These tests exercise the real SQL. They are skipped unless
 // TEST_DATABASE_URL points at a throwaway Postgres database:
 //
-//	createdb lifeos_test
-//	TEST_DATABASE_URL=postgres://localhost:5432/lifeos_test?sslmode=disable go test ./...
+//	createdb lunex_test
+//	TEST_DATABASE_URL=postgres://localhost:5432/lunex_test?sslmode=disable go test ./...
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -65,8 +65,11 @@ func TestMigrationsUpDownUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 || dirty {
-		t.Fatalf("version = %d dirty = %t, want 1 / false", version, dirty)
+	// Bump this with every migration added; a stale value here is how a
+	// migration that never runs in CI goes unnoticed.
+	const wantVersion = 2
+	if version != wantVersion || dirty {
+		t.Fatalf("version = %d dirty = %t, want %d / false", version, dirty, wantVersion)
 	}
 }
 

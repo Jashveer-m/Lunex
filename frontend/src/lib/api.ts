@@ -1,4 +1,4 @@
-// Thin fetch wrapper for the LifeOS API.
+// Thin fetch wrapper for the Lunex API.
 //
 // Phase 1 scaffold: only the health endpoint is wired up. The auth calls
 // (register / login / refresh / logout / me) land in Phase 2 together with the

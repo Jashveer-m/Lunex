@@ -1,8 +1,13 @@
-# LifeOS
+# Lunex
 
-Personal life-operating-system. **Phase 1** is the foundation only: repository
-structure, database schema and authentication. Tasks, goals, notes, documents
-and anything AI-shaped belong to later phases and are deliberately absent.
+Personal life-operating-system.
+
+- **Phase 1** — repository structure, database schema, authentication.
+- **Phase 2** — tasks, goals and notes: plain CRUD, authenticated, scoped per
+  user.
+
+Documents, RAG, memory and anything AI-shaped belong to later phases and are
+deliberately absent.
 
 ## Stack
 
@@ -17,7 +22,7 @@ and anything AI-shaped belong to later phases and are deliberately absent.
 ## Layout
 
 ```
-lifeos/
+lunex/
 ├── backend/
 │   ├── cmd/api/           # HTTP server
 │   ├── cmd/migrate/       # up / down / version
@@ -26,7 +31,13 @@ lifeos/
 │   │   ├── auth/          # argon2id, JWT, sessions, service, handlers
 │   │   ├── config/        # environment configuration
 │   │   ├── db/            # connection pool + migration runner
-│   │   └── users/         # user + profile model and repository
+│   │   ├── goals/         # goals + milestones: model, service, handlers
+│   │   ├── httpx/         # JSON transport helpers shared by the modules
+│   │   ├── notes/         # notes: model, service, handlers
+│   │   ├── optional/      # the three-state field a PATCH body needs
+│   │   ├── tasks/         # tasks + dependencies: model, service, handlers
+│   │   ├── users/         # user + profile model and repository
+│   │   └── validate/      # field rules shared by the modules
 │   ├── migrations/        # embedded .sql migrations
 │   └── go.mod
 ├── frontend/              # Vite React TS scaffold
@@ -40,12 +51,12 @@ Requires Go 1.26+, PostgreSQL 16+ and Node 20+.
 
 ```sh
 # 1. Database
-createdb lifeos
+createdb lunex
 
 # 2. Backend config
 cd backend
 cp .env.example .env          # then edit it
-export DATABASE_URL='postgres://postgres@localhost:5432/lifeos?sslmode=disable'
+export DATABASE_URL='postgres://postgres@localhost:5432/lunex?sslmode=disable'
 export JWT_SECRET="$(openssl rand -base64 48)"
 
 # 3. Migrate and run
@@ -71,7 +82,19 @@ TOKENS=$(curl -s -X POST localhost:8080/api/v1/auth/register \
   -d '{"email":"ada@example.com","password":"correct horse battery staple","name":"Ada"}')
 
 ACCESS=$(echo "$TOKENS" | python3 -c 'import sys,json;print(json.load(sys.stdin)["tokens"]["access_token"])')
-curl -s localhost:8080/api/v1/me -H "Authorization: Bearer $ACCESS"
+AUTH="Authorization: Bearer $ACCESS"
+
+curl -s localhost:8080/api/v1/me -H "$AUTH"
+```
+
+Create and list a task:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/tasks -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Ship phase 2","priority":"high","tags":["api"]}'
+
+curl -s 'localhost:8080/api/v1/tasks?status=pending&sort=-priority' -H "$AUTH"
 ```
 
 ## Configuration
@@ -81,7 +104,7 @@ curl -s localhost:8080/api/v1/me -H "Authorization: Bearer $ACCESS"
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `JWT_SECRET` | yes | — | ≥ 32 bytes; the process refuses to start otherwise |
 | `PORT` | no | `8080` | |
-| `JWT_ISSUER` | no | `lifeos` | Validated on every access token |
+| `JWT_ISSUER` | no | `lifeos` | Validated on every access token; unchanged from Phase 1 so existing tokens keep verifying |
 | `ACCESS_TOKEN_TTL` | no | `15m` | Go duration |
 | `REFRESH_TOKEN_TTL` | no | `720h` | 30 days |
 | `LOGIN_RATE_LIMIT_BURST` | no | `10` | Per-IP burst on login/register |
@@ -103,10 +126,10 @@ make frontend-dev      # start Vite
 
 - [docs/api.md](docs/api.md) — endpoint-by-endpoint API contract
 - [docs/decisions.md](docs/decisions.md) — why chi, why SHA-256 for refresh
-  tokens, and **what Phase 1 explicitly defers**
+  tokens, why a foreign resource is a 404, and **what is explicitly deferred**
 - [docs/testing.md](docs/testing.md) — test layers and how to run them
 
-## Known Phase 1 gaps
+## Known gaps
 
 Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 
@@ -120,3 +143,10 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 5. **No CORS middleware** — development relies on the Vite proxy.
 6. **Logout does not revoke outstanding access tokens**; they expire within 15
    minutes.
+7. **No recurring tasks.** The schema leaves room for a `recurrence_rule`
+   column; none of the logic exists yet.
+8. **List paging is `limit`/`offset`.** Fine at this size, but a client paging
+   deeply while rows are being inserted can see a row twice. Keyset paging is
+   the fix when it starts to matter.
+9. **The Go module path is still `github.com/jashveer/lifeos/backend`**, because
+   it mirrors the repository URL. Renaming it is a repository rename.

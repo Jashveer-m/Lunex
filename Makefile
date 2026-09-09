@@ -1,6 +1,6 @@
 # Convenience targets. Everything here is a thin wrapper over go/npm.
-DATABASE_URL ?= postgres://postgres@localhost:5432/lifeos?sslmode=disable
-TEST_DATABASE_URL ?= postgres://postgres@localhost:5432/lifeos_test?sslmode=disable
+DATABASE_URL ?= postgres://postgres@localhost:5432/lunex?sslmode=disable
+TEST_DATABASE_URL ?= postgres://postgres@localhost:5432/lunex_test?sslmode=disable
 
 .PHONY: build test test-integration migrate-up migrate-down migrate-version run fmt vet frontend-dev frontend-build
 

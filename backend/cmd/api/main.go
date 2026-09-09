@@ -1,4 +1,4 @@
-// Command api runs the LifeOS HTTP API.
+// Command api runs the Lunex HTTP API.
 package main
 
 import (
@@ -15,6 +15,9 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/auth"
 	"github.com/jashveer/lifeos/backend/internal/config"
 	"github.com/jashveer/lifeos/backend/internal/db"
+	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/tasks"
 	"github.com/jashveer/lifeos/backend/internal/users"
 	"github.com/jashveer/lifeos/backend/migrations"
 )
@@ -66,8 +69,15 @@ func run(logger *slog.Logger) error {
 	tokens := auth.NewTokenIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL)
 	service := auth.NewService(userRepo, sessionRepo, tokens, cfg.RefreshTokenTTL)
 
+	taskSvc := tasks.NewService(tasks.NewRepository(pool))
+	goalSvc := goals.NewService(goals.NewRepository(pool))
+	noteSvc := notes.NewService(notes.NewRepository(pool))
+
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(service, logger),
+		Tasks:       tasks.NewHandler(taskSvc, logger),
+		Goals:       goals.NewHandler(goalSvc, logger),
+		Notes:       notes.NewHandler(noteSvc, logger),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(cfg.LoginRateLimit, cfg.LoginRateLimitBurst),
 		DB:          pool,

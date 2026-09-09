@@ -1,4 +1,4 @@
-// Package api wires the HTTP routes for the LifeOS API.
+// Package api wires the HTTP routes for the Lunex API.
 package api
 
 import (
@@ -13,11 +13,17 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
 // Deps are everything the router needs to build the route tree.
 type Deps struct {
 	Auth        *auth.Handler
+	Tasks       *tasks.Handler
+	Goals       *goals.Handler
+	Notes       *notes.Handler
 	Tokens      *auth.TokenIssuer
 	RateLimiter *auth.IPRateLimiter
 	DB          *sql.DB
@@ -53,6 +59,14 @@ func NewRouter(d Deps) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAuth(d.Tokens))
 			r.Get("/me", d.Auth.Me)
+
+			// Phase 2 resources. Each module owns its own subtree, so adding
+			// a route never means editing a shared switch statement, and the
+			// RequireAuth wrapper is applied once for all of them rather than
+			// remembered per route.
+			r.Mount("/tasks", d.Tasks.Routes())
+			r.Mount("/goals", d.Goals.Routes())
+			r.Mount("/notes", d.Notes.Routes())
 		})
 	})
 

@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,6 +13,10 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/tasks"
+	"github.com/jashveer/lifeos/backend/internal/users"
 )
 
 // The router is exercised end to end against the real service; only the
@@ -19,14 +24,39 @@ import (
 // coverage lives in the integration tests (see docs/testing.md).
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	tokens := auth.NewTokenIssuer([]byte("router-test-secret-at-least-32-bytes"), "lifeos-test", 15*time.Minute)
-	svc := auth.NewService(newMemoryUserStore(), newMemorySessionStore(), tokens, 24*time.Hour)
+	return newServer(t, nil)
+}
+
+// newServer builds the whole route tree. Passing a nil pool is deliberate: the
+// auth tests never reach a resource handler, so the Phase 2 repositories are
+// wired but never queried, and the tests that do query them (see
+// isolation_test.go) pass a real pool. Faking the three resource stores
+// instead would only prove that the fakes scope by user — which is exactly the
+// property worth testing against the real SQL.
+func newServer(t *testing.T, pool *sql.DB) *httptest.Server {
+	t.Helper()
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tokens := auth.NewTokenIssuer([]byte("router-test-secret-at-least-32-bytes"), "lunex-test", 15*time.Minute)
+
+	// With a pool, auth runs on the real repositories too: the Phase 2 tables
+	// have a foreign key to users, so a user id invented by an in-memory store
+	// could not own a task.
+	var userStore auth.UserStore = newMemoryUserStore()
+	var sessionStore auth.SessionStore = newMemorySessionStore()
+	if pool != nil {
+		userStore = users.NewRepository(pool)
+		sessionStore = auth.NewSessionRepository(pool)
+	}
+	svc := auth.NewService(userStore, sessionStore, tokens, 24*time.Hour)
 	handler := api.NewRouter(api.Deps{
-		Auth:        auth.NewHandler(svc, slog.New(slog.NewTextHandler(io.Discard, nil))),
+		Auth:        auth.NewHandler(svc, discard),
+		Tasks:       tasks.NewHandler(tasks.NewService(tasks.NewRepository(pool)), discard),
+		Goals:       goals.NewHandler(goals.NewService(goals.NewRepository(pool)), discard),
+		Notes:       notes.NewHandler(notes.NewService(notes.NewRepository(pool)), discard),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(100, 100),
-		DB:          nil, // healthz degrades to a liveness check
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DB:          pool, // nil degrades healthz to a liveness check
+		Logger:      discard,
 	})
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -138,8 +168,44 @@ func TestRouterSetsSecurityHeaders(t *testing.T) {
 
 func TestUnknownRouteIs404(t *testing.T) {
 	srv := newTestServer(t)
-	resp, _ := doJSON(t, srv, http.MethodGet, "/api/v1/tasks", "", nil)
+	resp, _ := doJSON(t, srv, http.MethodGet, "/api/v1/nonexistent", "", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// Every Phase 2 route sits behind RequireAuth. This is the cheap half of the
+// isolation story: without a token there is no user id on the context, so a
+// handler never runs at all. The other half — one user reaching another
+// user's rows — is in isolation_test.go, against real SQL.
+func TestPhase2RoutesRequireAuth(t *testing.T) {
+	srv := newTestServer(t)
+	id := "5c2c9b6f-0f8e-4f4c-9f2b-0f0d9b6f0f8e"
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/tasks"},
+		{http.MethodPost, "/api/v1/tasks"},
+		{http.MethodGet, "/api/v1/tasks/" + id},
+		{http.MethodPatch, "/api/v1/tasks/" + id},
+		{http.MethodDelete, "/api/v1/tasks/" + id},
+		{http.MethodPost, "/api/v1/tasks/" + id + "/dependencies"},
+		{http.MethodGet, "/api/v1/goals"},
+		{http.MethodPost, "/api/v1/goals"},
+		{http.MethodGet, "/api/v1/goals/" + id},
+		{http.MethodPatch, "/api/v1/goals/" + id},
+		{http.MethodDelete, "/api/v1/goals/" + id},
+		{http.MethodPost, "/api/v1/goals/" + id + "/milestones"},
+		{http.MethodPatch, "/api/v1/goals/" + id + "/milestones/" + id},
+		{http.MethodGet, "/api/v1/notes"},
+		{http.MethodPost, "/api/v1/notes"},
+		{http.MethodGet, "/api/v1/notes/" + id},
+		{http.MethodPatch, "/api/v1/notes/" + id},
+		{http.MethodDelete, "/api/v1/notes/" + id},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			resp, _ := doJSON(t, srv, tc.method, tc.path, "", nil)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", resp.StatusCode)
+			}
+		})
 	}
 }

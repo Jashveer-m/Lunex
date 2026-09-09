@@ -19,7 +19,7 @@ export default function App() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-950 p-6 text-slate-100">
       <div className="w-full max-w-md rounded-xl border border-slate-800 bg-slate-900 p-8 shadow-lg">
-        <h1 className="text-2xl font-semibold tracking-tight">LifeOS</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Lunex</h1>
         <p className="mt-2 text-sm text-slate-400">
           Phase 1 scaffold — backend, database and auth only. The UI lands in a later phase.
         </p>
