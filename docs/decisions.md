@@ -430,3 +430,198 @@ Once in `documents.extracted_text` and again, in overlapping windows, across
 in the database. It is the right trade while retrieval must return the exact
 string it embedded — but it is why the 800-chunk cap and the 10 MB upload limit
 matter more than they would if chunks were offsets into the text.
+
+---
+
+# Phase 4 decisions
+
+## The provider is an interface, and no cloud provider is implemented
+
+`internal/ai` defines `Provider` (`Chat(ctx, messages, opts) (Stream, error)`)
+with two implementations: `Ollama`, and `Mock`. **There is deliberately no
+Anthropic or OpenAI implementation in this phase** — the brief scopes it out —
+but the interface is shaped so adding one is a new file in `internal/ai` plus
+one line in `cmd/api`, and nothing in `internal/chat` changes. What that costs
+is stated rather than hidden: `Options` carries only `Model`, `Temperature` and
+`MaxTokens`, so a hosted provider's extras (system-prompt caching, tool use,
+structured output, a per-request key) will need the struct to grow. Growing an
+options struct is a smaller change than unpicking Ollama's wire format from an
+orchestrator.
+
+`Mock` lives in the package rather than in a `_test.go` file because three
+packages' tests need it, and a test helper that three packages import is
+production code with a small audience. It is also why `go test ./...` is green
+on a machine with no model server.
+
+## The grounding rule is enforced in three places, not one
+
+The master spec's rule — never claim an answer came from the user's data when
+it did not — is not something a system prompt alone can deliver. It is
+implemented as:
+
+1. **A retrieval floor.** `CHAT_MIN_SIMILARITY` defaults to `0.5`. Vector
+   search always returns the nearest *k* chunks however far away they are, so
+   with no floor an unrelated question is handed a distant chunk and the model
+   is then being asked to resist material it was told was relevant. The floor
+   removes the temptation instead of relying on the model to. Measured against
+   the corpus in `scripts/e2e.sh` with nomic-embed-text: the question the notes
+   answer scores 0.73, "the current price of Brent crude" scores 0.43, "how do
+   I make sourdough starter" 0.38. 0.5 sits in that gap.
+2. **An explicitly empty context.** When nothing is retrieved the prompt still
+   carries a `CONTEXT` section, saying so in words. An absent section reads
+   like an oversight; an explicitly empty one reads like an answer.
+3. **Citations checked after the fact.** `Source.Cited` is set by reading the
+   generated answer for the `S1`-style labels it was actually given. Retrieval
+   typically offers five things and an answer uses one, so recording all five
+   as "used" would make the stored citation trail useless for the question it
+   exists to answer — what was this claim based on?
+
+The system prompt states the rule too, including what to do instead (say it
+was not found, then answer from general knowledge and say so). Prompts are the
+weakest of the four, which is why they are not the only one.
+
+## The assistant cannot take actions, and says so
+
+There is no approval engine in this phase, so an assistant that answered "done,
+I've added that task" would be lying about a write that cannot happen. The
+system prompt says it can only read and must tell the user to do it themselves.
+Structurally, `chat.Deps` is given `DocumentSearcher`, `TaskLister`,
+`GoalLister` and `NoteLister` — four read interfaces — so there is no write
+path to reach even by accident. Adding one will be a deliberate change to that
+struct.
+
+A caveat worth stating: a 3B model asked to create a task answers "I'm not able
+to take actions on your behalf" and then, sometimes, offers to help create one
+anyway. It does not claim to have done it, and nothing is written. A larger
+model is the fix, not more prompt.
+
+## Streaming is Server-Sent Events, not chunked text
+
+Both were on the table. SSE won on one point: the answer is not only text.
+Every turn also has a citation list that a client wants *before* the first
+token, so it can show what the reply is grounded in while it is still being
+written. SSE names each frame and carries a JSON body, so `sources`, `token`,
+`done` and `error` are distinguishable without inventing a length-prefixed
+protocol inside a chunked body. Token text is JSON-encoded because models emit
+newlines mid-sentence and an SSE frame ends at a blank line.
+
+This is SSE *framing* over a normal authenticated `POST`, not an `EventSource`
+resource — `EventSource` can send neither a body nor an `Authorization` header,
+so clients read it with `fetch`.
+
+The cost: the response commits to `200 OK` at the first frame. That is why the
+orchestrator does retrieval *and* opens the model stream before touching the
+sink — everything that can fail with a meaningful status code (`404`, `400`,
+`503`) fails while the HTTP layer can still choose one, and only a
+mid-generation failure has to be reported as an `error` event.
+
+There is no keep-alive comment on the stream. A local model's first token
+usually arrives in a few seconds and the `sources` frame is sent before it, so
+a proxy sees traffic early. A slow hosted model behind an idle-timeout proxy
+would want one.
+
+## A failed turn persists nothing
+
+If generation fails — the model refuses the call, the stream is cut off, the
+reply is empty, the client hangs up — neither message is written. The
+alternative, keeping the question and discarding the answer, leaves a dangling
+user message that the next turn replays as history and that a client cannot
+distinguish from a question the assistant ignored. Resending is the retry.
+
+The whole turn is one transaction, so a reader never sees a question without
+its answer. That transaction is opened by an `UPDATE conversations … RETURNING
+id`, which does three jobs at once: it proves the conversation is the caller's
+(no rows means it is not), applies the derived title if the conversation is
+still called `New conversation`, and moves `updated_at` through the existing
+`set_updated_at` trigger — inserting a message would not otherwise touch the
+parent row, and the conversation list sorts on it.
+
+## Messages have no user_id, so ownership runs through the join
+
+The brief's schema hangs `messages` off `conversations` alone. Ownership is
+still in the `WHERE` clause rather than checked after the row is in memory —
+every message statement joins `conversations` and filters `user_id` there — it
+just costs one join. `messages_conversation_id_created_at_idx` is what makes
+that join and the "last N messages" read a single scan, and it doubles as the
+index the `ON DELETE CASCADE` lookup needs, which the foreign key does not
+create by itself.
+
+## Message timestamps come from clock_timestamp(), not now()
+
+`now()` is the *transaction's* start time, so both messages of a turn would
+carry the identical timestamp and their read order would fall to the tie-break
+on a random uuid — which can put the answer before the question. The inserts
+use `clock_timestamp()`, which reads the wall clock per statement.
+
+The sharp edge: `clock_timestamp()` has microsecond resolution, and two rows
+written a microsecond apart would tie. Two round trips to Postgres take far
+longer than that, so it does not happen in practice — but if the ordering ever
+needs to be a guarantee rather than an overwhelming likelihood, the fix is a
+monotonic `seq` column on `messages`, and `ORDER BY` moves to it.
+
+## The request timeout is per subtree, because a nested one only shortens
+
+`middleware.Timeout` derives its context from the one already on the request,
+so a nested `Timeout` can only shorten the deadline it inherits: a two-minute
+budget underneath a thirty-second one is thirty seconds.
+
+Phases 1–3 applied a 30-second timeout at the root and a longer one on
+`/documents` beneath it, which meant `DOCUMENT_PROCESS_TIMEOUT` never actually
+took effect — an upload was cut off at 30 seconds regardless. Phase 4 found it
+the obvious way: the first real chat turn against a cold llama3.2:3b died at
+exactly 30 seconds with `context deadline exceeded`. The router now applies the
+budget per subtree and none of them nest.
+
+`RequireAuth` is repeated on each of those three groups rather than lifted onto
+the `/api/v1` router, because a router-level middleware runs *before* routing:
+an unknown path under `/api/v1` would then answer `401` instead of `404`.
+
+## Tasks, goals and notes are retrieved by heuristic, not semantically
+
+They have no embeddings in this phase. What they get instead is a stated rule:
+up to 5 tasks (in progress by recency, then pending by nearest deadline), up to
+5 active goals by nearest deadline, and the 3 most recently updated notes.
+The difference is visible to the model — a chunk arrives with a similarity
+score, an item arrives as background the question may or may not be about — and
+`Cited` records which of it the answer actually used.
+
+The consequence is real: "what did I write about the aurora" searches
+documents properly, while "which of my notes mentions the antenna" only sees
+the three most recent notes. Embedding tasks, goals and notes into the same
+`document_chunks`-style index is the fix and is a later phase.
+
+## Conversation history is the whole of the memory
+
+The last 20 messages are replayed as real user/assistant turns. There is no
+extraction, no summarisation and no long-term store — Phase 5 owns those — so
+a conversation longer than 20 messages forgets its own beginning, silently.
+The context block sits immediately before the new question rather than at the
+top of the prompt, because it was retrieved for *that* question; putting it
+next to the question is what stops the model attributing it to an earlier turn.
+
+## Titles are derived, not generated
+
+A conversation is named from the first line of its first message, cut to 60
+characters. Asking the model for a title would cost a second round trip per
+conversation, and a title is a label in a sidebar rather than a summary.
+
+## What Phase 4 does not have
+
+1. **No cloud provider.** Interface only; see above.
+2. **No memory system.** Phase 5.
+3. **No agents.** One general assistant.
+4. **No knowledge graph, no action/approval engine.** The assistant reads.
+5. **No regeneration, no editing a message, no branching.** A conversation is
+   append-only.
+6. **No streaming cancellation that survives the request.** A client that hangs
+   up abandons the turn; the model's own generation is cancelled with the
+   request context and nothing is stored.
+7. **No token accounting.** `MaxTokens` bounds the reply and the context budget
+   is counted in characters, not tokens. A prompt that overflows the model's
+   window is truncated by Ollama, silently.
+8. **No reranking of the retrieved set**, and no hybrid search — inherited from
+   Phase 3, and it matters more here, because a chunk that scrapes past the
+   floor is shown to a model rather than to a person who can dismiss it.
+9. **No per-user rate limit on generation.** A user can hold as many concurrent
+   turns open as they have connections, each occupying the model server. The
+   `CHAT_TIMEOUT` budget is the only bound.

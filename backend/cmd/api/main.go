@@ -11,8 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/config"
 	"github.com/jashveer/lifeos/backend/internal/db"
 	"github.com/jashveer/lifeos/backend/internal/documents"
@@ -84,12 +86,41 @@ func run(logger *slog.Logger) error {
 		"base_url", cfg.OllamaBaseURL, "model", embedder.Model(), "dimensions", embedder.Dimensions())
 	docSvc := documents.NewService(documents.NewRepository(pool), embedder, logger, cfg.DocumentProcessTimeout)
 
+	// Same story for the chat model: built, not dialled. Ollama being down
+	// makes a chat turn a 503; it does not stop the API serving tasks.
+	//
+	// This is the one place a provider is chosen. Swapping in a hosted model
+	// later is a change to this expression and nothing else -- internal/chat
+	// depends on ai.Provider, not on Ollama.
+	provider := ai.NewOllama(cfg.OllamaBaseURL, cfg.ChatModel, cfg.ChatTimeout)
+	logger.Info("chat provider configured",
+		"base_url", cfg.OllamaBaseURL, "model", provider.Model(),
+		"min_similarity", cfg.ChatMinSimilarity)
+	chatSvc := chat.NewService(chat.Deps{
+		Store:    chat.NewRepository(pool),
+		Provider: provider,
+		// Retrieval reads through the Phase 2/3 services, not their
+		// repositories: the assistant sees exactly what the API would return,
+		// validation and ownership included.
+		Documents: docSvc,
+		Tasks:     taskSvc,
+		Goals:     goalSvc,
+		Notes:     noteSvc,
+		Logger:    logger,
+		Options: chat.Options{
+			Temperature:   cfg.ChatTemperature,
+			MaxTokens:     cfg.ChatMaxTokens,
+			MinSimilarity: cfg.ChatMinSimilarity,
+		},
+	})
+
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(service, logger),
 		Tasks:       tasks.NewHandler(taskSvc, logger),
 		Goals:       goals.NewHandler(goalSvc, logger),
 		Notes:       notes.NewHandler(noteSvc, logger),
 		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
+		Chat:        chat.NewHandler(chatSvc, logger),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(cfg.LoginRateLimit, cfg.LoginRateLimitBurst),
 		DB:          pool,
@@ -98,6 +129,7 @@ func run(logger *slog.Logger) error {
 		// long is ended by the handler -- which can still answer -- rather
 		// than by the socket, which cannot.
 		DocumentTimeout: cfg.DocumentProcessTimeout + 5*time.Second,
+		ChatTimeout:     cfg.ChatTimeout + 5*time.Second,
 	})
 
 	go sweepExpiredSessions(ctx, sessionRepo, logger)

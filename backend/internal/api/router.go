@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -26,6 +27,7 @@ type Deps struct {
 	Goals       *goals.Handler
 	Notes       *notes.Handler
 	Documents   *documents.Handler
+	Chat        *chat.Handler
 	Tokens      *auth.TokenIssuer
 	RateLimiter *auth.IPRateLimiter
 	DB          *sql.DB
@@ -33,6 +35,9 @@ type Deps struct {
 	// DocumentTimeout overrides the global request timeout for /documents.
 	// Zero falls back to the global one.
 	DocumentTimeout time.Duration
+	// ChatTimeout does the same for /conversations, where a turn waits on a
+	// model rather than on an embedder. Zero falls back to the global one.
+	ChatTimeout time.Duration
 }
 
 // NewRouter returns the fully wired handler for the API.
@@ -44,16 +49,21 @@ func NewRouter(d Deps) http.Handler {
 	// X-Forwarded-For, which is client-controlled until a trusted proxy is in
 	// front of this process, and the rate limiter keys on RemoteAddr.
 	r.Use(middleware.Recoverer)
-	// The global request budget. /documents raises it below: uploading is
-	// synchronous in this phase, and embedding a long document is minutes of
-	// honest work rather than a stuck request.
-	r.Use(middleware.Timeout(30 * time.Second))
 	r.Use(securityHeaders)
 
-	r.Get("/healthz", healthz(d.DB))
+	// The request budget is applied per subtree rather than once at the root.
+	//
+	// middleware.Timeout derives its context from the one already on the
+	// request, so a nested Timeout can only ever shorten the deadline it
+	// inherits: a two-minute budget underneath a thirty-second one is thirty
+	// seconds. A root-level 30s would silently cap uploads and chat turns at
+	// 30s however large their own budgets were set -- so each subtree names
+	// its own, and none of them nest.
+	r.With(middleware.Timeout(requestTimeout)).Get("/healthz", healthz(d.DB))
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Route("/auth", func(r chi.Router) {
+			r.Use(middleware.Timeout(requestTimeout))
 			// Rate limiting guards the endpoints that are worth guessing at.
 			r.Group(func(r chi.Router) {
 				r.Use(d.RateLimiter.Middleware)
@@ -64,8 +74,16 @@ func NewRouter(d Deps) http.Handler {
 			r.Post("/logout", d.Auth.Logout)
 		})
 
+		// RequireAuth is repeated per group rather than lifted onto the
+		// /api/v1 router itself, because a router-level middleware runs
+		// before routing: an unknown path under /api/v1 would then answer
+		// 401 instead of 404, which tells an unauthenticated caller nothing
+		// but is still the wrong answer.
+
+		// Everything that answers from the database alone.
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAuth(d.Tokens))
+			r.Use(middleware.Timeout(requestTimeout))
 			r.Get("/me", d.Auth.Me)
 
 			// Phase 2 resources. Each module owns its own subtree, so adding
@@ -75,20 +93,37 @@ func NewRouter(d Deps) http.Handler {
 			r.Mount("/tasks", d.Tasks.Routes())
 			r.Mount("/goals", d.Goals.Routes())
 			r.Mount("/notes", d.Notes.Routes())
+		})
 
-			// Phase 3. The upload pipeline runs inside the request, so this
-			// subtree gets its own, longer, timeout; every other route keeps
-			// the 30 seconds set above.
-			r.Group(func(r chi.Router) {
-				if d.DocumentTimeout > 0 {
-					r.Use(middleware.Timeout(d.DocumentTimeout))
-				}
-				r.Mount("/documents", d.Documents.Routes())
-			})
+		// Phase 3. The upload pipeline runs inside the request -- extract,
+		// chunk, embed, store -- so this subtree gets a longer budget.
+		r.Group(func(r chi.Router) {
+			r.Use(auth.RequireAuth(d.Tokens))
+			r.Use(middleware.Timeout(orDefault(d.DocumentTimeout)))
+			r.Mount("/documents", d.Documents.Routes())
+		})
+
+		// Phase 4. A chat turn retrieves, generates and streams, all inside
+		// the request, and a local model outlives 30 seconds routinely.
+		r.Group(func(r chi.Router) {
+			r.Use(auth.RequireAuth(d.Tokens))
+			r.Use(middleware.Timeout(orDefault(d.ChatTimeout)))
+			r.Mount("/conversations", d.Chat.Routes())
 		})
 	})
 
 	return r
+}
+
+// requestTimeout is the budget for a request that only touches the database.
+const requestTimeout = 30 * time.Second
+
+// orDefault falls back to the ordinary budget for a subtree whose own is unset.
+func orDefault(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return requestTimeout
 }
 
 // healthz reports process liveness plus database reachability.

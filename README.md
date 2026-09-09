@@ -8,10 +8,14 @@ Personal life-operating-system.
 - **Phase 3** — documents and retrieval: upload a PDF or Markdown/text file,
   extract its text, chunk it, embed it with a local Ollama, store the vectors in
   pgvector, and search them with citations.
+- **Phase 4** — the AI assistant: a provider abstraction over the LLM, an
+  orchestrator that pulls the retrieved chunks plus your tasks, goals and notes
+  into the prompt, and a streaming chat API that records exactly what grounded
+  each answer.
 
-AI chat, agents, memory and the knowledge graph belong to later phases and are
-deliberately absent. Phase 3 builds the retrieval function those phases will
-call, not a chat UI.
+Memory, agents, the knowledge graph and the action/approval engine belong to
+later phases and are deliberately absent. The Phase 4 assistant answers
+questions; it does not create or change anything, and it says so if you ask.
 
 ## Stack
 
@@ -20,6 +24,7 @@ call, not a chat UI.
 | API | Go 1.26, [chi](https://github.com/go-chi/chi) router |
 | Database | PostgreSQL 16 + [pgvector](https://github.com/pgvector/pgvector), migrations via golang-migrate (embedded) |
 | Embeddings | [Ollama](https://ollama.com) running `nomic-embed-text` (768 dimensions) locally |
+| Chat model | Ollama running `llama3.2:3b` locally, behind an `ai.Provider` interface |
 | PDF text | [ledongthuc/pdf](https://github.com/ledongthuc/pdf) — text layer only |
 | Passwords | Argon2id (`golang.org/x/crypto/argon2`) |
 | Tokens | HS256 access JWT (15 min) + rotating opaque refresh token (30 days) |
@@ -33,8 +38,10 @@ lunex/
 │   ├── cmd/api/           # HTTP server
 │   ├── cmd/migrate/       # up / down / version
 │   ├── internal/
+│   │   ├── ai/            # LLM provider interface + Ollama and mock backends
 │   │   ├── api/           # router and middleware wiring
 │   │   ├── auth/          # argon2id, JWT, sessions, service, handlers
+│   │   ├── chat/          # conversations, the RAG orchestrator, SSE streaming
 │   │   ├── config/        # environment configuration
 │   │   ├── db/            # connection pool, migration runner, pgvector param
 │   │   ├── documents/     # upload, extract, chunk, embed, search
@@ -50,7 +57,7 @@ lunex/
 │   └── go.mod
 ├── frontend/              # Vite React TS scaffold
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> search, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> search -> ask -> cite, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -63,6 +70,7 @@ Requires Go 1.26+, PostgreSQL 16+ with pgvector, Ollama, and Node 20+.
 brew install pgvector          # or: apt install postgresql-16-pgvector
 brew install ollama && ollama serve &
 ollama pull nomic-embed-text
+ollama pull llama3.2:3b        # the chat model (Phase 4)
 
 # 1. Database
 createdb lunex
@@ -125,6 +133,31 @@ curl -s -X POST localhost:8080/api/v1/documents/search -H "$AUTH" \
 # {"count":1,"results":[{"filename":"notes.txt","chunk_index":0,"similarity":0.73,"content":"The aurora…"}]}
 ```
 
+Ask the assistant about it:
+
+```sh
+CONV=$(curl -s -X POST localhost:8080/api/v1/conversations -H "$AUTH" \
+  -H 'Content-Type: application/json' -d '{}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+curl -N -X POST "localhost:8080/api/v1/conversations/$CONV/messages" -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"What do my notes say happened over the tundra?"}'
+# event: sources
+# data: {"sources":[{"type":"document","label":"S1","title":"notes.txt","similarity":0.73,…}],"count":1}
+# event: token
+# data: {"text":"According"}
+# …
+# event: done
+# data: {"conversation_id":"…","message":{"content":"According to [S1], …","sources":[…]},"model":"llama3.2:3b"}
+```
+
+The reply streams as Server-Sent Events, and the `sources` frame arrives before
+the first token so a client can show what the answer is grounded in while it is
+still being written. Ask something your data does not answer and the assistant
+says so rather than inventing a citation — see
+[docs/decisions.md](docs/decisions.md) for how that is enforced.
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
@@ -142,6 +175,11 @@ curl -s -X POST localhost:8080/api/v1/documents/search -H "$AUTH" \
 | `EMBEDDING_DIMENSIONS` | no | `768` | Must match the `vector(n)` column in migration 000003 |
 | `MAX_UPLOAD_BYTES` | no | `10485760` | 10 MB; rejected before the file is read |
 | `DOCUMENT_PROCESS_TIMEOUT` | no | `2m` | Budget for one synchronous upload; also sets the server's read/write timeout |
+| `CHAT_MODEL` | no | `llama3.2:3b` | The Ollama chat model |
+| `CHAT_TIMEOUT` | no | `3m` | Budget for one whole turn: retrieve, generate, persist |
+| `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
+| `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
+| `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
 
 ## Common commands
 
@@ -149,7 +187,7 @@ curl -s -X POST localhost:8080/api/v1/documents/search -H "$AUTH" \
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -202,3 +240,24 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 14. **Embeddings are tied to nomic-embed-text.** Vectors from two models are not
     comparable, so changing the model means a migration that changes the column
     and re-embeds every chunk.
+15. **No cloud LLM provider.** `internal/ai` defines the interface and ships
+    Ollama and a mock; adding Anthropic or OpenAI is a new file there plus one
+    line in `cmd/api`, but `Options` will need to grow for a hosted provider's
+    extras.
+16. **Tasks, goals and notes are retrieved by heuristic, not semantically.**
+    They have no embeddings yet, so the assistant sees what is in progress, due
+    soonest and recently touched — not what is relevant to the question.
+    Documents are the only semantic half.
+17. **Conversation history is the whole memory.** The last 20 messages are
+    replayed; there is no extraction and no long-term store, so a longer
+    conversation forgets its own beginning silently. That is Phase 5.
+18. **The assistant cannot take actions.** It reads and answers. Asked to
+    create a task it says so; nothing in the chat path writes to tasks, goals,
+    notes or documents.
+19. **A failed turn is not saved at all** — not the question, not a partial
+    answer. Resending is the retry.
+20. **No token accounting.** The context budget is counted in characters, and a
+    prompt that overflows the model's window is truncated by Ollama silently.
+21. **No per-user rate limit on generation.** One user can hold as many
+    concurrent turns open as they have connections; `CHAT_TIMEOUT` is the only
+    bound.

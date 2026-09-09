@@ -14,12 +14,18 @@
 | Chunking, text extraction, filename and query rules | `internal/documents/{chunk,extract,validate}_test.go` | no |
 | Document pipeline use cases (fake store + fake embedder) | `internal/documents/service_test.go` | no |
 | Ollama client: batching, widths, outages | `internal/embeddings/ollama_test.go` | no |
+| Chat provider: streaming, refusals, truncated streams | `internal/ai/ollama_test.go` | no |
+| The mock provider's own contract | `internal/ai/mock_test.go` | no |
+| Orchestrator: grounding, citations, failure modes (fakes + MockProvider) | `internal/chat/service_test.go` | no |
+| Prompt assembly, citation extraction, context budget | `internal/chat/prompt_test.go` | no |
+| SSE framing, status codes, in-band errors | `internal/chat/handlers_test.go` | no |
 | Config loading | `internal/config/config_test.go` | no |
 | Migrations, constraints, cascades, atomic rotation | `internal/db/integration_test.go` | **yes** |
 | Phase 2 SQL: filters, sorting, partial updates, dependency cycles | `internal/db/phase2_integration_test.go` | **yes** |
 | Phase 3 SQL: pgvector round trip, cosine ordering, cascades | `internal/db/phase3_integration_test.go` | **yes** |
+| Phase 4 SQL: jsonb sources, turn atomicity, message ordering, cascades | `internal/db/phase4_integration_test.go` | **yes** |
 | Cross-user isolation over the whole stack, documents included | `internal/api/isolation_test.go` | **yes** |
-| The whole pipeline against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
+| The whole pipeline and the assistant against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
 
 ## Running
 
@@ -57,9 +63,12 @@ brew install pgvector        # or: apt install postgresql-16-pgvector
 ```
 
 None of the Go tests need Ollama. The document tests use a deterministic
-bag-of-words embedder (`internal/api/embedder_test.go`) so that what they
-measure is the routing, the SQL scoping and the pipeline's own logic — not
-whether a model understood a sentence.
+bag-of-words embedder (`internal/api/embedder_test.go`) and the chat tests use
+`ai.Mock`, so that what they measure is the routing, the SQL scoping and the
+orchestrator's own logic — not whether a model understood a sentence. `ai.Mock`
+records every prompt it was given, which is how the grounding assertions are
+made: whether the retrieved chunk reached the model, whether the system prompt
+carried the rules, and whose data was in the context.
 
 ## The end-to-end check
 
@@ -69,11 +78,28 @@ phrase from it, and asserts the chunk comes back with the right filename and a
 similarity in `(0, 1]` — then deletes the document and checks the chunks went
 with it.
 
+Since Phase 4 it also asks the assistant two questions against a real
+llama3.2:3b, which is the check the phase turns on:
+
+- **a question the document answers** — the stream must lead with a `sources`
+  frame naming `field-notes.txt`, the stored answer must mark that source
+  `cited`, and the text must use what was retrieved;
+- **a question nothing in the corpus answers** — nothing may be retrieved (the
+  similarity floor), the answer may contain no `[S…]` citation, and it may not
+  claim to have found anything in the user's documents.
+
+It then reads the conversation back and checks both turns are stored in order,
+with sources on the grounded answer only.
+
 ```sh
 ollama serve &                       # if it is not already running
 ollama pull nomic-embed-text         # once
+ollama pull llama3.2:3b              # once
 make test-e2e
 ```
+
+A run against a cold model takes a couple of minutes: the first turn includes
+loading llama3.2:3b into memory.
 
 ## What the tests assert
 
@@ -166,3 +192,49 @@ Phase 3:
 - the `status` CHECK constraint rejects anything outside
   `processing`/`ready`/`failed`;
 - deleting a document, or a user, cascades to every chunk.
+
+Phase 4:
+
+- **cross-user isolation for conversations**, end to end and against real SQL:
+  user B gets `404` — not `403` — on GET, DELETE and *sending a message to* A's
+  conversation, B's list holds only B's rows, and A's conversation is verified
+  unchanged afterwards, so a wrong status code cannot hide a message that
+  actually landed;
+- the part unique to this phase: B asking the assistant *the exact words in A's
+  document* retrieves nothing and gets an answer that says nothing was found —
+  the retrieval path could leak another user's text without ever naming an id;
+- the control that makes those non-vacuous: A asking the same question does
+  retrieve the document, and the answer cites it with the right filename, id
+  and label;
+- an unrelated question retrieves nothing above the similarity floor and
+  produces no citation — the grounding rule, end to end;
+- `Cited` is read off the generated answer: a source that was offered and not
+  referenced is recorded as uncited, and a label the model never saw is not
+  matched;
+- a bracketed group that is not a citation — a Markdown link, a bare `S1` in
+  prose — does not mark anything as cited;
+- every dependency (document search, task/goal/note lists, the conversation
+  store) is called with the authenticated user id and nothing from the request;
+- a failed turn persists nothing: a refused model call, a stream cut off
+  partway, an empty reply, a failed retrieval and a client that hung up are
+  each pinned separately, and each leaves the conversation exactly as it was;
+- everything that fails before the first token is an ordinary JSON error with a
+  real status code, and only a mid-generation failure is an in-band `error`
+  event on an already-committed `200`;
+- the streamed tokens reassemble into exactly the stored message content,
+  newlines included;
+- the model stream is a stream: a three-frame reply arrives as three pieces,
+  and a body that ends without `done: true` is reported as a truncated answer
+  rather than stored as a finished one;
+- a cancelled caller is distinguished from a model outage, so an abandoned
+  request is not logged as a 503;
+- the retrieval floor and the top-k are applied to the document search, and the
+  task/goal/note heuristic is the stated one;
+- a turn is atomic: an invalid role on the second message rolls back the first
+  *and* the conversation rename;
+- the answer is never stored before its question, and a long conversation
+  returns its most recent window in order;
+- the `role` CHECK rejects anything outside `user`/`assistant`/`system`;
+- `sources` survives the jsonb round trip whole, pointers included, and a user
+  message reads back as NULL rather than `[]`;
+- deleting a conversation, or a user, cascades to every message.

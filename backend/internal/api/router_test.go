@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -36,6 +38,13 @@ func newTestServer(t *testing.T) *httptest.Server {
 // property worth testing against the real SQL.
 func newServer(t *testing.T, pool *sql.DB) *httptest.Server {
 	t.Helper()
+	return newServerWithProvider(t, pool, &ai.Mock{})
+}
+
+// newServerWithProvider is the same tree with a chosen model, so a test can
+// decide what the assistant answers.
+func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httptest.Server {
+	t.Helper()
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tokens := auth.NewTokenIssuer([]byte("router-test-secret-at-least-32-bytes"), "lunex-test", 15*time.Minute)
 
@@ -53,18 +62,32 @@ func newServer(t *testing.T, pool *sql.DB) *httptest.Server {
 	// Ollama, so these tests measure the routing and the SQL scoping and
 	// nothing else. See embedder_test.go.
 	docSvc := documents.NewService(documents.NewRepository(pool), &hashingEmbedder{}, discard, 30*time.Second)
+	taskSvc := tasks.NewService(tasks.NewRepository(pool))
+	goalSvc := goals.NewService(goals.NewRepository(pool))
+	noteSvc := notes.NewService(notes.NewRepository(pool))
+	// The assistant runs against a mock model for the same reason the document
+	// tests run against a deterministic embedder: what these tests measure is
+	// the routing and the SQL scoping, not whether a model understood a
+	// sentence. The genuine end-to-end check is scripts/e2e.sh.
+	chatSvc := chat.NewService(chat.Deps{
+		Store: chat.NewRepository(pool), Provider: provider,
+		Documents: docSvc, Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc,
+		Logger: discard,
+	})
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(svc, discard),
-		Tasks:       tasks.NewHandler(tasks.NewService(tasks.NewRepository(pool)), discard),
-		Goals:       goals.NewHandler(goals.NewService(goals.NewRepository(pool)), discard),
-		Notes:       notes.NewHandler(notes.NewService(notes.NewRepository(pool)), discard),
+		Tasks:       tasks.NewHandler(taskSvc, discard),
+		Goals:       goals.NewHandler(goalSvc, discard),
+		Notes:       notes.NewHandler(noteSvc, discard),
 		Documents:   documents.NewHandler(docSvc, discard, 0),
+		Chat:        chat.NewHandler(chatSvc, discard),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(100, 100),
 		DB:          pool, // nil degrades healthz to a liveness check
 		Logger:      discard,
 
 		DocumentTimeout: 60 * time.Second,
+		ChatTimeout:     60 * time.Second,
 	})
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -182,7 +205,7 @@ func TestUnknownRouteIs404(t *testing.T) {
 	}
 }
 
-// Every Phase 2 and Phase 3 route sits behind RequireAuth. This is the cheap half of the
+// Every Phase 2, 3 and 4 route sits behind RequireAuth. This is the cheap half of the
 // isolation story: without a token there is no user id on the context, so a
 // handler never runs at all. The other half — one user reaching another
 // user's rows — is in isolation_test.go, against real SQL.
@@ -213,6 +236,11 @@ func TestResourceRoutesRequireAuth(t *testing.T) {
 		{http.MethodPost, "/api/v1/documents/search"},
 		{http.MethodGet, "/api/v1/documents/" + id},
 		{http.MethodDelete, "/api/v1/documents/" + id},
+		{http.MethodGet, "/api/v1/conversations"},
+		{http.MethodPost, "/api/v1/conversations"},
+		{http.MethodGet, "/api/v1/conversations/" + id},
+		{http.MethodDelete, "/api/v1/conversations/" + id},
+		{http.MethodPost, "/api/v1/conversations/" + id + "/messages"},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			resp, _ := doJSON(t, srv, tc.method, tc.path, "", nil)

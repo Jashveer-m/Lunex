@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/db"
 	"github.com/jashveer/lifeos/backend/migrations"
 )
@@ -24,6 +26,12 @@ import (
 // user's rows, and the API answers 404 rather than 403 so it never confirms
 // that somebody else's id exists.
 func isolationServer(t *testing.T) *httptest.Server {
+	return isolationServerWithProvider(t, &ai.Mock{})
+}
+
+// isolationServerWithProvider is the same stack with a chosen model, for the
+// Phase 4 tests that care what the assistant answers.
+func isolationServerWithProvider(t *testing.T, provider *ai.Mock) *httptest.Server {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -37,12 +45,12 @@ func isolationServer(t *testing.T) *httptest.Server {
 	if err := db.Up(pool, migrations.FS); err != nil {
 		t.Fatalf("migrate up: %v", err)
 	}
-	// Tasks, goals, notes, documents and chunks all cascade from users, so one
-	// truncate is enough.
+	// Tasks, goals, notes, documents, chunks, conversations and messages all
+	// cascade from users, so one truncate is enough.
 	if _, err := pool.Exec(`TRUNCATE users CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	return newServer(t, pool)
+	return newServerWithProvider(t, pool, provider)
 }
 
 // register creates a user through the API and returns their access token.
@@ -463,5 +471,337 @@ func TestUnsupportedFileTypesAreRejected(t *testing.T) {
 	}
 	if count, _ := body["count"].(float64); count != 0 {
 		t.Fatalf("%v documents exist after four rejected uploads, want 0", count)
+	}
+}
+
+// --- Phase 4: the AI assistant ----------------------------------------------
+
+// sseEvent is one parsed Server-Sent Event from a chat stream.
+type sseEvent struct {
+	Name string
+	Data map[string]any
+}
+
+// ask posts a message to a conversation and returns the whole stream. The
+// model is a mock, so nothing here waits on Ollama.
+func ask(t *testing.T, srv *httptest.Server, token, convID, content string) (*http.Response, []sseEvent) {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"content": content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		srv.URL+"/api/v1/conversations/"+convID+"/messages", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return resp, nil
+	}
+
+	var events []sseEvent
+	var name string
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			name = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			var data map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &data); err != nil {
+				t.Fatalf("decode %s event: %v", name, err)
+			}
+			events = append(events, sseEvent{Name: name, Data: data})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	return resp, events
+}
+
+// answer returns the reassembled reply and the done event of a stream.
+func answer(t *testing.T, events []sseEvent) (string, map[string]any) {
+	t.Helper()
+	var text strings.Builder
+	var done map[string]any
+	for _, e := range events {
+		switch e.Name {
+		case "token":
+			s, _ := e.Data["text"].(string)
+			text.WriteString(s)
+		case "done":
+			done = e.Data
+		case "error":
+			t.Fatalf("stream failed: %v", e.Data)
+		}
+	}
+	if done == nil {
+		t.Fatalf("stream had no done event: %v", events)
+	}
+	return text.String(), done
+}
+
+// citingProvider answers by citing whatever the retrieved context contains,
+// which is what makes the grounding assertions below meaningful: the reply
+// tracks the prompt rather than being a fixed string.
+func citingProvider() *ai.Mock {
+	return &ai.Mock{ReplyFunc: func(msgs []ai.Message) string {
+		// Keyed on a retrieved source header, not on the words of the
+		// question: the point is to answer from the context or say it is not
+		// there, and the question itself mentions the aurora either way.
+		prompt := ai.PromptText(msgs)
+		if strings.Contains(prompt, "[S1] document:") {
+			return "Your notes say the aurora appeared over the tundra [S1]."
+		}
+		return "I could not find anything about that in your documents, tasks, goals or notes."
+	}}
+}
+
+// The Phase 4 half of the property the whole ownership design exists for.
+func TestCrossUserConversationIsolation(t *testing.T) {
+	srv := isolationServerWithProvider(t, citingProvider())
+	alice := register(t, srv, "alice@example.com")
+	bob := register(t, srv, "bob@example.com")
+
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{"title": "Alice's chat"})
+	if _, events := ask(t, srv, alice, convID, "hello"); len(events) == 0 {
+		t.Fatal("Alice's own message produced no stream")
+	}
+
+	// Alice's conversation exists and Bob does not own it. The answer must be
+	// 404 — a 403 would confirm the id is real.
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{"get conversation", http.MethodGet, "/api/v1/conversations/" + convID, nil},
+		{"delete conversation", http.MethodDelete, "/api/v1/conversations/" + convID, nil},
+		{"send a message", http.MethodPost, "/api/v1/conversations/" + convID + "/messages", map[string]any{"content": "hijacked"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := doJSON(t, srv, tc.method, tc.path, bob, tc.body)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s %s as the wrong user = %d, want 404: %v", tc.method, tc.path, resp.StatusCode, body)
+			}
+			if body["error"] != "not_found" {
+				t.Fatalf("error = %v, want not_found", body["error"])
+			}
+		})
+	}
+
+	// Bob's list never contains Alice's conversation.
+	resp, list := doJSON(t, srv, http.MethodGet, "/api/v1/conversations", bob, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /conversations: %d %v", resp.StatusCode, list)
+	}
+	if count, _ := list["count"].(float64); count != 0 {
+		t.Fatalf("Bob sees %v conversations, want 0: %v", count, list)
+	}
+
+	// And none of that touched Alice's conversation: the attempts must have
+	// been no-ops, not just unhelpful status codes.
+	resp, conv := doJSON(t, srv, http.MethodGet, "/api/v1/conversations/"+convID, alice, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Alice's conversation after Bob's attempts = %d %v", resp.StatusCode, conv)
+	}
+	msgs, _ := conv["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("Alice's conversation holds %d messages, want the one turn she sent: %v", len(msgs), conv)
+	}
+	for _, raw := range msgs {
+		m, _ := raw.(map[string]any)
+		if content, _ := m["content"].(string); strings.Contains(content, "hijacked") {
+			t.Fatalf("Bob's message landed in Alice's conversation: %v", m)
+		}
+	}
+}
+
+// The retrieval path is the one that could leak another user's text without
+// ever naming an id: Bob asks the assistant the exact words in Alice's file.
+func TestChatRetrievalCannotReachAnotherUsersDocuments(t *testing.T) {
+	srv := isolationServerWithProvider(t, citingProvider())
+	alice := register(t, srv, "alice@example.com")
+	bob := register(t, srv, "bob@example.com")
+
+	const secret = "The aurora borealis appeared over the tundra shortly after midnight."
+	upload(t, srv, alice, "alice-field-notes.md", secret)
+
+	convID := create(t, srv, bob, "/api/v1/conversations", map[string]any{})
+	_, events := ask(t, srv, bob, convID, "What do my notes say about the aurora borealis over the tundra?")
+	text, done := answer(t, events)
+
+	message, _ := done["message"].(map[string]any)
+	sources, _ := message["sources"].([]any)
+	for _, raw := range sources {
+		s, _ := raw.(map[string]any)
+		if title, _ := s["title"].(string); strings.Contains(title, "alice") {
+			t.Fatalf("Bob's assistant cited Alice's document: %v", s)
+		}
+	}
+	if len(sources) != 0 {
+		t.Fatalf("Bob retrieved %d sources from an empty corpus: %v", len(sources), sources)
+	}
+	if strings.Contains(text, "aurora appeared") {
+		t.Fatalf("Bob's assistant answered from Alice's document: %q", text)
+	}
+	if !strings.Contains(text, "could not find") {
+		t.Fatalf("answer = %q, want it to say nothing was found", text)
+	}
+}
+
+// The control that makes the isolation assertions above non-vacuous, and the
+// grounding rule end to end: the owner's own question retrieves the document
+// and the answer cites it, while an unrelated question cites nothing.
+func TestChatGroundsAnswersInTheOwnersDataOnly(t *testing.T) {
+	srv := isolationServerWithProvider(t, citingProvider())
+	alice := register(t, srv, "alice@example.com")
+
+	doc := upload(t, srv, alice, "field-notes.md",
+		"The aurora borealis appeared over the tundra shortly after midnight.")
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+
+	// A question the document answers.
+	_, events := ask(t, srv, alice, convID, "What do my notes say about the aurora borealis over the tundra?")
+	if events[0].Name != "sources" {
+		t.Fatalf("first event = %q, want sources", events[0].Name)
+	}
+	text, done := answer(t, events)
+	message, _ := done["message"].(map[string]any)
+	sources, _ := message["sources"].([]any)
+	if len(sources) != 1 {
+		t.Fatalf("retrieved %d sources, want the one document: %v", len(sources), sources)
+	}
+	cited, _ := sources[0].(map[string]any)
+	if cited["type"] != "document" || cited["title"] != "field-notes.md" || cited["id"] != doc["id"] {
+		t.Fatalf("source = %v, want the uploaded document", cited)
+	}
+	if cited["cited"] != true {
+		t.Fatalf("the answer cited %v but the record says otherwise: %v", cited["label"], cited)
+	}
+	if !strings.Contains(text, "[S1]") {
+		t.Fatalf("answer = %q, want it to carry the citation", text)
+	}
+
+	// A question about something else. Nothing is retrieved above the
+	// similarity floor, so there is nothing to cite — and the answer says so
+	// rather than reaching for the document that is there.
+	_, events = ask(t, srv, alice, convID, "quarterly revenue forecast spreadsheet")
+	text, done = answer(t, events)
+	message, _ = done["message"].(map[string]any)
+	sources, _ = message["sources"].([]any)
+	if len(sources) != 0 {
+		t.Fatalf("an unrelated question retrieved %d sources: %v", len(sources), sources)
+	}
+	if strings.Contains(text, "[S") || strings.Contains(text, "aurora") {
+		t.Fatalf("an unrelated question produced a citation: %q", text)
+	}
+
+	// Both turns are on the record, in order, and the conversation took its
+	// name from the first question.
+	resp, conv := doJSON(t, srv, http.MethodGet, "/api/v1/conversations/"+convID, alice, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode)
+	}
+	msgs, _ := conv["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("conversation holds %d messages, want 4", len(msgs))
+	}
+	wantRoles := []string{"user", "assistant", "user", "assistant"}
+	for i, raw := range msgs {
+		m, _ := raw.(map[string]any)
+		if m["role"] != wantRoles[i] {
+			t.Fatalf("message %d is %v, want %s — the answer must not precede the question", i, m["role"], wantRoles[i])
+		}
+	}
+	if title, _ := conv["title"].(string); !strings.HasPrefix(title, "What do my notes say") {
+		t.Fatalf("title = %q, want it derived from the first question", title)
+	}
+}
+
+// A failed turn leaves the conversation exactly as it was: no dangling
+// question, no half-written answer.
+func TestAFailedTurnIsNotPersisted(t *testing.T) {
+	srv := isolationServerWithProvider(t, &ai.Mock{Err: ai.ErrUnavailable})
+	alice := register(t, srv, "alice@example.com")
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+
+	resp, body := doJSON(t, srv, http.MethodPost, "/api/v1/conversations/"+convID+"/messages",
+		alice, map[string]any{"content": "hello"})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %v", resp.StatusCode, body)
+	}
+	if body["error"] != "model_unavailable" {
+		t.Fatalf("error = %v, want model_unavailable", body["error"])
+	}
+
+	resp, conv := doJSON(t, srv, http.MethodGet, "/api/v1/conversations/"+convID, alice, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode)
+	}
+	if msgs, _ := conv["messages"].([]any); len(msgs) != 0 {
+		t.Fatalf("a failed turn left %d messages behind: %v", len(msgs), msgs)
+	}
+	if title, _ := conv["title"].(string); title != "New conversation" {
+		t.Fatalf("a failed turn renamed the conversation to %q", title)
+	}
+}
+
+// Deleting a conversation takes its messages with it, and deleting a user
+// takes their conversations.
+func TestConversationAndUserDeletionCascade(t *testing.T) {
+	srv := isolationServerWithProvider(t, citingProvider())
+	alice := register(t, srv, "alice@example.com")
+	convID := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+	ask(t, srv, alice, convID, "hello")
+
+	pool := mustPool(t)
+	var messages int
+	if err := pool.QueryRow(`SELECT count(*) FROM messages`).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 2 {
+		t.Fatalf("%d messages stored, want 2", messages)
+	}
+
+	resp, body := doJSON(t, srv, http.MethodDelete, "/api/v1/conversations/"+convID, alice, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete = %d: %v", resp.StatusCode, body)
+	}
+	if err := pool.QueryRow(`SELECT count(*) FROM messages`).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 0 {
+		t.Fatalf("%d messages survived the conversation, want 0", messages)
+	}
+
+	// And a second conversation goes with the user.
+	second := create(t, srv, alice, "/api/v1/conversations", map[string]any{})
+	ask(t, srv, alice, second, "hello again")
+	if _, err := pool.Exec(`DELETE FROM users`); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"conversations", "messages"} {
+		var n int
+		if err := pool.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%d rows survived in %s after the user was deleted", n, table)
+		}
 	}
 }

@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–3)
+# Lunex API — v1 (Phases 1–4)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -35,6 +35,7 @@ Validation failures add a `fields` array:
 | `unsupported_media_type` | 415 | `Content-Type` is not `application/json`; or the uploaded file is not a PDF, TXT or Markdown |
 | `invalid_multipart` | 400 | Upload body is not `multipart/form-data` with a `file` part |
 | `embedding_unavailable` | 503 | The embedding service could not be reached, so a search cannot run |
+| `model_unavailable` | 503 | The chat model or the embedding service could not be reached, so a turn cannot run |
 | `rate_limited` | 429 | Too many requests from this IP (`Retry-After` header set) |
 | `internal_error` | 500 | Unexpected failure (details are logged, never returned) |
 
@@ -560,6 +561,202 @@ If the embedding service is unreachable the search cannot run and answers
 
 ---
 
+## Conversations
+
+The AI assistant. Every endpoint is scoped to the caller: a conversation
+belonging to somebody else answers `404`, exactly like one that does not exist.
+
+### `POST /api/v1/conversations`
+
+```json
+{ "title": "Thesis planning" }
+```
+
+`title` is optional. Omitted, the conversation is called `New conversation`
+until its first message names it — from the first line of that message, cut to
+60 characters. A title the user chose is never overwritten.
+
+`201 Created`:
+
+```json
+{
+  "id": "fe69e704-57f3-4d18-b7be-b3d09cfcfd1b",
+  "title": "New conversation",
+  "message_count": 0,
+  "created_at": "2026-09-09T18:19:07.221Z",
+  "updated_at": "2026-09-09T18:19:07.221Z"
+}
+```
+
+### `GET /api/v1/conversations`
+
+| Parameter | Values |
+| --- | --- |
+| `sort` | `created_at`, `updated_at`, `title`, each also with `-` (default `-updated_at`) |
+| `limit`, `offset` | paging (default 50, max 200) |
+
+```json
+{ "conversations": [ … ], "count": 2, "limit": 50, "offset": 0 }
+```
+
+The default order is most recently active first: `updated_at` moves every time
+a turn is added, not only when the title changes.
+
+### `GET /api/v1/conversations/{id}`
+
+The conversation plus its messages, oldest first, each with the sources
+recorded for it. A conversation longer than 500 messages returns its most
+recent 500.
+
+```json
+{
+  "id": "fe69e704-…",
+  "title": "What do my field notes say happened over the tundra?",
+  "message_count": 2,
+  "messages": [
+    { "id": "…", "role": "user", "content": "What do my field notes say happened over the tundra?", "sources": [], "created_at": "…" },
+    {
+      "id": "…",
+      "role": "assistant",
+      "content": "According to [S1], your field notes … the aurora borealis appeared over the tundra shortly after midnight.",
+      "sources": [
+        {
+          "type": "document",
+          "id": "4c3a26b4-b42f-4f76-8909-d610f20482ed",
+          "label": "S1",
+          "title": "field-notes.txt",
+          "chunk_index": 0,
+          "similarity": 0.7326,
+          "excerpt": "Field notes, 14 March. The aurora borealis appeared…",
+          "cited": true
+        }
+      ],
+      "created_at": "…"
+    }
+  ],
+  "created_at": "…",
+  "updated_at": "…"
+}
+```
+
+A **source** is one thing that was retrieved for that answer.
+
+| Field | Meaning |
+| --- | --- |
+| `type` | `document`, `task`, `goal` or `note` |
+| `id` | the id of that record, so a client can link to it |
+| `label` | the marker the prompt showed the model (`S1`, `S2`, …) |
+| `title` | filename, or the task/goal/note title |
+| `chunk_index`, `similarity` | documents only; the cosine score retrieval used |
+| `excerpt` | the text the model was actually shown |
+| `cited` | whether the answer referenced this label |
+
+`cited` is measured by reading the generated answer for its labels, not
+assumed. Retrieval usually offers five things and an answer uses one; `sources`
+records all five and marks which. A user message carries `sources: []`.
+
+### `DELETE /api/v1/conversations/{id}`
+
+`204 No Content`. Its messages go with it.
+
+### `POST /api/v1/conversations/{id}/messages`
+
+Send a message and stream the answer.
+
+```json
+{ "content": "What do my field notes say happened over the tundra?" }
+```
+
+`content` is required, at most 8,000 characters.
+
+**The response is Server-Sent Events** (`Content-Type: text/event-stream`), not
+chunked plain text. The reason is the `sources` frame: an answer is not just
+text, it also has a citation list that a client wants *before* the first token
+so it can show what the reply is grounded in while it is still being written.
+SSE gives every frame a name and a JSON body, so `sources`, `token`, `done` and
+`error` are distinguishable without a length-prefix protocol invented for the
+purpose. Raw chunked text would carry the tokens and nothing else.
+
+Note that this is SSE framing over a normal `POST`, not an `EventSource`
+resource: `EventSource` cannot send a body or an `Authorization` header, so
+clients read the stream with `fetch` and a reader.
+
+```
+event: sources
+data: {"sources":[{"type":"document","id":"…","label":"S1","title":"field-notes.txt","chunk_index":0,"similarity":0.7326,"excerpt":"…","cited":false}],"count":1}
+
+event: token
+data: {"text":"According"}
+
+event: token
+data: {"text":" to [S1],"}
+
+event: done
+data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b"}
+```
+
+| Event | Payload | When |
+| --- | --- | --- |
+| `sources` | `{sources, count}` | Once, after the model accepts the request and before the first token. `cited` is always `false` here — nothing has been generated yet. |
+| `token` | `{text}` | Per fragment, in order. Concatenating every `text` gives exactly the stored message content. |
+| `done` | `{conversation_id, user_message, message, model}` | Once, after the turn is persisted. `message.sources` is the same list with `cited` filled in. |
+| `error` | `{error, message}` | Instead of `done`, if generation failed after the stream started. |
+
+Token text is JSON-encoded rather than written raw because a model emits
+newlines mid-sentence and an SSE frame ends at a blank line.
+
+Everything that can fail *before* the first token fails as an ordinary JSON
+error with a real status code — the sink is not touched until retrieval has run
+and the model has accepted the request:
+
+| Failure | Response |
+| --- | --- |
+| No such conversation, or it is somebody else's | `404 not_found` |
+| Empty or oversized `content` | `400 validation_failed` |
+| Unknown JSON field | `400 invalid_json` |
+| Model or embedding service unreachable | `503 model_unavailable` |
+| Generation failed after the stream started | `200` with `event: error` |
+
+A turn that did not finish is **not persisted at all** — not the question, not a
+partial answer. Sending the message again is the retry. The `error` event says
+so.
+
+### What the assistant will not do
+
+Two rules are in the system prompt and both are load-bearing.
+
+**It does not claim an answer came from your data when it did not.** Only the
+retrieved context is citable, by the exact `S1`-style labels it was given. If
+nothing was retrieved the assistant says so rather than reaching for a
+plausible filename; it may then answer from general knowledge, saying that is
+what it is doing. Retrieval applies a similarity floor (`CHAT_MIN_SIMILARITY`,
+default `0.5`), so an unrelated question is not handed a distant chunk to
+resist in the first place.
+
+**It cannot take actions.** There is no approval engine in this phase, so the
+assistant only reads. Asked to create a task or complete a goal, it says that
+taking actions is not supported yet and describes what you would do yourself.
+No chat endpoint writes to `tasks`, `goals`, `notes` or `documents`.
+
+### What grounds an answer
+
+| Source | How it is selected |
+| --- | --- |
+| Document chunks | Phase 3's vector search over the caller's chunks: top 5 above the similarity floor |
+| Tasks | Up to 5: in progress by recency, then pending by nearest deadline |
+| Goals | Up to 5 active goals by nearest deadline |
+| Notes | The 3 most recently updated |
+
+Tasks, goals and notes are selected by that heuristic rather than semantically —
+they have no embeddings in this phase — so they reach the model as background
+that the question may or may not be about. Documents are the semantic half.
+
+The previous 20 messages of the conversation are replayed as history. That is
+the whole of this phase's memory: there is no extraction and no long-term
+store, so a conversation longer than 20 messages forgets its own beginning.
+
+---
+
 ## Field limits
 
 | Field | Limit |
@@ -574,6 +771,7 @@ If the embedding service is unreachable the search cannot run and answers
 | uploaded file | 10 MB (`MAX_UPLOAD_BYTES`) |
 | filename | 255 characters |
 | search `query` | 4,000 characters |
+| chat message `content` | 8,000 characters |
 | chunks per document | 800 (~1.5 MB of prose); a larger document fails to process |
 
 Lengths count characters (runes), not bytes.

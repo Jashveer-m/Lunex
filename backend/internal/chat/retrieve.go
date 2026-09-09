@@ -1,0 +1,230 @@
+package chat
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/tasks"
+)
+
+// The four things the orchestrator can retrieve from. Each is the narrowest
+// slice of an existing Phase 2/3 service, and each takes the owner id as an
+// argument -- so the orchestrator cannot reach another user's data even by
+// mistake, for the same structural reason the repositories cannot.
+//
+// They are interfaces rather than concrete *documents.Service and friends so
+// the orchestrator's tests can hand it a corpus without a database.
+type (
+	// DocumentSearcher is Phase 3's RAG search, called as a service function
+	// rather than over HTTP.
+	DocumentSearcher interface {
+		Search(ctx context.Context, userID uuid.UUID, q documents.SearchQuery) ([]documents.SearchResult, error)
+	}
+	TaskLister interface {
+		List(ctx context.Context, userID uuid.UUID, f tasks.Filter) ([]tasks.Task, error)
+	}
+	GoalLister interface {
+		List(ctx context.Context, userID uuid.UUID, f goals.Filter) ([]goals.Goal, error)
+	}
+	NoteLister interface {
+		List(ctx context.Context, userID uuid.UUID, f notes.Filter) ([]notes.Note, error)
+	}
+)
+
+// retrieve gathers the context for one question, strongest first: document
+// chunks that actually match it, then the user's current tasks, goals and
+// notes.
+//
+// Documents are matched semantically. Tasks, goals and notes are not -- they
+// are selected by a plain heuristic (in progress, due soonest, recently
+// touched), because they have no embeddings in this phase. That difference is
+// visible to the model: a chunk arrives with a similarity score, an item
+// arrives as background the question may or may not be about, and the system
+// prompt forbids citing anything that does not answer the question.
+//
+// Any retrieval failure fails the whole turn. Answering without the tasks
+// table because its query errored would produce "I could not find anything in
+// your tasks" -- a false statement about the user's data, which is exactly
+// what this phase's grounding rule exists to prevent.
+func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question string) ([]Source, error) {
+	var out []Source
+
+	found, err := s.docs.Search(ctx, userID, documents.SearchQuery{
+		Query:         truncate(question, documents.MaxQueryLen),
+		Limit:         MaxDocumentChunks,
+		MinSimilarity: s.opts.MinSimilarity,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve documents: %w", err)
+	}
+	for _, r := range found {
+		idx, sim := r.ChunkIndex, r.Similarity
+		out = append(out, Source{
+			Type: SourceDocument, ID: r.DocumentID, Title: r.Filename,
+			ChunkIndex: &idx, Similarity: &sim,
+			Excerpt: truncate(r.Content, MaxExcerptChars),
+		})
+	}
+
+	found2, err := s.currentTasks(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, found2...)
+
+	activeGoals, err := s.goals.List(ctx, userID, goals.Filter{
+		Status: "active", Sort: "deadline", Limit: MaxGoals,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve goals: %w", err)
+	}
+	for _, g := range activeGoals {
+		out = append(out, Source{
+			Type: SourceGoal, ID: g.ID, Title: g.Title,
+			Excerpt: truncate(goalSummary(g), MaxExcerptChars),
+		})
+	}
+
+	recentNotes, err := s.notes.List(ctx, userID, notes.Filter{Sort: "-updated_at", Limit: MaxNotes})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve notes: %w", err)
+	}
+	for _, n := range recentNotes {
+		out = append(out, Source{
+			Type: SourceNote, ID: n.ID, Title: n.Title,
+			Excerpt: truncate(noteSummary(n), MaxExcerptChars),
+		})
+	}
+
+	return labelled(out), nil
+}
+
+// currentTasks is the task heuristic: what the user is working on, then what
+// is due soonest. Two queries rather than one because Filter takes a single
+// status, and "in progress" and "due next" are different questions.
+func (s *Service) currentTasks(ctx context.Context, userID uuid.UUID) ([]Source, error) {
+	const inProgress = 3
+
+	active, err := s.tasks.List(ctx, userID, tasks.Filter{
+		Status: "in_progress", Sort: "-updated_at", Limit: inProgress,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve tasks: %w", err)
+	}
+	// deadline sorts ASC NULLS LAST, so undated tasks fill the remaining slots
+	// only once the dated ones are exhausted -- which is what "upcoming
+	// deadlines" should mean.
+	upcoming, err := s.tasks.List(ctx, userID, tasks.Filter{
+		Status: "pending", Sort: "deadline", Limit: MaxTasks,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve tasks: %w", err)
+	}
+
+	out := make([]Source, 0, MaxTasks)
+	seen := make(map[uuid.UUID]struct{}, MaxTasks)
+	for _, t := range append(active, upcoming...) {
+		if len(out) == MaxTasks {
+			break
+		}
+		if _, dup := seen[t.ID]; dup {
+			continue
+		}
+		seen[t.ID] = struct{}{}
+		out = append(out, Source{
+			Type: SourceTask, ID: t.ID, Title: t.Title,
+			Excerpt: truncate(taskSummary(t), MaxExcerptChars),
+		})
+	}
+	return out, nil
+}
+
+// labelled assigns S1…Sn in order and drops anything past the context budget.
+//
+// A source over the budget is dropped whole rather than truncated: a source
+// listed as retrieved but carrying none of the text it would be cited for is
+// worse than one that is absent, because the citation trail would claim
+// something the model never saw.
+func labelled(in []Source) []Source {
+	out := make([]Source, 0, len(in))
+	used := 0
+	for _, s := range in {
+		size := len(s.Title) + len(s.Excerpt) + 64 // 64 covers the header line
+		if used+size > MaxContextChars && len(out) > 0 {
+			continue
+		}
+		used += size
+		s.Label = label(len(out))
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// --- item summaries ---------------------------------------------------------
+//
+// Each renders one Phase 2 row as the few lines the model is shown. They are
+// deliberately telegraphic: the fields that decide whether an item answers the
+// question (status, priority, dates) come first, free text after.
+
+func taskSummary(t tasks.Task) string {
+	parts := []string{"priority " + t.Priority, "status " + t.Status}
+	if t.Deadline != nil {
+		parts = append(parts, "due "+t.Deadline.UTC().Format(time.DateOnly))
+	}
+	if t.Category != nil && *t.Category != "" {
+		parts = append(parts, "category "+*t.Category)
+	}
+	if len(t.Tags) > 0 {
+		parts = append(parts, "tags "+strings.Join(t.Tags, ", "))
+	}
+	return withDescription(strings.Join(parts, " · "), t.Description)
+}
+
+func goalSummary(g goals.Goal) string {
+	parts := []string{"type " + g.Type, "status " + g.Status}
+	if g.Deadline != nil {
+		parts = append(parts, "deadline "+g.Deadline.UTC().Format(time.DateOnly))
+	}
+	if len(g.Milestones) > 0 {
+		done := 0
+		for _, m := range g.Milestones {
+			if m.Completed {
+				done++
+			}
+		}
+		parts = append(parts, fmt.Sprintf("milestones %d of %d complete", done, len(g.Milestones)))
+	}
+	return withDescription(strings.Join(parts, " · "), g.Description)
+}
+
+func noteSummary(n notes.Note) string {
+	head := ""
+	if len(n.Tags) > 0 {
+		head = "tags " + strings.Join(n.Tags, ", ")
+	}
+	content := strings.TrimSpace(n.Content)
+	switch {
+	case head == "":
+		return content
+	case content == "":
+		return head
+	}
+	return head + "\n" + content
+}
+
+func withDescription(head string, description *string) string {
+	if description == nil || strings.TrimSpace(*description) == "" {
+		return head
+	}
+	return head + "\n" + strings.TrimSpace(*description)
+}

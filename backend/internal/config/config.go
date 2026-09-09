@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/ai"
+	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
 )
@@ -32,6 +34,21 @@ type Config struct {
 	// embed and store. It also sets the server's write timeout, because a
 	// response the server has already given up on cannot report the result.
 	DocumentProcessTimeout time.Duration
+
+	// Phase 4: the AI assistant.
+	ChatModel string
+	// ChatTimeout bounds one whole turn: retrieval, generation and the write.
+	// A local 3B model answering from five retrieved chunks is tens of seconds
+	// of honest work, so it is far larger than the 30s the rest of the API
+	// gets -- and, like the document timeout, it also has to fit inside the
+	// server's write timeout or the stream would be cut at the socket.
+	ChatTimeout     time.Duration
+	ChatTemperature float64
+	ChatMaxTokens   int
+	// ChatMinSimilarity is the retrieval floor for chat. Below it a chunk is
+	// not shown to the model at all, which is the main defence against an
+	// unrelated question coming back with a confident citation.
+	ChatMinSimilarity float64
 }
 
 // WriteTimeout is how long the HTTP server will spend producing a response.
@@ -42,7 +59,11 @@ type Config struct {
 // When the job queue arrives this drops back to a flat 30s.
 func (c Config) WriteTimeout() time.Duration {
 	const base = 30 * time.Second
-	if d := c.DocumentProcessTimeout + 15*time.Second; d > base {
+	// The longest thing a single request can legitimately do, plus slack for
+	// writing the response. Chat streams for as long as the model generates,
+	// so it counts here alongside an upload.
+	longest := max(c.DocumentProcessTimeout, c.ChatTimeout)
+	if d := longest + 15*time.Second; d > base {
 		return d
 	}
 	return base
@@ -63,6 +84,11 @@ func Load() (Config, error) {
 		EmbeddingModel:      envOr("EMBEDDING_MODEL", embeddings.DefaultModel),
 		EmbeddingDimensions: embeddings.DefaultDimensions,
 		MaxUploadBytes:      documents.MaxUploadBytes,
+
+		ChatModel:         envOr("CHAT_MODEL", ai.DefaultModel),
+		ChatTemperature:   0.2, // low: the assistant quotes the user's own data back
+		ChatMaxTokens:     1024,
+		ChatMinSimilarity: chat.DefaultMinSimilarity,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -83,6 +109,24 @@ func Load() (Config, error) {
 	}
 	if cfg.DocumentProcessTimeout, err = durationOr("DOCUMENT_PROCESS_TIMEOUT", 2*time.Minute); err != nil {
 		return Config{}, err
+	}
+	if cfg.ChatTimeout, err = durationOr("CHAT_TIMEOUT", 3*time.Minute); err != nil {
+		return Config{}, err
+	}
+	if cfg.ChatTemperature, err = floatOr("CHAT_TEMPERATURE", cfg.ChatTemperature, 0, 2); err != nil {
+		return Config{}, err
+	}
+	// The floor runs -1 … 1 because it is a cosine similarity, but a negative
+	// floor admits everything and is never what an operator means.
+	if cfg.ChatMinSimilarity, err = floatOr("CHAT_MIN_SIMILARITY", cfg.ChatMinSimilarity, 0, 1); err != nil {
+		return Config{}, err
+	}
+	if v := os.Getenv("CHAT_MAX_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("CHAT_MAX_TOKENS: want a positive integer, got %q", v)
+		}
+		cfg.ChatMaxTokens = n
 	}
 	// The vector column is `vector(768)` in migration 000003. Changing the
 	// model without a migration that changes the column -- and re-embeds every
@@ -118,6 +162,21 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// floatOr reads a bounded float. The bounds are checked here rather than
+// clamped silently: a temperature of 9 is a typo, and answering it with 2
+// would hide the mistake until someone read the generations.
+func floatOr(key string, fallback, min, max float64) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < min || f > max {
+		return 0, fmt.Errorf("%s: want a number between %g and %g, got %q", key, min, max, v)
+	}
+	return f, nil
 }
 
 func durationOr(key string, fallback time.Duration) (time.Duration, error) {
