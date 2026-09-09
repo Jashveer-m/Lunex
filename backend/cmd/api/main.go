@@ -15,6 +15,8 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/auth"
 	"github.com/jashveer/lifeos/backend/internal/config"
 	"github.com/jashveer/lifeos/backend/internal/db"
+	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/embeddings"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -73,15 +75,29 @@ func run(logger *slog.Logger) error {
 	goalSvc := goals.NewService(goals.NewRepository(pool))
 	noteSvc := notes.NewService(notes.NewRepository(pool))
 
+	// The embedding client is built, not dialled: Ollama being down is a
+	// per-request failure that the document ends up recording, not a reason to
+	// refuse to serve tasks and notes.
+	embedder := embeddings.NewOllama(cfg.OllamaBaseURL, cfg.EmbeddingModel,
+		cfg.EmbeddingDimensions, cfg.DocumentProcessTimeout)
+	logger.Info("embeddings configured",
+		"base_url", cfg.OllamaBaseURL, "model", embedder.Model(), "dimensions", embedder.Dimensions())
+	docSvc := documents.NewService(documents.NewRepository(pool), embedder, logger, cfg.DocumentProcessTimeout)
+
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(service, logger),
 		Tasks:       tasks.NewHandler(taskSvc, logger),
 		Goals:       goals.NewHandler(goalSvc, logger),
 		Notes:       notes.NewHandler(noteSvc, logger),
+		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(cfg.LoginRateLimit, cfg.LoginRateLimitBurst),
 		DB:          pool,
 		Logger:      logger,
+		// A little under the server's write timeout, so a request that runs
+		// long is ended by the handler -- which can still answer -- rather
+		// than by the socket, which cannot.
+		DocumentTimeout: cfg.DocumentProcessTimeout + 5*time.Second,
 	})
 
 	go sweepExpiredSessions(ctx, sessionRepo, logger)
@@ -90,9 +106,13 @@ func run(logger *slog.Logger) error {
 		Addr:              ":" + cfg.Port,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// Reading a 10 MB upload over a slow link can outlast 30 seconds, and
+		// ReadTimeout covers the body as well as the headers. ReadHeaderTimeout
+		// above is what actually guards against a slowloris, so widening this
+		// one costs nothing.
+		ReadTimeout:  cfg.WriteTimeout(),
+		WriteTimeout: cfg.WriteTimeout(),
+		IdleTimeout:  120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)

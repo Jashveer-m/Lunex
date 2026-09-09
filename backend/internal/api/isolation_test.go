@@ -1,11 +1,15 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jashveer/lifeos/backend/internal/db"
@@ -33,7 +37,8 @@ func isolationServer(t *testing.T) *httptest.Server {
 	if err := db.Up(pool, migrations.FS); err != nil {
 		t.Fatalf("migrate up: %v", err)
 	}
-	// Tasks, goals and notes all cascade from users, so one truncate is enough.
+	// Tasks, goals, notes, documents and chunks all cascade from users, so one
+	// truncate is enough.
 	if _, err := pool.Exec(`TRUNCATE users CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -211,4 +216,252 @@ func mustPool(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { pool.Close() })
 	return pool
+}
+
+// --- Phase 3: documents -----------------------------------------------------
+
+// upload posts a multipart file and returns the created document.
+func upload(t *testing.T, srv *httptest.Server, token, filename, body string) map[string]any {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/documents", &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode upload response: %v", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /documents %s: status %d: %v", filename, resp.StatusCode, out)
+	}
+	if out["status"] != "ready" {
+		t.Fatalf("document %s is %v, want ready: %v", filename, out["status"], out["error_message"])
+	}
+	return out
+}
+
+// The Phase 3 half of the property the whole ownership design exists for.
+func TestCrossUserDocumentIsolation(t *testing.T) {
+	srv := isolationServer(t)
+	alice := register(t, srv, "alice@example.com")
+	bob := register(t, srv, "bob@example.com")
+
+	const secret = "The launch code for the Aurora satellite is quetzal seventeen."
+	aliceDoc := upload(t, srv, alice, "alice-secrets.txt", secret)
+	aliceID, _ := aliceDoc["id"].(string)
+	upload(t, srv, bob, "bob-notes.txt", "Bob keeps a list of birds he has seen.")
+
+	// Alice's document exists and Bob does not own it. The answer must be 404
+	// — a 403 would confirm the id is real.
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"get document", http.MethodGet, "/api/v1/documents/" + aliceID},
+		{"delete document", http.MethodDelete, "/api/v1/documents/" + aliceID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := doJSON(t, srv, tc.method, tc.path, bob, nil)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s %s as the wrong user = %d, want 404: %v", tc.method, tc.path, resp.StatusCode, body)
+			}
+			if body["error"] != "not_found" {
+				t.Fatalf("error = %v, want not_found", body["error"])
+			}
+		})
+	}
+
+	// Bob's list holds only his own document.
+	resp, list := doJSON(t, srv, http.MethodGet, "/api/v1/documents", bob, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /documents: %d %v", resp.StatusCode, list)
+	}
+	if count, _ := list["count"].(float64); count != 1 {
+		t.Fatalf("Bob sees %v documents, want only his own: %v", count, list)
+	}
+
+	// The retrieval path is the one that could leak text without ever
+	// mentioning an id: Bob searches for the exact words in Alice's file.
+	resp, found := doJSON(t, srv, http.MethodPost, "/api/v1/documents/search", bob,
+		map[string]any{"query": "Aurora satellite launch code quetzal", "limit": 20})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /documents/search: %d %v", resp.StatusCode, found)
+	}
+	results, _ := found["results"].([]any)
+	for _, raw := range results {
+		r, _ := raw.(map[string]any)
+		content, _ := r["content"].(string)
+		filename, _ := r["filename"].(string)
+		if strings.Contains(content, "quetzal") || strings.Contains(filename, "alice") {
+			t.Fatalf("Bob's search returned Alice's content: %v", r)
+		}
+	}
+
+	// Naming Alice's document id explicitly must not reach it either.
+	resp, found = doJSON(t, srv, http.MethodPost, "/api/v1/documents/search", bob,
+		map[string]any{"query": "Aurora satellite", "document_ids": []string{aliceID}})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /documents/search with a foreign id: %d %v", resp.StatusCode, found)
+	}
+	if count, _ := found["count"].(float64); count != 0 {
+		t.Fatalf("searching another user's document id returned %v results, want 0: %v", count, found)
+	}
+
+	// And none of that touched Alice's data.
+	resp, doc := doJSON(t, srv, http.MethodGet, "/api/v1/documents/"+aliceID, alice, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Alice's document after Bob's attempts = %d %v", resp.StatusCode, doc)
+	}
+	if text, _ := doc["extracted_text"].(string); text != secret {
+		t.Fatalf("Alice's extracted text = %q, want it unchanged", text)
+	}
+}
+
+// Retrieval works for the owner: the point of the module, and the control
+// that makes the isolation assertions above meaningful rather than vacuous.
+func TestSearchFindsTheOwnersChunk(t *testing.T) {
+	srv := isolationServer(t)
+	alice := register(t, srv, "alice@example.com")
+
+	doc := upload(t, srv, alice, "field-notes.md",
+		"# Field notes\n\nThe aurora borealis appeared over the tundra shortly after midnight.\n")
+	if chunks, _ := doc["chunk_count"].(float64); chunks != 1 {
+		t.Fatalf("chunk_count = %v, want 1", chunks)
+	}
+
+	resp, body := doJSON(t, srv, http.MethodPost, "/api/v1/documents/search", alice,
+		map[string]any{"query": "aurora borealis tundra", "limit": 5})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search: %d %v", resp.StatusCode, body)
+	}
+	results, _ := body["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1: %v", len(results), body)
+	}
+
+	first, _ := results[0].(map[string]any)
+	if content, _ := first["content"].(string); !strings.Contains(content, "aurora borealis") {
+		t.Fatalf("content = %q, want the chunk from the file", content)
+	}
+	// The citation: which document, which chunk, and how close.
+	if first["filename"] != "field-notes.md" {
+		t.Fatalf("filename = %v, want field-notes.md", first["filename"])
+	}
+	if first["document_id"] != doc["id"] {
+		t.Fatalf("document_id = %v, want %v", first["document_id"], doc["id"])
+	}
+	if sim, _ := first["similarity"].(float64); sim <= 0 || sim > 1.0000001 {
+		t.Fatalf("similarity = %v, want a positive score no greater than 1", sim)
+	}
+
+	// A question about something else must not come back with a confident
+	// citation from this document.
+	resp, body = doJSON(t, srv, http.MethodPost, "/api/v1/documents/search", alice,
+		map[string]any{"query": "quarterly revenue forecast", "min_similarity": 0.5})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search: %d %v", resp.StatusCode, body)
+	}
+	if count, _ := body["count"].(float64); count != 0 {
+		t.Fatalf("an unrelated query returned %v results above the floor: %v", count, body)
+	}
+}
+
+// Deleting a document takes its chunks with it, so the text stops being
+// retrievable rather than merely stops being listed.
+func TestDeletingADocumentRemovesItFromSearch(t *testing.T) {
+	srv := isolationServer(t)
+	alice := register(t, srv, "alice@example.com")
+
+	doc := upload(t, srv, alice, "notes.txt", "The aurora borealis appeared over the tundra.")
+	id, _ := doc["id"].(string)
+
+	resp, _ := doJSON(t, srv, http.MethodDelete, "/api/v1/documents/"+id, alice, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE = %d, want 204", resp.StatusCode)
+	}
+
+	resp, body := doJSON(t, srv, http.MethodPost, "/api/v1/documents/search", alice,
+		map[string]any{"query": "aurora borealis tundra"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search: %d %v", resp.StatusCode, body)
+	}
+	if count, _ := body["count"].(float64); count != 0 {
+		t.Fatalf("search returned %v results after the document was deleted: %v", count, body)
+	}
+
+	pool := mustPool(t)
+	var n int
+	if err := pool.QueryRow(`SELECT count(*) FROM document_chunks`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d chunks survived the deleted document", n)
+	}
+}
+
+// A file the phase cannot read is rejected before a row exists, not stored as
+// a document that failed.
+func TestUnsupportedFileTypesAreRejected(t *testing.T) {
+	srv := isolationServer(t)
+	alice := register(t, srv, "alice@example.com")
+
+	for _, tc := range []struct{ name, body string }{
+		{"report.docx", "PK\x03\x04 not really a docx"},
+		{"rows.csv", "a,b\n1,2\n"},
+		{"scan.png", "\x89PNG\r\n\x1a\n"},
+		{"claims-to-be.pdf", "this is not a pdf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			mw := multipart.NewWriter(&buf)
+			part, _ := mw.CreateFormFile("file", tc.name)
+			_, _ = part.Write([]byte(tc.body))
+			_ = mw.Close()
+
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/documents", &buf)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			req.Header.Set("Authorization", "Bearer "+alice)
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnsupportedMediaType {
+				t.Fatalf("status = %d, want 415", resp.StatusCode)
+			}
+		})
+	}
+
+	// No half-made rows behind those rejections.
+	resp, body := doJSON(t, srv, http.MethodGet, "/api/v1/documents", alice, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode)
+	}
+	if count, _ := body["count"].(float64); count != 0 {
+		t.Fatalf("%v documents exist after four rejected uploads, want 0", count)
+	}
 }

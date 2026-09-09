@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–2)
+# Lunex API — v1 (Phases 1–3)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -31,8 +31,10 @@ Validation failures add a `fields` array:
 | `not_found` | 404 | No such resource, **or** it belongs to another user |
 | `email_taken` | 409 | An account with that email exists |
 | `dependency_cycle` | 409 | The task dependency would create a loop |
-| `payload_too_large` | 413 | Body exceeds 64 KiB |
-| `unsupported_media_type` | 415 | `Content-Type` is not `application/json` |
+| `payload_too_large` | 413 | Body exceeds 64 KiB — or, on an upload, the file exceeds the size limit |
+| `unsupported_media_type` | 415 | `Content-Type` is not `application/json`; or the uploaded file is not a PDF, TXT or Markdown |
+| `invalid_multipart` | 400 | Upload body is not `multipart/form-data` with a `file` part |
+| `embedding_unavailable` | 503 | The embedding service could not be reached, so a search cannot run |
 | `rate_limited` | 429 | Too many requests from this IP (`Retry-After` header set) |
 | `internal_error` | 500 | Unexpected failure (details are logged, never returned) |
 
@@ -409,6 +411,155 @@ Only `title` is required; `content` defaults to `""` and `tags` to `[]`.
 
 As for tasks. `{"tags": null}` empties the tag list rather than writing NULL.
 
+---
+
+## Documents
+
+Upload a file, and the API extracts its text, splits it into overlapping
+chunks, embeds each chunk and stores the vectors. `POST /documents/search` then
+returns the chunks nearest to a query, with the filename and chunk index needed
+to cite them.
+
+Processing is **synchronous**: the upload response already carries the final
+status. There is no job queue in this phase.
+
+> **The original file is not kept.** Only the extracted text is stored, so
+> re-downloading the PDF you uploaded is not possible until object storage
+> arrives in a later phase. See [decisions.md](decisions.md).
+
+### `POST /api/v1/documents`
+
+`multipart/form-data` with one part named `file`.
+
+```sh
+curl -s -X POST localhost:8080/api/v1/documents -H "$AUTH" -F 'file=@notes.txt'
+```
+
+| Accepted | Extension | Notes |
+| --- | --- | --- |
+| PDF | `.pdf` | Text layer only — a scanned page has none, and OCR is a later phase |
+| Plain text | `.txt`, `.text` | |
+| Markdown | `.md`, `.markdown` | Stored and chunked as-is; structure is preserved |
+
+DOCX, CSV and images are rejected with `415`. The extension is checked against
+the file's actual bytes, so a `.pdf` that is not a PDF is refused up front
+rather than stored as a document that failed.
+
+`201 Created`:
+
+```json
+{
+  "id": "b6d0a5c0-6e94-4d1a-9c2e-3b0b1a6f9a11",
+  "filename": "notes.txt",
+  "file_type": "txt",
+  "status": "ready",
+  "error_message": null,
+  "chunk_count": 3,
+  "text_length": 1042,
+  "created_at": "2026-09-09T11:02:31.118Z",
+  "updated_at": "2026-09-09T11:02:33.904Z"
+}
+```
+
+`status` is one of `processing`, `ready` or `failed`. A document that fails to
+process is still created, still has an id, and carries the reason:
+
+```json
+{
+  "id": "…",
+  "filename": "scan.pdf",
+  "status": "failed",
+  "error_message": "No text could be extracted. Scanned documents need OCR, which this version does not do.",
+  "chunk_count": 0
+}
+```
+
+That is deliberately a `201` and not a `4xx`: the row exists and the client
+needs its id. Problems detected *before* any work happens — an empty file, an
+unsupported type, an oversized upload — are ordinary errors and create nothing.
+
+| Failure | Response |
+| --- | --- |
+| No `file` part, or not multipart | `400 invalid_multipart` |
+| Empty file | `400 validation_failed` |
+| Larger than 10 MB (`MAX_UPLOAD_BYTES`) | `413 payload_too_large` |
+| Not a PDF/TXT/MD | `415 unsupported_media_type` |
+| Unreadable PDF, no text, embedding outage | `201` with `status: "failed"` |
+
+### `GET /api/v1/documents`
+
+| Parameter | Values |
+| --- | --- |
+| `status` | `processing`, `ready`, `failed` |
+| `sort` | `created_at`, `updated_at`, `filename`, each also with `-` (default `-created_at`) |
+| `limit`, `offset` | paging (default 50, max 200) |
+
+```json
+{ "documents": [ … ], "count": 2, "limit": 50, "offset": 0 }
+```
+
+A list omits `extracted_text` — it is the largest column in the schema and a
+page of fifty would be megabytes — and with it `text_length`, which is left out
+rather than reported as zero. `chunk_count` is the field to read there.
+
+### `GET /api/v1/documents/{id}`
+
+The document object plus `extracted_text` and `text_length` (characters, not
+bytes). With no object storage in this phase, this is the only way to read a
+document's content back.
+
+### `DELETE /api/v1/documents/{id}`
+
+`204 No Content`. Chunks and their embeddings go with it.
+
+### `POST /api/v1/documents/search`
+
+The retrieval endpoint. Later phases call the same thing as a service function
+(`documents.Service.Search`), not through HTTP.
+
+```json
+{ "query": "what happened over the tundra?", "limit": 5 }
+```
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `query` | — | Required, at most 4,000 characters |
+| `limit` | 5 | Max 50 |
+| `min_similarity` | 0 | Drops weak matches; cosine similarity runs −1 … 1 |
+| `document_ids` | all | Restrict the search to these documents |
+
+`200 OK`:
+
+```json
+{
+  "query": "what happened over the tundra?",
+  "count": 1,
+  "results": [
+    {
+      "chunk_id": "3a1f…",
+      "document_id": "b6d0a5c0-6e94-4d1a-9c2e-3b0b1a6f9a11",
+      "filename": "field-notes.txt",
+      "chunk_index": 0,
+      "content": "The aurora borealis appeared over the tundra shortly after midnight…",
+      "similarity": 0.71
+    }
+  ]
+}
+```
+
+Results are ordered by cosine similarity, nearest first. Only `ready` documents
+are searched, and only the caller's — a `document_ids` entry belonging to
+somebody else simply matches nothing, exactly as a made-up id does.
+
+`min_similarity` is worth setting. Vector search always returns the nearest
+`limit` chunks however far away they are, so without a floor an unrelated
+question still comes back with confident-looking citations.
+
+If the embedding service is unreachable the search cannot run and answers
+`503 embedding_unavailable`.
+
+---
+
 ## Field limits
 
 | Field | Limit |
@@ -420,5 +571,9 @@ As for tasks. `{"tags": null}` empties the tag list rather than writing NULL.
 | `tags` | 25 tags, 50 characters each |
 | `estimated_effort_minutes`, `actual_effort_minutes` | 0 – 525,600 (a year) |
 | request body | 64 KiB |
+| uploaded file | 10 MB (`MAX_UPLOAD_BYTES`) |
+| filename | 255 characters |
+| search `query` | 4,000 characters |
+| chunks per document | 800 (~1.5 MB of prose); a larger document fails to process |
 
 Lengths count characters (runes), not bytes.

@@ -195,6 +195,115 @@ plus a `sed` over the imports whenever the repository moves.
 
 ---
 
+# Phase 3 decisions
+
+## HNSW, not IVFFlat
+
+IVFFlat clusters the rows that exist when the index is built into `lists`
+centroids. An index created by a migration is created on an empty table, so it
+has no useful clustering and has to be rebuilt once real data arrives — a step
+nothing in the deploy would remember to do. HNSW builds its graph incrementally
+as rows are inserted: no training pass, no `REINDEX`, and better recall at the
+same speed.
+
+The costs are real and are the right ones to pay here. HNSW uses more memory,
+and an insert is slower than IVFFlat's. Inserts happen once per uploaded
+document; searches happen on every question asked of the corpus.
+
+The operator class is `vector_cosine_ops`, matching the `<=>` the search uses.
+nomic-embed-text does not return unit-length vectors, so cosine — not L2, not
+inner product — is the distance that means "similar text".
+
+## `ef_search` is raised for every search
+
+Every search is filtered by `user_id`. An HNSW scan collects candidates from the
+graph *first* and applies the `WHERE` clause afterwards, so with the default
+`ef_search` of 40, a user whose chunks are a small fraction of the table can
+have most candidates filtered away and get back fewer rows than they asked for
+— silently, since a short result list looks exactly like a small corpus.
+
+`Repository.Search` therefore runs in a read-only transaction whose only reason
+to exist is `SET LOCAL hnsw.ef_search = 200`: local, so the setting reverts on
+commit instead of leaking to the next query on that pooled connection.
+
+pgvector 0.8 adds iterative index scans (`hnsw.iterative_scan`), which solve
+this properly by re-walking the graph until the filter is satisfied. Using them
+would tie the code to a version floor the migration does not currently enforce;
+a wider `ef_search` costs a little latency and works on every version that has
+HNSW at all.
+
+## `document_chunks.user_id` is denormalized
+
+The owner is derivable by joining `documents`, and it is stored on the chunk
+anyway. The similarity search is an index scan over `document_chunks` ordered by
+distance; if the owner filter lived on the other side of a join, it could only
+be applied *after* that scan had already chosen its candidates — which is the
+same recall problem as above, made worse.
+
+The duplication is safe because nothing can change it: a chunk's `user_id` is
+written once, at insert, from the same variable that scoped the document lookup.
+
+## Chunking counts words, not tokens
+
+The brief asks for ~500-token chunks with ~50 tokens of overlap. Nothing here
+tokenizes. The only tokenizer that would be exact is the embedding model's own,
+and a chunk 15% off target costs nothing: nomic-embed-text's context is 8k
+tokens, sixteen times a chunk.
+
+So the token budget is converted once, at ~0.75 words per token, into 375 words
+with 38 of overlap — and the windows are sliced out of the original string
+rather than re-joined from a word list, so paragraph breaks, indentation and
+Markdown structure survive into the chunk. What gets embedded is what a citation
+will quote back.
+
+A byte ceiling (`MaxChunkBytes`) sits on top for text that is not words at all:
+minified JSON, base64, a language that does not space-separate. Without it one
+"word" could be the entire file, and Ollama would silently truncate it — storing
+a vector that does not describe most of the chunk it is attached to.
+
+## A failed document is a created document
+
+`POST /documents` answers `201` even when processing failed, with `status:
+"failed"` and the reason in `error_message`.
+
+The alternative — a `5xx` — leaves the client with a row they were never told
+the id of. The row genuinely exists: it can be listed, inspected and deleted.
+The line drawn instead is *when* the failure happened. Anything detected before
+work starts (empty file, unsupported type, oversized upload) creates nothing and
+is an ordinary `4xx`. Anything that fails during the pipeline is a document that
+failed.
+
+`error_message` is a fixed set of sentences written in this package, never
+`err.Error()`. The column is read back over the API, and a wrapped driver error
+would put connection strings and internal paths in an HTTP response. The full
+error goes to the log.
+
+## Uploads are processed inside the request
+
+There is no job queue in this phase, so the pipeline runs in the handler. Two
+consequences were made explicit rather than left to be discovered:
+
+- **`/documents` gets its own request timeout** (`DOCUMENT_PROCESS_TIMEOUT`,
+  default 2 minutes) instead of the global 30 seconds, and the HTTP server's
+  read and write timeouts are derived from it — a response the socket has
+  already given up on cannot report a result. Every other route keeps the 30
+  seconds.
+- **A document is capped at 800 chunks** (~1.5 MB of prose). That is not a storage
+  limit; it is what keeps one upload from holding a request open past any
+  reasonable timeout. A larger file fails with a message saying so.
+
+Both revert when the queue arrives: upload becomes `202`, and the cap becomes a
+matter of how long a worker may run rather than how long a client will wait.
+
+## The retrieval function is a service method, not a handler
+
+`documents.Service.Search(ctx, userID, SearchQuery)` takes the user id as an
+argument rather than reading it from a request context, and returns typed
+results. Phase 6's chat calls exactly that, from an agent loop with no HTTP
+anywhere in it. `POST /documents/search` is a thin adapter over it, and the
+validation and the owner scoping live on the service side of that line, so the
+non-HTTP caller cannot skip them.
+
 # Explicitly deferred
 
 These are **not** silently skipped — they are known gaps.
@@ -263,3 +372,61 @@ Each endpoint writes one row. Reordering a list of tasks, or completing a goal
 and all its milestones, takes one request per row and is not atomic. A
 `PATCH /tasks` accepting a list is the shape for it, and it should share the
 per-user advisory lock that dependency edits already use.
+
+## 9. No object storage — the original file is gone
+
+**This is the largest gap in Phase 3.** `documents.extracted_text` holds the
+text; the uploaded bytes are read, parsed and discarded. There is no way to
+re-download the PDF that was uploaded, to show it in a viewer, to re-extract it
+with a better parser later, or to hand it to OCR when that arrives.
+
+Everything a user can get back is the plain text: page layout, tables, images
+and formatting are lost at upload time and cannot be recovered from what is
+stored.
+
+MinIO is the fix and is a later phase. The migration for it is additive — a
+`storage_key` column on `documents` — but the files uploaded before it exists
+are not recoverable, so this is worth knowing before anyone treats the API as a
+document store.
+
+## 10. PDF and TXT/Markdown only
+
+DOCX, CSV and images (OCR) are rejected with `415`. Each is a separate parser
+with its own failure modes, and the brief scopes them out. A scanned PDF is
+accepted, extracts nothing, and fails with a message that says OCR is what it
+needs — rather than looking like a corrupt file.
+
+The PDF path reads the text layer only, via `ledongthuc/pdf`. That library
+panics on some malformed files rather than returning an error, which
+user-uploaded files will find; `extractPDF` recovers from that and reports it as
+an ordinary extraction failure.
+
+## 11. No background job queue
+
+Uploads process synchronously — see the Phase 3 decision above for what that
+constrains. A document that fails because Ollama was down has to be deleted and
+re-uploaded; there is no retry.
+
+## 12. No reranking, and no hybrid search
+
+Retrieval is plain vector similarity. There is no keyword/BM25 leg and no
+cross-encoder pass over the top-k, both of which measurably improve RAG
+precision. `min_similarity` is the only defence against confident-looking
+irrelevant citations, and it is off by default.
+
+## 13. Embeddings are tied to one model
+
+The column is `vector(768)` and the vectors in it come from
+nomic-embed-text. Vectors from two models are not comparable, so changing
+`EMBEDDING_MODEL` means a migration that changes the column *and* re-embeds
+every existing chunk. `EMBEDDING_DIMENSIONS` exists as a knob, but a mismatch is
+the operator's to resolve — the client refuses the batch with both widths named
+rather than letting Postgres reject the insert with an opaque error.
+
+## 14. Chunk text is stored twice
+
+Once in `documents.extracted_text` and again, in overlapping windows, across
+`document_chunks.content`. With ~10% overlap that is roughly 2.1x the text size
+in the database. It is the right trade while retrieval must return the exact
+string it embedded — but it is why the 800-chunk cap and the 10 MB upload limit
+matter more than they would if chunks were offsets into the text.

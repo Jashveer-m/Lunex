@@ -13,6 +13,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -48,15 +49,22 @@ func newServer(t *testing.T, pool *sql.DB) *httptest.Server {
 		sessionStore = auth.NewSessionRepository(pool)
 	}
 	svc := auth.NewService(userStore, sessionStore, tokens, 24*time.Hour)
+	// The document service gets a deterministic embedder rather than a live
+	// Ollama, so these tests measure the routing and the SQL scoping and
+	// nothing else. See embedder_test.go.
+	docSvc := documents.NewService(documents.NewRepository(pool), &hashingEmbedder{}, discard, 30*time.Second)
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(svc, discard),
 		Tasks:       tasks.NewHandler(tasks.NewService(tasks.NewRepository(pool)), discard),
 		Goals:       goals.NewHandler(goals.NewService(goals.NewRepository(pool)), discard),
 		Notes:       notes.NewHandler(notes.NewService(notes.NewRepository(pool)), discard),
+		Documents:   documents.NewHandler(docSvc, discard, 0),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(100, 100),
 		DB:          pool, // nil degrades healthz to a liveness check
 		Logger:      discard,
+
+		DocumentTimeout: 60 * time.Second,
 	})
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -174,11 +182,11 @@ func TestUnknownRouteIs404(t *testing.T) {
 	}
 }
 
-// Every Phase 2 route sits behind RequireAuth. This is the cheap half of the
+// Every Phase 2 and Phase 3 route sits behind RequireAuth. This is the cheap half of the
 // isolation story: without a token there is no user id on the context, so a
 // handler never runs at all. The other half — one user reaching another
 // user's rows — is in isolation_test.go, against real SQL.
-func TestPhase2RoutesRequireAuth(t *testing.T) {
+func TestResourceRoutesRequireAuth(t *testing.T) {
 	srv := newTestServer(t)
 	id := "5c2c9b6f-0f8e-4f4c-9f2b-0f0d9b6f0f8e"
 	for _, tc := range []struct{ method, path string }{
@@ -200,6 +208,11 @@ func TestPhase2RoutesRequireAuth(t *testing.T) {
 		{http.MethodGet, "/api/v1/notes/" + id},
 		{http.MethodPatch, "/api/v1/notes/" + id},
 		{http.MethodDelete, "/api/v1/notes/" + id},
+		{http.MethodGet, "/api/v1/documents"},
+		{http.MethodPost, "/api/v1/documents"},
+		{http.MethodPost, "/api/v1/documents/search"},
+		{http.MethodGet, "/api/v1/documents/" + id},
+		{http.MethodDelete, "/api/v1/documents/" + id},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			resp, _ := doJSON(t, srv, tc.method, tc.path, "", nil)

@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -24,10 +25,14 @@ type Deps struct {
 	Tasks       *tasks.Handler
 	Goals       *goals.Handler
 	Notes       *notes.Handler
+	Documents   *documents.Handler
 	Tokens      *auth.TokenIssuer
 	RateLimiter *auth.IPRateLimiter
 	DB          *sql.DB
 	Logger      *slog.Logger
+	// DocumentTimeout overrides the global request timeout for /documents.
+	// Zero falls back to the global one.
+	DocumentTimeout time.Duration
 }
 
 // NewRouter returns the fully wired handler for the API.
@@ -39,6 +44,9 @@ func NewRouter(d Deps) http.Handler {
 	// X-Forwarded-For, which is client-controlled until a trusted proxy is in
 	// front of this process, and the rate limiter keys on RemoteAddr.
 	r.Use(middleware.Recoverer)
+	// The global request budget. /documents raises it below: uploading is
+	// synchronous in this phase, and embedding a long document is minutes of
+	// honest work rather than a stuck request.
 	r.Use(middleware.Timeout(30 * time.Second))
 	r.Use(securityHeaders)
 
@@ -67,6 +75,16 @@ func NewRouter(d Deps) http.Handler {
 			r.Mount("/tasks", d.Tasks.Routes())
 			r.Mount("/goals", d.Goals.Routes())
 			r.Mount("/notes", d.Notes.Routes())
+
+			// Phase 3. The upload pipeline runs inside the request, so this
+			// subtree gets its own, longer, timeout; every other route keeps
+			// the 30 seconds set above.
+			r.Group(func(r chi.Router) {
+				if d.DocumentTimeout > 0 {
+					r.Use(middleware.Timeout(d.DocumentTimeout))
+				}
+				r.Mount("/documents", d.Documents.Routes())
+			})
 		})
 	})
 
