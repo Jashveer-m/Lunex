@@ -142,6 +142,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		Status:   q.Get("status"),
 		Category: q.Get("category"),
 		Tag:      q.Get("tag"),
+		Query:    q.Get("q"),
 		Sort:     q.Get("sort"),
 	}
 	var err error

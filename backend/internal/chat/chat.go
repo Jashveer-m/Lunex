@@ -18,11 +18,20 @@
 // independently switchable interfaces -- so an assistant with no graph
 // retrieves exactly what Phase 5 did.
 //
-// What it deliberately is not: there are no agents, no graph traversal beyond
-// one hop and no action engine. The assistant reads and answers. It cannot
-// create, modify or delete tasks, goals, notes or documents, and the system
-// prompt says so, so a user who asks for an action is told rather than quietly
-// ignored.
+// Phase 7 adds a step in front of retrieval. When a message looks like it
+// asks for something to be found or done, a routing call decides whether one
+// of the agent's tools is needed. A read tool runs there and then, and what it
+// found joins the context as the turn's first sources. A write tool does not
+// run: its call is validated into a proposal, recorded with the turn, and
+// announced to the client, and it changes nothing until the user approves it
+// through the action engine -- a different request, which this package never
+// makes. The only writes the chat turn performs are its own messages, the
+// actions it records, and what the two extractors learn.
+//
+// What it deliberately is not: there are no named specialist agents, no graph
+// traversal beyond one hop, no tool that deletes, and no path from a chat turn
+// to a write. The router's tools are wired all-or-nothing, and an assistant
+// without them says it cannot take actions, as it did in Phase 6.
 package chat
 
 import (
@@ -132,6 +141,11 @@ type Source struct {
 	// the difference between "offered to the model" and "used", and it is
 	// measured from the generated text rather than assumed.
 	Cited bool `json:"cited"`
+	// Tool names the tool that found this source, when it was found by one --
+	// search_tasks, search_documents -- rather than by the retrieval every turn
+	// runs. Type still says what kind of record it is, so a client links it the
+	// same way; this says how it got here.
+	Tool string `json:"tool,omitempty"`
 }
 
 // Filter is the query behind GET /conversations.

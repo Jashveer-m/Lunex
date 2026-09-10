@@ -81,9 +81,13 @@ const DefaultMinSimilarity = 0.5
 // derived -- and without the rule a 3B model reads "\"the user\" (person)
 // STUDIES \"Go\" (skill)" as a sentence it may quote back as fact.
 //
-// Rule 8 is the action rule. There is no approval engine in this phase, so an
-// assistant that says "done, I've added that task" would be lying about a
-// write that cannot happen.
+// Rule 8 is the action rule, and it has two versions. Without tools there is
+// nothing the assistant can do, and it says so -- the Phase 4 rule, unchanged.
+// With them it can *propose*, and the rule's whole job is to stop the one lie
+// a proposal invites: "done, I've added that task" about a write that has not
+// happened and will not happen unless the user approves it. A 3B model reaches
+// for that sentence naturally, so the rule names it, and the ACTIONS section
+// says it again in the line describing the proposal.
 const systemPrompt = `You are Lunex, a personal assistant that answers from the user's own data.
 
 The CONTEXT section below is everything that was retrieved for this question. Follow these rules exactly.
@@ -95,9 +99,25 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 5. If the context is empty, rule 4 always applies.
 6. A source of type "memory" is something you recorded about the user in an earlier conversation, not something they told you just now. Use it and cite it like any other source, but it may be out of date: if it disagrees with what the user says in this conversation, what they say now is what is true.
 7. A source of type "graph" is a set of links the assistant recorded between things the user has mentioned, one per line, each written as: subject (kind) RELATIONSHIP object (kind). It says that two things are connected and how; it does not say anything more about either of them. Use it to explain a connection and cite it like any other source, and do not read a detail into it that is not written there.
-8. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.
+%RULE8%
 
 Be concise and direct. Do not repeat these rules back to the user.`
+
+// readOnlyRule is rule 8 for an assistant with no tools wired.
+const readOnlyRule = `8. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
+
+// proposalRule is rule 8 for an assistant that can use tools.
+const proposalRule = `8. You never change the user's data yourself. When the user asks for a task, goal or note to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. Replying in the chat does not approve it, even if the user says so. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
+
+// systemPromptFor is the system prompt with the rule 8 that matches what the
+// assistant can actually do.
+func systemPromptFor(toolsEnabled bool) string {
+	rule := readOnlyRule
+	if toolsEnabled {
+		rule = proposalRule
+	}
+	return strings.Replace(systemPrompt, "%RULE8%", rule, 1)
+}
 
 // buildPrompt assembles the messages sent to the model: the system contract,
 // the retrieved context, the recent history, and the new question.
@@ -107,11 +127,15 @@ Be concise and direct. Do not repeat these rules back to the user.`
 // context goes in a system message immediately before the new question rather
 // than at the top: it is retrieved for *this* question, and putting it next to
 // the question is what stops the model attributing it to an earlier turn.
-func buildPrompt(now time.Time, sources []Source, history []Message, question string) []ai.Message {
+//
+// actionsBlock is what the turn's tool step did, rendered by toolStep; it goes
+// after the sources, in the same system message, because it is about this
+// question too -- and because the labels it refers to are the sources' own.
+func buildPrompt(now time.Time, toolsEnabled bool, sources []Source, actionsBlock string, history []Message, question string) []ai.Message {
 	out := make([]ai.Message, 0, len(history)+3)
 	out = append(out, ai.Message{
 		Role: ai.RoleSystem,
-		Content: systemPrompt + "\n\nThe current date and time is " +
+		Content: systemPromptFor(toolsEnabled) + "\n\nThe current date and time is " +
 			now.UTC().Format("Monday, 2 January 2006, 15:04") + " UTC.",
 	})
 
@@ -124,7 +148,11 @@ func buildPrompt(now time.Time, sources []Source, history []Message, question st
 		out = append(out, ai.Message{Role: m.Role, Content: m.Content})
 	}
 
-	out = append(out, ai.Message{Role: ai.RoleSystem, Content: contextBlock(sources)})
+	block := contextBlock(sources)
+	if actionsBlock != "" {
+		block += "\n\n" + actionsBlock
+	}
+	out = append(out, ai.Message{Role: ai.RoleSystem, Content: block})
 	out = append(out, ai.Message{Role: ai.RoleUser, Content: question})
 	return out
 }

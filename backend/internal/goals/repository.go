@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/jashveer/lifeos/backend/internal/db"
 )
 
 // Repository is the Postgres store for goals and their milestones.
@@ -77,6 +79,11 @@ func (r *Repository) List(ctx context.Context, userID uuid.UUID, f Filter) ([]Go
 	}
 	if f.Type != "" {
 		add("type = $%d", f.Type)
+	}
+	if f.Query != "" {
+		// See tasks.Repository.List: a scan of the owner's rows, escaped by
+		// db.Contains.
+		add(`(title ILIKE $%[1]d ESCAPE '\' OR description ILIKE $%[1]d ESCAPE '\')`, db.Contains(f.Query))
 	}
 
 	query := `SELECT ` + goalColumns + ` FROM goals WHERE ` + strings.Join(where, " AND ") +

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check for the Phase 3 retrieval pipeline, the Phase 4 assistant,
-# the Phase 5 memory system and the Phase 6 knowledge graph.
+# the Phase 5 memory system, the Phase 6 knowledge graph and the Phase 7 action
+# engine.
 #
 # Boots the API against TEST_DATABASE_URL, registers a user, uploads a small
 # text file, searches for a phrase from it, then asks the assistant two
@@ -18,6 +19,14 @@
 # graph context surfaces; and confirm the delete rules -- a mirrored node is
 # refused, an extracted one is not, and deleting the task takes its node.
 #
+# Then the action check: ask the assistant to create a task and confirm it was
+# proposed, not created; approve it and confirm the task now exists; ask for
+# another and reject it, and confirm nothing was created; and ask it to find a
+# task, which must run the search without asking anybody.
+#
+# E2E_ONLY=actions runs the preflight, registration and the action check and
+# nothing else -- a few minutes rather than most of an hour on a slow machine.
+#
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
 # generation, real extraction.
 #
@@ -33,12 +42,12 @@
 # against a 60s default. Raise the budgets if the extraction steps come back
 # empty; they are passed through to the API:
 #
-#   MEMORY_EXTRACT_TIMEOUT=180s GRAPH_EXTRACT_TIMEOUT=180s CHAT_TIMEOUT=12m \
-#     ./scripts/e2e.sh
+#   MEMORY_EXTRACT_TIMEOUT=180s GRAPH_EXTRACT_TIMEOUT=180s AGENT_TIMEOUT=180s \
+#     CHAT_TIMEOUT=18m ./scripts/e2e.sh
 #
-# CHAT_TIMEOUT has to cover the whole turn including both extractions, and the
-# API refuses to start if it does not leave them room -- so raise all three
-# together or none.
+# CHAT_TIMEOUT has to cover the whole turn including both extractions and the
+# routing call, and the API refuses to start if it does not leave them room --
+# so raise them together or none.
 #
 # The run also holds one access token from registration to the last assertion,
 # and since Phase 6 that span routinely exceeds the 15-minute default TTL --
@@ -98,7 +107,18 @@ ok "schema is up, pgvector $(psql "${DB}" -tAc "SELECT extversion FROM pg_extens
 psql "${DB}" -q -c 'TRUNCATE users CASCADE'
 
 step "Starting the API on :${PORT}"
+# Something already listening on the port would answer healthz in place of the
+# API being tested -- which is exactly what a server left behind by an earlier
+# run did, silently, until this check existed.
+if curl -s --max-time 2 -o /dev/null "${API}/healthz"; then
+  fail "something is already listening on :${PORT} -- a server from an earlier run? Stop it, or set E2E_PORT"
+fi
 LOG="$(mktemp)"
+# Built first and run directly, so API_PID is the server itself. With `go run`
+# it was the go tool, and killing that on exit left the compiled server
+# listening -- to be mistaken for the next run's.
+BIN="$(mktemp -d)/api"
+(cd "${ROOT}/backend" && go build -o "${BIN}" ./cmd/api) || fail "the API does not build"
 (cd "${ROOT}/backend" && \
   DATABASE_URL="${DB}" \
   JWT_SECRET="e2e-secret-that-is-comfortably-over-32-bytes-long" \
@@ -109,7 +129,8 @@ LOG="$(mktemp)"
   CHAT_TIMEOUT="${CHAT_TIMEOUT:-}" \
   MEMORY_EXTRACT_TIMEOUT="${MEMORY_EXTRACT_TIMEOUT:-}" \
   GRAPH_EXTRACT_TIMEOUT="${GRAPH_EXTRACT_TIMEOUT:-}" \
-  go run ./cmd/api >"${LOG}" 2>&1) &
+  AGENT_TIMEOUT="${AGENT_TIMEOUT:-}" \
+  exec "${BIN}" >"${LOG}" 2>&1) &
 API_PID=$!
 trap 'kill "${API_PID}" 2>/dev/null || true; wait "${API_PID}" 2>/dev/null || true' EXIT
 
@@ -129,45 +150,7 @@ ACCESS=$(curl -s -X POST "${API}/api/v1/auth/register" \
 AUTH="Authorization: Bearer ${ACCESS}"
 ok "registered"
 
-step "Uploading a text file"
-FILE="$(mktemp -d)/field-notes.txt"
-cat > "${FILE}" <<'TXT'
-Field notes, 14 March.
-
-The aurora borealis appeared over the tundra shortly after midnight and lasted
-about forty minutes. The dogs slept through the whole thing.
-
-Separately: the generator needs a new fuel filter before the next resupply run,
-and the shortwave antenna guy-line on the north side has gone slack again.
-TXT
-
-DOC=$(curl -s -X POST "${API}/api/v1/documents" -H "${AUTH}" -F "file=@${FILE}")
-STATUS=$(echo "${DOC}" | json 'd["status"]')
-DOC_ID=$(echo "${DOC}" | json 'd["id"]')
-[ "${STATUS}" = "ready" ] || fail "document status is '${STATUS}', want 'ready': ${DOC}"
-CHUNKS=$(echo "${DOC}" | json 'd["chunk_count"]')
-[ "${CHUNKS}" -ge 1 ] || fail "document has ${CHUNKS} chunks"
-ok "uploaded ${DOC_ID}, status ready, ${CHUNKS} chunk(s)"
-
-step "Searching for a phrase from the file"
-FOUND=$(curl -s -X POST "${API}/api/v1/documents/search" -H "${AUTH}" \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"what happened with the northern lights over the tundra?","limit":3}')
-
-COUNT=$(echo "${FOUND}" | json 'd["count"]')
-[ "${COUNT}" -ge 1 ] || fail "search returned no results: ${FOUND}"
-
-echo "${FOUND}" | json 'd["results"][0]["content"]' | grep -qi "aurora borealis" \
-  || fail "the top result does not contain the phrase: ${FOUND}"
-echo "${FOUND}" | json 'd["results"][0]["filename"]' | grep -q "field-notes.txt" \
-  || fail "the result carries the wrong filename: ${FOUND}"
-
-SIM=$(echo "${FOUND}" | json 'd["results"][0]["similarity"]')
-python3 -c "import sys; sys.exit(0 if 0 < ${SIM} <= 1.0000001 else 1)" \
-  || fail "similarity ${SIM} is outside (0, 1]"
-ok "top result cites field-notes.txt, similarity ${SIM}"
-
-# --- Phase 4: the assistant -------------------------------------------------
+# --- the stream helpers ---------------------------------------------------------
 #
 # The reply arrives as Server-Sent Events, so the assertions below are made
 # over parsed frames rather than over raw text: `sse` pulls one fact out of a
@@ -222,6 +205,15 @@ out = {
     "linked": " | ".join("%s -%s-> %s" % (l["from_node_id"][:8], l["relationship"], l["to_node_id"][:8])
                          for l in (done or {}).get("linked", [])),
     "linked_count": len((done or {}).get("linked", [])),
+    # Phase 7: the action frames, in stream order, and what done repeated;
+    # and the sources a read tool found.
+    "action_frames": len([d for k, d in events if k == "action"]),
+    "action": json.dumps(next((d for k, d in events if k == "action"), {})),
+    "action_after_tokens": all(i > max([j for j, (k, _) in enumerate(events) if k == "token"] or [-1])
+                               for i, (k, _) in enumerate(events) if k == "action"),
+    "done_actions": len((done or {}).get("actions", [])),
+    "tool_sources": ",".join("%s:%s" % (s.get("tool"), s["title"]) for s in sources if s.get("tool")),
+    "tool_cited": len([s for s in sources if s.get("tool") and s["cited"]]),
 }
 print(out[want])
 PYEOF
@@ -234,6 +226,49 @@ ask() {
     -d "$(python3 -c 'import json,sys;print(json.dumps({"content":sys.argv[1]}))' "$2")" \
     > "$3"
 }
+
+# E2E_ONLY=actions skips straight to the Phase 7 check.
+if [ "${E2E_ONLY:-}" != "actions" ]; then
+
+step "Uploading a text file"
+FILE="$(mktemp -d)/field-notes.txt"
+cat > "${FILE}" <<'TXT'
+Field notes, 14 March.
+
+The aurora borealis appeared over the tundra shortly after midnight and lasted
+about forty minutes. The dogs slept through the whole thing.
+
+Separately: the generator needs a new fuel filter before the next resupply run,
+and the shortwave antenna guy-line on the north side has gone slack again.
+TXT
+
+DOC=$(curl -s -X POST "${API}/api/v1/documents" -H "${AUTH}" -F "file=@${FILE}")
+STATUS=$(echo "${DOC}" | json 'd["status"]')
+DOC_ID=$(echo "${DOC}" | json 'd["id"]')
+[ "${STATUS}" = "ready" ] || fail "document status is '${STATUS}', want 'ready': ${DOC}"
+CHUNKS=$(echo "${DOC}" | json 'd["chunk_count"]')
+[ "${CHUNKS}" -ge 1 ] || fail "document has ${CHUNKS} chunks"
+ok "uploaded ${DOC_ID}, status ready, ${CHUNKS} chunk(s)"
+
+step "Searching for a phrase from the file"
+FOUND=$(curl -s -X POST "${API}/api/v1/documents/search" -H "${AUTH}" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"what happened with the northern lights over the tundra?","limit":3}')
+
+COUNT=$(echo "${FOUND}" | json 'd["count"]')
+[ "${COUNT}" -ge 1 ] || fail "search returned no results: ${FOUND}"
+
+echo "${FOUND}" | json 'd["results"][0]["content"]' | grep -qi "aurora borealis" \
+  || fail "the top result does not contain the phrase: ${FOUND}"
+echo "${FOUND}" | json 'd["results"][0]["filename"]' | grep -q "field-notes.txt" \
+  || fail "the result carries the wrong filename: ${FOUND}"
+
+SIM=$(echo "${FOUND}" | json 'd["results"][0]["similarity"]')
+python3 -c "import sys; sys.exit(0 if 0 < ${SIM} <= 1.0000001 else 1)" \
+  || fail "similarity ${SIM} is outside (0, 1]"
+ok "top result cites field-notes.txt, similarity ${SIM}"
+
+# --- Phase 4: the assistant -------------------------------------------------
 
 step "Starting a conversation"
 CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
@@ -538,12 +573,18 @@ step "Asking about it in a different conversation"
 NAMED=$(echo "${GRAPH}" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
-linked = {e["from_node_id"] for e in d["edges"]} | {e["to_node_id"] for e in d["edges"]}
+# The self node is never matched by a mention -- in a message the user wrote,
+# "you" means the assistant (docs/decisions.md) -- so it is not a node a
+# question can name. Picking it, which happens whenever the model attaches most
+# of its edges to the user, would make this step unpassable by design.
+self_ids = {n["id"] for n in d["nodes"] if n["extracted"] and n["type"] == "person" and n["label"] == "You"}
+linked = ({e["from_node_id"] for e in d["edges"]} | {e["to_node_id"] for e in d["edges"]}) - self_ids
 # The node with the most edges, so the neighbourhood is worth showing.
 counts = {i: 0 for i in linked}
 for e in d["edges"]:
-    counts[e["from_node_id"]] += 1
-    counts[e["to_node_id"]] += 1
+    for end in (e["from_node_id"], e["to_node_id"]):
+        if end in counts:
+            counts[end] += 1
 best = max(counts, key=counts.get)
 print(next(n["label"] for n in d["nodes"] if n["id"] == best))
 ')
@@ -636,4 +677,152 @@ LEFT=$(psql "${DB}" -tAc 'SELECT count(*) FROM document_chunks')
 [ "${LEFT}" = "0" ] || fail "${LEFT} chunks survived the deleted document"
 ok "document deleted, chunks cascaded"
 
-printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse\n'
+fi # E2E_ONLY
+
+# --- Phase 7: tools and the action engine ---------------------------------------
+#
+# The brief's check, in its order: ask the assistant to create a task and
+# confirm it is proposed, not created; approve it and confirm the task exists;
+# ask for another and reject it, and confirm nothing was created. Then a read
+# tool, which runs without asking.
+#
+# The task titles are chosen so no earlier step has created anything that
+# matches them: the counts below are `?q=` searches for them, and mean exactly
+# what they say.
+
+# task_count <q> -- how many of the user's tasks match a search.
+task_count() {
+  local body
+  body=$(curl -s "${API}/api/v1/tasks?q=$1" -H "${AUTH}")
+  expect "listing tasks matching $1" "${body}" 'd["count"]'
+}
+
+# claims_done <answer> -- warn when the model says a proposal was carried out.
+# It is a warning rather than a failure: what a 3B model writes is a matter of
+# wording, and the property that matters -- nothing was created -- is asserted
+# separately against the database. But it is exactly the lie rule 8 exists to
+# prevent, so a run that shows it says so.
+claims_done() {
+  if echo "$1" | grep -qiE "(I('ve| have) (created|added|scheduled|set up)|has been (created|added)|is now (done|created|added)|(it|that) is done|I created|I added)"; then
+    printf '  \033[33mwarn\033[0m the answer describes the proposal as done: %s\n' "$(echo "$1" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
+step "Asking the assistant to create a task"
+ACT_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+[ -n "${ACT_CONV}" ] || fail "conversation was not created"
+[ "$(task_count passport)" = "0" ] || fail "a passport task exists before anything was asked for"
+
+PROPOSE="$(mktemp)"
+ask "${ACT_CONV}" "Add a task to renew my passport by 2026-10-15, it's urgent." "${PROPOSE}"
+sse "${PROPOSE}" answer >/dev/null || fail "the proposing turn failed"
+[ "$(sse "${PROPOSE}" action_frames)" = "1" ] || {
+  grep -q "routing" "${LOG}" && tail -5 "${LOG}" >&2
+  fail "the turn announced $(sse "${PROPOSE}" action_frames) action frame(s), want 1: $(sse "${PROPOSE}" answer | head -c 300)"
+}
+[ "$(sse "${PROPOSE}" action_after_tokens)" = "True" ] \
+  || fail "the action frame arrived before the answer finished"
+[ "$(sse "${PROPOSE}" done_actions)" = "1" ] || fail "done did not repeat the action"
+ACTION="$(sse "${PROPOSE}" action)"
+ACTION_ID=$(expect "reading the action frame" "${ACTION}" 'd["id"]')
+echo "${ACTION}" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["tool_name"] == "create_task", "tool is %r" % a["tool_name"]
+assert a["status"] == "proposed", "status is %r" % a["status"]
+assert a["permission_level"] == "write", "permission is %r" % a["permission_level"]
+assert "passport" in a["input"]["title"].lower(), "title is %r" % a["input"]["title"]
+assert a["result"] is None and a["error_message"] is None, "a proposal has an outcome: %r" % a
+' || fail "the proposal is not the task that was asked for: ${ACTION}"
+ok "proposed: $(echo "${ACTION}" | json 'd["summary"]')"
+printf '     %s\n' "$(sse "${PROPOSE}" answer | tr '\n' ' ' | head -c 260)"
+claims_done "$(sse "${PROPOSE}" answer)"
+
+step "Checking it was proposed, not created"
+[ "$(task_count passport)" = "0" ] || fail "the task exists before it was approved"
+PENDING=$(curl -s "${API}/api/v1/actions?status=proposed" -H "${AUTH}")
+echo "${PENDING}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+assert sys.argv[1] in [a["id"] for a in d["actions"]], "the proposal is not listed as proposed"
+' "${ACTION_ID}" || fail "GET /actions?status=proposed does not list it: ${PENDING}"
+ok "no task yet; the action is listed as proposed"
+
+step "Approving it"
+APPROVED=$(curl -s -X POST "${API}/api/v1/actions/${ACTION_ID}/approve" -H "${AUTH}")
+[ "$(expect "approving" "${APPROVED}" 'd["status"]')" = "executed" ] \
+  || fail "approval did not execute: ${APPROVED}"
+[ "$(task_count passport)" = "1" ] || fail "after approval there are $(task_count passport) passport tasks, want 1"
+TASKS=$(curl -s "${API}/api/v1/tasks?q=passport" -H "${AUTH}")
+echo "${TASKS}" | python3 -c '
+import sys, json
+t = json.load(sys.stdin)["tasks"][0]
+a = json.loads(sys.argv[1])
+assert t["id"] == a["result"]["task"]["id"], "the action names %r, the task is %r" % (a["result"]["task"]["id"], t["id"])
+assert t["deadline"] and t["deadline"].startswith("2026-10-15"), "deadline is %r" % t["deadline"]
+' "${APPROVED}" || fail "the created task is not the one approved: ${TASKS}"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/actions/${ACTION_ID}/approve" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "a second approval returned ${CODE}, want 409"
+[ "$(task_count passport)" = "1" ] || fail "approving twice made a second task"
+ok "the task exists: $(echo "${TASKS}" | json 'd["tasks"][0]["title"]') (due $(echo "${TASKS}" | json 'd["tasks"][0]["deadline"][:10]')); a second approval is 409"
+
+step "Asking for another task and rejecting it"
+[ "$(task_count dentist)" = "0" ] || fail "a dentist task exists before anything was asked for"
+PROPOSE2="$(mktemp)"
+ask "${ACT_CONV}" "Please create a task to book a dentist appointment." "${PROPOSE2}"
+sse "${PROPOSE2}" answer >/dev/null || fail "the second proposing turn failed"
+[ "$(sse "${PROPOSE2}" action_frames)" = "1" ] \
+  || fail "the second turn announced $(sse "${PROPOSE2}" action_frames) action frame(s), want 1: $(sse "${PROPOSE2}" answer | head -c 300)"
+ACTION2="$(sse "${PROPOSE2}" action)"
+ACTION2_ID=$(expect "reading the second action frame" "${ACTION2}" 'd["id"]')
+echo "${ACTION2}" | json 'd["input"]["title"]' | grep -qi dentist \
+  || fail "the second proposal is not the dentist task: ${ACTION2}"
+ok "proposed: $(echo "${ACTION2}" | json 'd["summary"]')"
+claims_done "$(sse "${PROPOSE2}" answer)"
+
+REJECTED=$(curl -s -X POST "${API}/api/v1/actions/${ACTION2_ID}/reject" -H "${AUTH}")
+[ "$(expect "rejecting" "${REJECTED}" 'd["status"]')" = "rejected" ] || fail "rejection failed: ${REJECTED}"
+[ "$(task_count dentist)" = "0" ] || fail "a rejected proposal created a task"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/actions/${ACTION2_ID}/approve" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "approving a rejected action returned ${CODE}, want 409"
+[ "$(task_count dentist)" = "0" ] || fail "approving after rejecting created a task"
+ok "rejected, and no dentist task exists -- not even after trying to approve it afterwards"
+
+step "Asking it to find a task"
+FIND="$(mktemp)"
+ask "${ACT_CONV}" "Which of my tasks mention the passport?" "${FIND}"
+sse "${FIND}" answer >/dev/null || fail "the searching turn failed"
+sse "${FIND}" tool_sources | grep -qi "search_tasks:.*passport" \
+  || fail "the search did not run or did not find the task: sources=$(sse "${FIND}" tool_sources) types=$(sse "${FIND}" types)"
+[ "$(sse "${FIND}" action_frames)" = "1" ] || fail "the read was not announced"
+echo "$(sse "${FIND}" action)" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["permission_level"] == "read" and a["status"] == "executed", "the read is %r" % a
+' || fail "the read was not recorded as an executed read: $(sse "${FIND}" action)"
+[ "$(task_count passport)" = "1" ] || fail "a read changed the tasks"
+ok "search_tasks ran without approval and found $(sse "${FIND}" tool_sources); $(sse "${FIND}" tool_cited) cited"
+printf '     %s\n' "$(sse "${FIND}" answer | tr '\n' ' ' | head -c 260)"
+
+step "Reading the action log"
+LOGGED=$(curl -s "${API}/api/v1/actions?conversation_id=${ACT_CONV}" -H "${AUTH}")
+expect "listing the conversation's actions" "${LOGGED}" 'd["count"]' >/dev/null
+echo "${LOGGED}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+by = sorted((a["tool_name"], a["status"]) for a in d["actions"])
+assert ("create_task", "executed") in by, by
+assert ("create_task", "rejected") in by, by
+assert ("search_tasks", "executed") in by, by
+assert not [a for a in d["actions"] if a["status"] in ("proposed", "approved")], "something is still pending: %r" % by
+for a in d["actions"]:
+    print("     %-12s %-9s %s" % (a["tool_name"], a["status"], a["summary"]))
+' || fail "the action log is not what happened: ${LOGGED}"
+ok "one executed create, one rejected create, one executed read, nothing pending"
+
+if [ "${E2E_ONLY:-}" = "actions" ]; then
+  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n'
+else
+  printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject\n'
+fi

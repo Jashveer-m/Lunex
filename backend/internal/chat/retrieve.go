@@ -72,9 +72,9 @@ type (
 	}
 )
 
-// retrieve gathers the context for one question, strongest first: document
-// chunks that actually match it, then the memories that match it, then the
-// user's current tasks, goals and notes.
+// retrieve gathers the context for one question, strongest first: whatever a
+// read tool found for it, then document chunks that actually match it, then
+// the memories that match it, then the user's current tasks, goals and notes.
 //
 // Documents and memories are matched semantically. Tasks, goals and notes are
 // not -- they are selected by a plain heuristic (in progress, due soonest,
@@ -95,8 +95,10 @@ type (
 // table because its query errored would produce "I could not find anything in
 // your tasks" -- a false statement about the user's data, which is exactly
 // what this phase's grounding rule exists to prevent.
-func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question string) ([]Source, error) {
-	var out []Source
+func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question string, first []Source) ([]Source, error) {
+	// A read tool's results lead: they are the one thing retrieved because the
+	// user asked for exactly it.
+	out := append([]Source(nil), first...)
 
 	found, err := s.docs.Search(ctx, userID, documents.SearchQuery{
 		Query:         truncate(question, documents.MaxQueryLen),
@@ -157,7 +159,34 @@ func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question strin
 		})
 	}
 
-	return labelled(out), nil
+	return labelled(deduplicated(out)), nil
+}
+
+// deduplicated drops a source already retrieved by an earlier step. A task the
+// search tool found is usually also one the heuristic picks up, and showing the
+// model the same task twice under two labels would split its citations between
+// them. The first occurrence wins, which keeps the tool's -- it came first,
+// and it carries the tool's name.
+func deduplicated(in []Source) []Source {
+	type key struct {
+		kind  string
+		id    uuid.UUID
+		chunk int
+	}
+	seen := make(map[key]struct{}, len(in))
+	out := in[:0:0]
+	for _, s := range in {
+		k := key{kind: s.Type, id: s.ID, chunk: -1}
+		if s.ChunkIndex != nil {
+			k.chunk = *s.ChunkIndex
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // recall is the memory half of retrieval. It is a no-op when no memory service

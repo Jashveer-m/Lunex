@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/actions"
+	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
@@ -24,6 +26,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
+	"github.com/jashveer/lifeos/backend/internal/tools"
 	"github.com/jashveer/lifeos/backend/internal/users"
 	"github.com/jashveer/lifeos/backend/migrations"
 )
@@ -160,6 +163,42 @@ func run(logger *slog.Logger) error {
 		"extraction", cfg.GraphExtraction, "model", orElse(cfg.GraphModel, provider.Model()),
 		"extract_timeout", cfg.GraphExtractTimeout)
 
+	// Phase 7's tools and the action engine. The registry is built over the
+	// same services the HTTP API uses -- a tool that creates a task goes
+	// through tasks.Service.Create, validation, ownership and graph sync
+	// included -- and its ledger is the actions table, which is what makes
+	// "no write without an approved action" a property of the wiring rather
+	// than of the callers: the registry can run a write tool only after that
+	// repository has approved a proposed row. There is one production path to
+	// a write tool, and it starts at POST /actions/{id}/approve.
+	actionRepo := actions.NewRepository(pool)
+	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
+		DocumentMinSimilarity: cfg.ChatMinSimilarity,
+	})...)
+	if err != nil {
+		return err
+	}
+	actionSvc := actions.NewService(actionRepo, registry, logger)
+	// The switch removes the tools from the chat turn and nothing else: the
+	// approval endpoints stay, so a proposal made before it was flipped can
+	// still be decided.
+	var (
+		router     chat.ToolRouter
+		toolRunner chat.ToolRunner
+		actionLog  chat.ActionLog
+	)
+	if cfg.AgentTools {
+		router = agents.NewRouter(provider, registry, logger, agents.Options{
+			Model: cfg.AgentModel, Temperature: cfg.AgentTemperature,
+			MaxTokens: cfg.AgentMaxTokens, Timeout: cfg.AgentTimeout,
+		})
+		toolRunner, actionLog = registry, actionSvc
+	}
+	logger.Info("agent tools configured",
+		"enabled", cfg.AgentTools, "agent", agents.General.Name, "tools", len(registry.Tools()),
+		"model", orElse(cfg.AgentModel, provider.Model()), "timeout", cfg.AgentTimeout)
+
 	chatSvc := chat.NewService(chat.Deps{
 		Store:    chat.NewRepository(pool),
 		Provider: provider,
@@ -176,7 +215,11 @@ func run(logger *slog.Logger) error {
 		Tasks:          taskSvc,
 		Goals:          goalSvc,
 		Notes:          noteSvc,
-		Logger:         logger,
+		// Phase 7, all three or none.
+		Router:  router,
+		Tools:   toolRunner,
+		Actions: actionLog,
+		Logger:  logger,
 		Options: chat.Options{
 			Temperature:         cfg.ChatTemperature,
 			MaxTokens:           cfg.ChatMaxTokens,
@@ -187,6 +230,7 @@ func run(logger *slog.Logger) error {
 
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(service, logger),
+		Actions:     actions.NewHandler(actionSvc, logger),
 		Tasks:       tasks.NewHandler(taskSvc, logger),
 		Goals:       goals.NewHandler(goalSvc, logger),
 		Notes:       notes.NewHandler(noteSvc, logger),

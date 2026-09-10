@@ -109,6 +109,9 @@ func (p MilestonePatch) Empty() bool {
 type Filter struct {
 	Status string
 	Type   string
+	// Query keeps the goals whose title or description contains it,
+	// case-insensitively and literally; see tasks.Filter.Query.
+	Query  string
 	Sort   string
 	Limit  int
 	Offset int

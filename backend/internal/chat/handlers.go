@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/actions"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/httpx"
 	"github.com/jashveer/lifeos/backend/internal/memories"
@@ -105,6 +106,20 @@ type doneEvent struct {
 	// [] on most turns, the notification rather than the management surface.
 	// The full graph is at /api/v1/knowledge-graph.
 	Linked []linkedResponse `json:"linked"`
+	// Actions is what the turn did with a tool -- a search it ran, or a change
+	// it proposed that now waits for approval at /api/v1/actions/{id}/approve.
+	// The same actions were already sent as `action` frames the moment the
+	// turn was saved; they are repeated here so a client reading only `done`
+	// misses nothing. [] on most turns.
+	Actions []actions.Response `json:"actions"`
+}
+
+func toActionResponses(acts []TurnAction) []actions.Response {
+	out := make([]actions.Response, 0, len(acts))
+	for _, a := range acts {
+		out = append(out, actions.NewResponse(a.Action, a.Summary))
+	}
+	return out
 }
 
 // linkedResponse is one newly recorded relationship, reported on the turn that
@@ -313,6 +328,7 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		Model:          turn.Model,
 		Remembered:     toRememberedResponse(turn.Remembered),
 		Linked:         toLinkedResponse(turn.Linked),
+		Actions:        toActionResponses(turn.Actions),
 	})
 }
 
@@ -344,6 +360,19 @@ func (s *sseSink) Sources(sources []Source) error {
 
 func (s *sseSink) Token(text string) error {
 	return s.send("token", tokenEvent{Text: text})
+}
+
+// Actions sends one `action` frame per action, each an action exactly as
+// GET /api/v1/actions/{id} returns it. They follow the last token and precede
+// `done`: the row exists by the time the frame is written, so a client can
+// approve the moment it shows the proposal.
+func (s *sseSink) Actions(acts []TurnAction) error {
+	for _, a := range acts {
+		if err := s.send("action", actions.NewResponse(a.Action, a.Summary)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *sseSink) send(event string, payload any) error {

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/memories"
@@ -131,6 +132,7 @@ func TestChatKnobsAreBounded(t *testing.T) {
 	t.Setenv("CHAT_TIMEOUT", "90s")
 	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "20s")
 	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "20s")
+	t.Setenv("AGENT_TIMEOUT", "5s")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -147,8 +149,11 @@ func TestChatKnobsAreBounded(t *testing.T) {
 // the user as an answer that could not be completed and was not saved. Both
 // halves of that message would be false.
 //
+// Since Phase 7 the routing call counts too: it runs before the answer rather
+// than after it, but on the same context and out of the same budget.
+//
 // The default configuration has to satisfy the rule, which is the other half
-// of what this pins: it is why DefaultChatTimeout is four minutes.
+// of what this pins: it is why DefaultChatTimeout is six minutes.
 func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
 	t.Setenv("JWT_SECRET", validSecret)
@@ -157,7 +162,7 @@ func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the default configuration does not satisfy its own rule: %v", err)
 	}
-	tail := defaults.MemoryExtractTimeout + defaults.GraphExtractTimeout
+	tail := defaults.MemoryExtractTimeout + defaults.GraphExtractTimeout + defaults.AgentTimeout
 	if left := defaults.ChatTimeout - tail; left < tail {
 		t.Fatalf("the defaults leave %s for generation against %s of extraction", left, tail)
 	}
@@ -166,6 +171,9 @@ func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 		{"the extractions eat the whole budget", "2m", "60s", "60s"},
 		{"one extraction raised without the turn", "4m", "60s", "3m"},
 		{"a turn budget lowered under its own tail", "1m", "60s", "60s"},
+		// Room for the extractions, but not once the routing call's minute is
+		// counted: the Phase 6 default budget with Phase 7's tail.
+		{"the routing call not budgeted for", "5m", "60s", "60s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CHAT_TIMEOUT", tc.chat)
@@ -187,8 +195,20 @@ func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	t.Setenv("CHAT_TIMEOUT", "30s")
 	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "5s")
 	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "5s")
+	t.Setenv("AGENT_TIMEOUT", "5s")
 	if _, err := Load(); err != nil {
 		t.Fatalf("a budget that does leave room was refused: %v", err)
+	}
+
+	// With tools off there is no routing call, and its timeout is not charged
+	// against the turn.
+	t.Setenv("CHAT_TIMEOUT", "5m")
+	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "60s")
+	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "60s")
+	t.Setenv("AGENT_TIMEOUT", "60s")
+	t.Setenv("AGENT_TOOLS", "false")
+	if _, err := Load(); err != nil {
+		t.Fatalf("a budget that fits without the routing call was refused with tools off: %v", err)
 	}
 }
 
@@ -285,6 +305,65 @@ func TestMemoryKnobsAreBounded(t *testing.T) {
 	if cfg.MemoryMinSimilarity != 0.7 || cfg.MemoryMaxTokens != 256 ||
 		cfg.MemoryExtractTimeout != 20*time.Second || cfg.MemoryExtraction ||
 		cfg.MemoryModel != "qwen2.5:1.5b" {
+		t.Fatalf("cfg = %+v, want the values from the environment", cfg)
+	}
+}
+
+// --- Phase 7 ---------------------------------------------------------------
+
+func TestAgentDefaults(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
+	t.Setenv("JWT_SECRET", validSecret)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tools are on by default: this is the phase that adds them, and every
+	// write they propose still waits for the user.
+	if !cfg.AgentTools {
+		t.Fatal("agent tools default to off")
+	}
+	if cfg.AgentModel != "" {
+		t.Fatalf("AgentModel = %q, want empty -- the chat model routes unless told otherwise", cfg.AgentModel)
+	}
+	if cfg.AgentTimeout != agents.DefaultTimeout || cfg.AgentMaxTokens != agents.DefaultMaxTokens ||
+		cfg.AgentTemperature != agents.DefaultTemperature {
+		t.Fatalf("cfg = %+v, want the agents package defaults", cfg)
+	}
+}
+
+func TestAgentKnobsAreBounded(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
+	t.Setenv("JWT_SECRET", validSecret)
+
+	for _, tc := range []struct{ key, value string }{
+		{"AGENT_TOOLS", "no"},
+		{"AGENT_TOOLS", "maybe"},
+		{"AGENT_TIMEOUT", "a minute"},
+		{"AGENT_TEMPERATURE", "3"},
+		{"AGENT_MAX_TOKENS", "0"},
+		{"AGENT_MAX_TOKENS", "few"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("err = %v, want a %s error", err, tc.key)
+			}
+		})
+	}
+
+	t.Setenv("AGENT_TOOLS", "false")
+	t.Setenv("AGENT_MODEL", "qwen2.5:1.5b")
+	t.Setenv("AGENT_TIMEOUT", "20s")
+	t.Setenv("AGENT_TEMPERATURE", "0")
+	t.Setenv("AGENT_MAX_TOKENS", "128")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentTools || cfg.AgentModel != "qwen2.5:1.5b" || cfg.AgentTimeout != 20*time.Second ||
+		cfg.AgentMaxTokens != 128 {
 		t.Fatalf("cfg = %+v, want the values from the environment", cfg)
 	}
 }

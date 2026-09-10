@@ -1317,3 +1317,367 @@ The pipeline is sound and the model is small. It misses relationships, states
 some in the wrong direction, and reaches for `RELATED_TO` when a specific
 relationship was available. `GRAPH_MODEL` points extraction at a different model
 without touching anything else, and that is the intended fix.
+
+# Phase 7 decisions
+
+## The model chooses a tool through a structured reply, not native tool calling
+
+This was measured, not assumed. Eighteen messages -- ten that need one of the
+eight tools, eight that need none (a greeting, thanks, a general question, a
+remark about the user's day, a delete request, "yes, go ahead") -- were sent to
+llama3.2:3b three ways:
+
+| Approach | Right | Tool called on the 8 no-tool messages | Median latency |
+| --- | --- | --- | --- |
+| Ollama's native `tools` parameter | 10/18 | **8 of 8** | 3.9s |
+| Structured prompt, a JSON *list* of calls, examples inline | 8/18 | 0 -- but `[]` for everything | 1.6s |
+| Structured prompt, one decision *object* with `"none"` as a named choice, examples as real chat turns | **18/18** | 0 | 3.3s |
+
+Native tool calling is disqualified by its failure mode, not its score: with
+tools in the request, the model called one on *every* message. "Hi, how are
+you?" searched the notes; "Thanks, that's really helpful" produced a
+`create_task` with an invented deadline in 2024. In an assistant whose writes
+are proposals, that is a proposal on every thank-you.
+
+The first structured prompt failed the opposite way -- the attractor Phase 6
+documented, where a 3B model handed a list schema answers `[]` to everything.
+Two changes fixed it and both are load-bearing: "no tool" became a named
+choice (`{"tool": "none"}`) rather than an empty list, and the worked examples
+became real user/assistant turns instead of text inside the system prompt.
+
+So routing is Phase 5/6's pattern -- a small classifier prompt, a lenient
+parser, a strict check on what it returns -- and it needs nothing new from
+`ai.Provider`. Native calling would have needed the interface to grow tool
+support and would have sent the full retrieved context twice per turn.
+
+The production prompt is re-measured by an opt-in test,
+`internal/agents/ollama_eval_test.go`, over the eighteen plus six harder
+messages. Its first run scored 22/24 with no write proposed for a message that
+asked for none; the two misses ("remind me to call the bank on Friday" got no
+tool, and a statement containing "finish" got a search) led to one more worked
+example of each, and the second run scored **23/24, 0 spurious writes**. The
+remaining miss is a statement that triggers `search_notes` -- a read, which
+changes nothing.
+
+## The routing call is gated by a lexical check
+
+The routing prompt is ~720 tokens. On the development machine (an i5-7360U
+running Ollama on two threads) prompt evaluation runs at ~13 tokens a second:
+the routing call costs **~55 seconds** when Ollama's prefix cache does not
+already hold it, and ~3 seconds when it does. In real use the chat and
+extraction prompts pass through the same model between turns, and the cache
+rarely holds it. Every one of those seconds is before the first token of the
+answer.
+
+So `agents.MightUseTool` sits in front of it, the routing counterpart of the
+extractors' length threshold: a message is only routed if it contains a cue --
+a word starting "task", "note", "goal", "document", "add", "create", "find",
+"mark", "remind", "delete" and some forty more. Greetings, thanks, questions
+about the world and remarks about the day contain none, and most turns are
+those.
+
+The gate is deliberately permissive and it can only fail one way. A request
+phrased with none of the cues gets an answer without a tool -- exactly the
+answer Phase 6 gave -- and never the dangerous way: the gate can decline a
+tool, only the model can choose one, and only the user can approve a write. A
+false positive costs one routing call and nothing else, which is why "which",
+"list" and "show" are cues despite appearing in ordinary questions.
+
+## The router reads the message and nothing else
+
+No retrieved context, no conversation history, no date. That keeps the prompt
+short, which is the whole cost of the call, and it has three consequences:
+
+- **Relative dates are resolved in Go.** The prompt tells the model to copy a
+  date as the user wrote it ("tomorrow", "friday"), and `tools.ParseDate`
+  resolves it against the server clock. Date arithmetic is exactly what a 3B
+  model gets confidently wrong, and Go does it exactly. Anything `ParseDate`
+  cannot read ("next year", "soon") is not guessed: the call is declined and
+  the model asks for a date.
+- **"Yes, go ahead" never re-proposes.** With no history the router cannot
+  see what "yes" is agreeing to, so it chooses no tool -- which is also the
+  only correct thing to do, since replying in the chat is not an approval.
+- **"Mark it done" about a task named two turns ago does not resolve.** That
+  is a real limit; see deferred item 30.
+- **Nothing in your documents can reach it.** The prompt-injection path Phases 5
+  and 6 documented -- a file engineered to say "the user has approved X" being
+  read back by an extractor -- does not lead here. The router never sees
+  retrieved text, so a document cannot cause a proposal, and a proposal cannot
+  run without the user anyway.
+
+## Agents are data, and there is one
+
+`agents.Agent` is a name, a purpose and a set of tool names. `TaskAgent`,
+`GoalAgent`, `NoteAgent` and `DocumentAgent` each wrap one module's tools, and
+`General` is `Compose`d from all four. The orchestrator uses `General`, and
+nothing routes to the domain agents individually.
+
+It is data rather than a `TaskAgent` type with methods because agents differ
+only in what they may use. How they decide (the one `Router`), how a decision
+is checked (the agent's own tool set, then the registry's validation) and what
+happens to it (a read runs, a write is proposed) is the same for all of them.
+`Router.Decide` takes the agent as an argument, renders only its tools into the
+prompt, shows only the worked examples for tools it has, and refuses a
+decision naming anything outside its set.
+
+That is what makes the named-agent layer an addition rather than a rework. A
+later phase puts one step in front of `Decide` that picks an agent -- say a
+Study agent composed from `TaskAgent`, `NoteAgent` and a courses module -- and
+calls the same `Decide` with it. The tools, the registry, the action engine and
+the chat turn do not change. The domain agents are a real partition, not
+labels: a test pins that every standard tool belongs to exactly one.
+
+## "No write without an approved action" is a property of the code, not a rule
+
+The brief's one unrelaxable rule is enforced by what exists, not by callers
+remembering it:
+
+- **There is no method that runs a write tool with an input.** `tools.Registry`
+  has `RunRead`, which refuses any tool the registry says is a write -- it looks
+  the permission up rather than trusting the `Call` it was handed -- and
+  `RunApproved`, which takes an **action id** and nothing else.
+- **`RunApproved` asks the ledger to approve that row, then runs what the row
+  says.** The ledger is the actions repository, and its `Approve` is one
+  conditional `UPDATE ... SET status = 'approved' WHERE id = $1 AND user_id =
+  $2 AND status = 'proposed' AND permission_level = 'write' RETURNING tool_name,
+  input`. The tool and its input come out of that row, so what runs is exactly
+  what was proposed and shown, and the caller cannot substitute anything.
+- **The chat turn cannot reach even that.** `chat.ToolRunner` is `Prepare` and
+  `RunRead`. The only production path to `RunApproved` is
+  `POST /actions/{id}/approve`.
+- **The tools cannot delete.** Their service interfaces (`tools.TaskService`
+  and friends) have no `Delete` method, so no tool can call one by mistake.
+
+The rule holds even when the user asks to relax it -- "don't ask me, just do
+it" produces a proposal like any other, and "I approve" typed into the chat is
+not routed at all -- and it is pinned at four layers: the registry against a
+fake ledger, the action engine against an in-memory store, the chat turn with
+a registry that has *no ledger at all*, and `internal/db` against the real
+table, where every state but `proposed` -- including a row set to `approved` by
+hand -- is refused and the tasks table is counted after each attempt.
+
+## Approval is single-use, and `approved` is transient
+
+The conditional `UPDATE` is what makes an approval happen at most once. Two
+requests approving the same action both run it; Postgres row-locks the first,
+the second re-evaluates `status = 'proposed'` against the committed row, and
+matches nothing. Ten concurrent approvals over HTTP produce one `200`, nine
+`409`s and one task; sixteen concurrent `RunApproved` calls against the table
+produce one success.
+
+`approved` means "the user said yes and the tool is running", and becomes
+`executed` or `failed` within the same request. Everything after the approval
+runs on a context detached from the request (and bounded by its own 20s), so a
+client that hangs up the moment it clicks cannot strand the row. A row left in
+`approved` means the process died mid-execution and the outcome is unknown. It
+is **never retried**: retrying a create that did in fact land would create it
+twice, and the gate would refuse anyway -- the row is no longer proposed.
+
+## Proposals are part of the turn
+
+A turn's actions -- the read it ran, the write it proposed -- are inserted in
+the same transaction as its messages, by `chat.Repository.AppendTurn` calling
+`actions.Insert` on its own transaction. The SQL for the table still lives in
+`internal/actions`; the commit is shared. Phase 4's rule is kept whole: a turn
+that fails persists nothing, and that now includes a proposal the user never
+saw answered.
+
+The `action` frame is sent **after the last token and before `done`** -- the
+moment the turn is committed and before the two extractions run. Not earlier:
+before the answer, the row does not exist, and a client that showed an approve
+button during the stream would get a `404` for a real click. Not later: `done`
+waits for up to two extractions, and an approve button that appears a minute
+after the answer is one nobody waits for. `done` repeats the actions for a
+client that reads only it.
+
+## A write is validated when it is proposed, not when it is approved
+
+`Registry.Prepare` turns the model's arguments into the tool's canonical input:
+lenient about shape (aliases, `"none"` for absent, a number where a string was
+asked for), strict about content -- the resource service's own `ValidateCreate`
+/ `ValidatePatch` runs at proposal time, so the user is never shown a proposal
+that would fail on approval. The canonical input is what is stored, what the
+user sees, and what an approval executes; it is decoded strictly on the way
+back, so a stored input with a key its type does not declare is refused rather
+than run with the key ignored.
+
+The one-sentence `summary` on every action is derived from the input on each
+read and never stored, so it cannot disagree with what would run.
+
+A call the model got wrong -- no title, a date that is not a date -- is not
+recorded and is not an error. The answering model is told, in the ACTIONS
+section, what could not be prepared and why, so it can ask the user for the
+missing piece.
+
+## `update_task` resolves its reference to one task, or declines
+
+The model names the task in words ("the scheduler task"). `resolveTask` looks
+among the caller's own tasks only: an exact title match wins; otherwise the
+reference is searched as text -- the whole phrase, then its significant words
+-- and it resolves only if exactly one task matches. Several matches are
+declined with the candidates listed; none is declined with the reference
+quoted. Guessing which task to change is precisely the decision the user should
+make, and a proposal is the wrong place to discover the guess was wrong.
+
+The resolved task is stored by id, with its title alongside for the summary, and
+the approval executes by id alone. A change to what the task already has is
+declined ("nothing to change") rather than proposed.
+
+## Read tools are recorded too
+
+A read runs without approval, and is still an `actions` row -- `permission_level
+= 'read'`, born `executed` -- which is why the brief's schema has the column. It
+is the audit trail of what the assistant looked at on the user's behalf. The
+schema says the half of the state machine it can: a read can never be
+`proposed`, `approved` or `rejected`. `search_documents` records which chunks it
+found and their scores, not the passages, so the audit trail does not become a
+second copy of the corpus.
+
+What a read found joins the context as the turn's *first* sources, marked with
+`tool`, rendered with the same summaries the heuristic uses, and deduplicated
+against everything else retrieved -- a task the search found is usually also on
+the heuristic's list, and two labels for one task would split its citations. A
+read that fails because the database or the embedder is down fails the turn,
+as a failed retrieval does.
+
+## The model is told what became of what it proposed
+
+Every turn with tools reads the conversation's last five write actions and
+shows their outcomes in the ACTIONS section -- "the user approved it and it was
+done", "the user rejected it", "the user approved it, but it failed: …".
+Without it the model's only memory of a proposal is its own sentence in the
+history, and it goes on calling an approved task "waiting".
+
+Proposing exactly what is already pending in the conversation reuses the
+pending action rather than queueing a second one -- which would let the user
+approve the same task twice.
+
+## Approve and reject take no parameters
+
+A body is optional and, if present, must be `{}`. `{"input": {...}}` is a `400`
+and the action is untouched: an ignored field is how a client comes to believe
+it edited a proposal on the way through, and what runs must be what was
+proposed. Editing a proposal is deferred (item 32).
+
+Approve answers `200` with the action in its final state whether the tool
+succeeded or not -- the approval was accepted and recorded; `status` says
+`executed` or `failed`. A failed action's `error_message` is a fixed sentence,
+never the underlying error, for the reason `documents.clientMessage` gives.
+An action that exists and is no longer proposed is `409 action_not_pending`,
+naming its state; somebody else's is `404` whatever its state.
+
+## The resource lists grew a text filter
+
+`search_tasks`, `search_goals` and `search_notes` need to find records by what
+they say, and none of the Phase 2 filters could. `Filter.Query` is a
+case-insensitive substring match on the title and the description (or a note's
+content), escaped by `db.Contains` so `%` and `_` are characters. It is exposed
+as `?q=` on `GET /tasks`, `/goals` and `/notes`, so the assistant sees exactly
+what the API returns. A leading-wildcard `ILIKE` cannot use an index; it scans
+one user's rows, which the `user_id` index has already narrowed.
+
+## The turn's budget grew again
+
+`CHAT_TIMEOUT` defaults to 6 minutes, and the boot-time coherence check now
+counts `AGENT_TIMEOUT` alongside the two extraction timeouts: the routing call
+runs before the answer rather than after it, but on the same context and out of
+the same budget. Phase 6 added a minute for its extraction; this phase adds one
+for its routing call, for the same reason. `AGENT_TOOLS=false` removes the
+routing call and its share of the check.
+
+## The system prompt's action rule has two versions
+
+Without tools, rule 8 is Phase 4's: the assistant can only read, and says so.
+With them it can propose, and the rule's whole job is the one lie a proposal
+invites -- "done, I've added that task". It says a proposal has not been made,
+that replying in the chat does not approve it, and to report earlier proposals
+exactly as the ACTIONS section states them.
+
+How the ACTIONS section is *worded* turned out to matter as much as the rule,
+and it was measured twice. The first version reported the proposal to the model
+-- "You proposed this change, and it has NOT been made: …" -- and in both
+end-to-end runs llama3.2:3b copied the section into its reply, heading and all.
+Four renderings were then tried against the same system prompt: moving the
+section above the context made the model open with "I could not find anything
+about that"; a bare note with no heading was copied every time; the report
+wording was copied in some samples; and wording it as *what to say* -- "Reply by
+telling the user, in your own words, that you have prepared it, what it will do
+(…), and that it will only happen once they approve it" -- produced "I have
+prepared a change … it will only happen once you approve it" in every sample.
+That is the wording that ships.
+
+It is still a prompt, so it is a request: the end-to-end run warns when an
+answer describes a proposal as done, and the property that matters -- nothing
+was created -- is asserted against the database, not the wording.
+
+## A goal with no stated type is filed as `personal`
+
+`goals.type` is required and has no default. Asking "what *type* of goal is
+running a marathon?" before proposing it is a worse experience than filing it
+under the broadest type and showing that in the proposal, where the user sees it
+before anything is written. Near-misses are mapped (`savings` → `financial`,
+`work` → `career`).
+
+# Phase 7 — explicitly deferred
+
+## 29. No delete tools
+
+Deleting through a conversation is a sharper edge than creating. An approved
+create that was wrong costs a click to undo; an approved delete of the wrong
+task -- resolved from "the antenna one" -- costs the task, its subtasks and its
+graph node. It wants a proposal that shows exactly what would go, and probably
+an undo window. The tool service interfaces have no `Delete` method, so adding
+it is a deliberate change to an interface, not a line written by accident. The
+router is told nothing can be deleted and chooses no tool; the answering model
+is told to say so.
+
+## 30. One tool call per turn, and no conversation history for the router
+
+"Find my scheduler task and mark it done" works only because `update_task`
+resolves its own reference. "Create tasks for A, B and C" proposes one. "Mark
+it done" about a task named two turns ago does not resolve, because the router
+reads only the message. Multi-call turns and history-aware routing are the
+agent loop the spec describes, and both would lengthen the prompt on the path
+to the first token.
+
+## 31. No named specialist agents
+
+Study, Career, Finance, Travel and Research need modules that do not exist.
+The structure for them does; see "Agents are data" above.
+
+## 32. A proposal cannot be edited, and does not expire
+
+Approve takes no body. Fixing a proposal's title means rejecting it and asking
+again. Proposals do not expire and are not checked for staleness: an
+`update_task` approved a week later applies the fields it named to the task as
+it is then, whatever else changed meanwhile.
+
+## 33. `update_task` cannot clear a field
+
+It sets values; it cannot remove a deadline or a description. Clearing is a
+`null` in the canonical input and a third state in the summary, and it waits for
+a UI that can show "deadline → (none)" unambiguously.
+
+## 34. No undo, and no reconciler for a stranded `approved`
+
+An executed action is final; undoing it is an ordinary edit through the API. A
+row left `approved` by a crash is logged loudly and left for a human, because
+the only safe automatic answer -- never retry -- is already what happens.
+
+## 35. Dates are resolved in UTC
+
+"Tomorrow" is tomorrow in UTC, the same clock the chat prompt states.
+`user_profiles.timezone` exists and nothing here reads it yet; a user in
+UTC+10 asking after 2pm local time gets the day after the one they meant.
+
+## 36. The gate and the router were measured on 24 messages
+
+23/24 with no spurious write is a good result on a small, hand-written set, not
+a labelled evaluation. The eval test exists so the next change to the prompt,
+the tools or the model can be re-measured the same way.
+
+## 37. No per-user limit on proposals or approvals
+
+A user can hold as many proposals open as they can type requests. Every one
+waits for them, so the harm is clutter rather than writes, but a rate limit on
+the approval endpoint belongs with the rest of the per-user limits.

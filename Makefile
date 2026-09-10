@@ -22,7 +22,9 @@ test-integration:
 # searches for a phrase from it, asks the assistant about it, states a fact in
 # one conversation and checks a different conversation retrieves and cites it,
 # then creates a task and checks its graph node, states a relationship and
-# checks the edge was extracted, and asks about it in a third conversation.
+# checks the edge was extracted, and asks about it in a third conversation --
+# and then asks the assistant to create a task, approves the proposal, asks for
+# another and rejects it. E2E_ONLY=actions runs just that last part.
 # Needs Postgres with pgvector and a running Ollama; see docs/testing.md.
 test-e2e:
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" ./scripts/e2e.sh

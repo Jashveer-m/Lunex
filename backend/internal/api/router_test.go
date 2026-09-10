@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/actions"
+	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
@@ -21,6 +23,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
+	"github.com/jashveer/lifeos/backend/internal/tools"
 	"github.com/jashveer/lifeos/backend/internal/users"
 )
 
@@ -86,11 +89,26 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Store: memories.NewRepository(pool), Provider: provider, Embedder: &hashingEmbedder{},
 		Logger: discard,
 	})
+	// Phase 7 is wired exactly as cmd/api wires it: the registry over the real
+	// services with the real actions table as its ledger, so these tests run
+	// the genuine approval path against the genuine SQL -- including the gate
+	// every write tool has to pass through.
+	actionRepo := actions.NewRepository(pool)
+	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
+		DocumentMinSimilarity: 0.5,
+	})...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionSvc := actions.NewService(actionRepo, registry, discard)
 	chatSvc := chat.NewService(chat.Deps{
 		Store: chat.NewRepository(pool), Provider: provider,
 		Documents: docSvc, Memories: memorySvc, MemoryExtractor: memorySvc,
 		Graph: graphSvc, GraphExtractor: graphSvc,
 		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc,
+		Router: agents.NewRouter(provider, registry, discard, agents.Options{}),
+		Tools:  registry, Actions: actionSvc,
 		Logger: discard,
 		Options: chat.Options{
 			// The memory floor is named here rather than left at its default.
@@ -106,6 +124,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	})
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(svc, discard),
+		Actions:     actions.NewHandler(actionSvc, discard),
 		Tasks:       tasks.NewHandler(taskSvc, discard),
 		Goals:       goals.NewHandler(goalSvc, discard),
 		Notes:       notes.NewHandler(noteSvc, discard),
@@ -237,7 +256,7 @@ func TestUnknownRouteIs404(t *testing.T) {
 	}
 }
 
-// Every Phase 2, 3 and 4 route sits behind RequireAuth. This is the cheap half of the
+// Every Phase 2-7 route sits behind RequireAuth. This is the cheap half of the
 // isolation story: without a token there is no user id on the context, so a
 // handler never runs at all. The other half — one user reaching another
 // user's rows — is in isolation_test.go, against real SQL.
@@ -277,6 +296,10 @@ func TestResourceRoutesRequireAuth(t *testing.T) {
 		{http.MethodDelete, "/api/v1/memories"},
 		{http.MethodPatch, "/api/v1/memories/" + id},
 		{http.MethodDelete, "/api/v1/memories/" + id},
+		{http.MethodGet, "/api/v1/actions"},
+		{http.MethodGet, "/api/v1/actions/" + id},
+		{http.MethodPost, "/api/v1/actions/" + id + "/approve"},
+		{http.MethodPost, "/api/v1/actions/" + id + "/reject"},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			resp, _ := doJSON(t, srv, tc.method, tc.path, "", nil)

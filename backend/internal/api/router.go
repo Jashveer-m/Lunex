@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/jashveer/lifeos/backend/internal/actions"
 	"github.com/jashveer/lifeos/backend/internal/auth"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
@@ -25,6 +26,7 @@ import (
 // Deps are everything the router needs to build the route tree.
 type Deps struct {
 	Auth        *auth.Handler
+	Actions     *actions.Handler
 	Tasks       *tasks.Handler
 	Goals       *goals.Handler
 	Notes       *notes.Handler
@@ -110,6 +112,12 @@ func NewRouter(d Deps) http.Handler {
 			// involved in the chat turn that grows an edge, and the sync that
 			// creates a node is a single upsert on the resource's own request.
 			r.Mount("/knowledge-graph", d.Graph.Routes())
+
+			// Phase 7. Approving an action runs its tool, and every tool is a
+			// single insert or update plus a graph sync -- database work with
+			// no model anywhere, so the ordinary budget. The model's part was
+			// the chat turn that proposed it.
+			r.Mount("/actions", d.Actions.Routes())
 		})
 
 		// Phase 3. The upload pipeline runs inside the request -- extract,

@@ -1,0 +1,277 @@
+package agents
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jashveer/lifeos/backend/internal/ai"
+	"github.com/jashveer/lifeos/backend/internal/tools"
+)
+
+// catalog is the standard tool declarations. Nothing here runs a tool, so the
+// services behind them are never reached.
+type catalog []tools.Tool
+
+func (c catalog) Tools() []tools.Tool { return c }
+
+func standard() catalog { return catalog(tools.Standard(tools.Services{})) }
+
+func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// --- agents -----------------------------------------------------------------
+
+// General is exactly the domain agents' tools, and every standard tool belongs
+// to exactly one domain agent -- which is what makes the domain agents a real
+// partition a named-agent layer can compose, rather than labels.
+func TestGeneralIsTheUnionOfTheDomainAgents(t *testing.T) {
+	owner := map[string]string{}
+	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent} {
+		for _, name := range a.Tools {
+			if prev, dup := owner[name]; dup {
+				t.Fatalf("%s belongs to both %s and %s", name, prev, a.Name)
+			}
+			owner[name] = a.Name
+		}
+	}
+	for _, tool := range standard() {
+		if owner[tool.Name] == "" {
+			t.Fatalf("%s belongs to no domain agent", tool.Name)
+		}
+		if !General.Allows(tool.Name) {
+			t.Fatalf("General cannot use %s", tool.Name)
+		}
+	}
+	if len(General.Tools) != len(standard()) {
+		t.Fatalf("General has %d tools, want %d", len(General.Tools), len(standard()))
+	}
+}
+
+func TestComposeKeepsEachToolOnce(t *testing.T) {
+	a := Compose("both", "", TaskAgent, TaskAgent, NoteAgent)
+	if len(a.Tools) != len(TaskAgent.Tools)+len(NoteAgent.Tools) {
+		t.Fatalf("tools = %v", a.Tools)
+	}
+}
+
+// --- the prompt -------------------------------------------------------------
+
+func TestTheRoutingPromptOffersExactlyTheAgentsTools(t *testing.T) {
+	var offered []tools.Tool
+	for _, tool := range standard() {
+		if TaskAgent.Allows(tool.Name) {
+			offered = append(offered, tool)
+		}
+	}
+	prompt := RoutingPrompt(offered, "  Add a task to buy milk  ")
+	system := prompt[0].Content
+	for _, want := range []string{"- search_tasks:", "- create_task:", "- update_task:", "- none:",
+		"title (required)", "(low, medium or high)", "Nothing can be deleted"} {
+		if !strings.Contains(system, want) {
+			t.Fatalf("the prompt is missing %q:\n%s", want, system)
+		}
+	}
+	for _, not := range []string{"create_note", "search_documents", "%TOOLS%"} {
+		if strings.Contains(system, not) {
+			t.Fatalf("the prompt offers %q to the task agent", not)
+		}
+	}
+	// The worked examples are real turns, and none demonstrates a tool this
+	// agent cannot use: the search_notes example is gone, the none ones stay.
+	all := ai.PromptText(prompt)
+	if strings.Contains(all, "search_notes") {
+		t.Fatal("the task agent was shown an example of a tool it may not use")
+	}
+	if !strings.Contains(all, `"tool": "none"`) || !strings.Contains(all, `"tool": "create_task"`) {
+		t.Fatal("the examples are missing")
+	}
+	last := prompt[len(prompt)-1]
+	if last.Role != ai.RoleUser || last.Content != "Add a task to buy milk" {
+		t.Fatalf("the last message is %+v, want the user's message", last)
+	}
+}
+
+func TestTheRoutingPromptTruncatesAVeryLongMessage(t *testing.T) {
+	prompt := RoutingPrompt(standard(), strings.Repeat("x", MaxMessageChars*2))
+	if n := len([]rune(prompt[len(prompt)-1].Content)); n > MaxMessageChars+1 {
+		t.Fatalf("message is %d runes", n)
+	}
+}
+
+// --- parsing ----------------------------------------------------------------
+
+// Every shape here is one a model has been seen to write, or plausibly would.
+func TestParseDecisionAcceptsTheShapesModelsWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name, reply, tool, arg, want string
+	}{
+		{"as asked", `{"tool": "create_task", "arguments": {"title": "Buy milk"}}`, "create_task", "title", "Buy milk"},
+		// Seen from llama3.2:3b during the routing measurement.
+		{"flattened", `{"tool": "search_documents", "query": "aurora"}`, "search_documents", "query", "aurora"},
+		{"native habit", `{"name": "search_notes", "parameters": {"query": "Rust"}}`, "search_notes", "query", "Rust"},
+		{"openai", `{"function": {"name": "create_note", "arguments": "{\"title\": \"wifi\"}"}}`, "create_note", "title", "wifi"},
+		{"a list of one", `[{"tool": "update_task", "arguments": {"task": "essay"}}]`, "update_task", "task", "essay"},
+		{"fenced", "```json\n{\"tool\": \"search_tasks\", \"arguments\": {\"query\": \"x\"}}\n```", "search_tasks", "query", "x"},
+		{"after prose", `Sure! Here you go: {"tool": "Create-Task", "args": {"title": "t"}}`, "create_task", "title", "t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := ParseDecision(tc.reply)
+			if d.Tool != tc.tool || d.Args.String(tc.arg) != tc.want {
+				t.Fatalf("ParseDecision = %+v, want %s with %s=%s", d, tc.tool, tc.arg, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseDecisionInventsNothing(t *testing.T) {
+	for _, reply := range []string{
+		`{"tool": "none", "arguments": {}}`,
+		`{"tool": "", "arguments": {"title": "x"}}`,
+		`{"arguments": {"title": "x"}}`,
+		`[]`,
+		`I think you should create a task for that.`,
+		`{"tool": "create_task", "arguments": `,
+		``,
+	} {
+		if d := ParseDecision(reply); !d.None() {
+			t.Fatalf("ParseDecision(%q) = %+v, want no tool", reply, d)
+		}
+	}
+}
+
+// --- the router -------------------------------------------------------------
+
+func TestTheRouterReturnsTheModelsDecision(t *testing.T) {
+	m := &ai.Mock{Reply: `{"tool": "create_task", "arguments": {"title": "Buy milk", "deadline": "tomorrow"}}`}
+	r := NewRouter(m, standard(), quiet(), Options{Model: "router-model"})
+	d, err := r.Decide(context.Background(), General, "Create a task to buy milk tomorrow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Tool != tools.CreateTask || d.Args.String("deadline") != "tomorrow" {
+		t.Fatalf("decision = %+v", d)
+	}
+	opts := m.Calls()[0].Options
+	if opts.Model != "router-model" || opts.Temperature != DefaultTemperature || opts.MaxTokens != DefaultMaxTokens {
+		t.Fatalf("options = %+v", opts)
+	}
+	// Measured: JSON mode is not what this prompt was measured with.
+	if opts.Format != "" {
+		t.Fatalf("the routing call asked for format %q", opts.Format)
+	}
+}
+
+// A model naming a tool it was not offered -- or one that does not exist --
+// gets no tool, not the one it named.
+func TestTheRouterOnlyReturnsToolsTheAgentMayUse(t *testing.T) {
+	for name, tc := range map[string]struct {
+		agent Agent
+		reply string
+	}{
+		"outside the agent": {TaskAgent, `{"tool": "create_note", "arguments": {"title": "x"}}`},
+		"not a tool":        {General, `{"tool": "delete_task", "arguments": {"task": "x"}}`},
+		"shell out":         {General, `{"tool": "run_sql", "arguments": {"sql": "DROP TABLE tasks"}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := NewRouter(&ai.Mock{Reply: tc.reply}, standard(), quiet(), Options{})
+			d, err := r.Decide(context.Background(), tc.agent, "whatever")
+			if err != nil || !d.None() {
+				t.Fatalf("Decide = %+v, %v; want no tool", d, err)
+			}
+		})
+	}
+}
+
+// The model not answering is an outage the turn reports as a 503, not a
+// decision to use no tool: answering without the step that decides whether
+// the user asked for something is not an answer to give silently.
+func TestARoutingFailureIsTheModelBeingUnavailable(t *testing.T) {
+	for name, m := range map[string]*ai.Mock{
+		"refused":   {Err: errors.New("connection refused")},
+		"truncated": {Reply: `{"tool": "create`, StreamErr: errors.New("stream ended")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewRouter(m, standard(), quiet(), Options{}).Decide(context.Background(), General, "add a task")
+			if !errors.Is(err, ai.ErrUnavailable) {
+				t.Fatalf("err = %v, want ErrUnavailable", err)
+			}
+		})
+	}
+}
+
+func TestTheRoutersOwnDeadlineIsAnOutageButTheCallersIsNot(t *testing.T) {
+	r := NewRouter(&blockingProvider{}, standard(), quiet(), Options{Timeout: 20 * time.Millisecond})
+	if _, err := r.Decide(context.Background(), General, "add a task"); !errors.Is(err, ai.ErrUnavailable) {
+		t.Fatalf("the router's deadline = %v, want ErrUnavailable", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r = NewRouter(&blockingProvider{}, standard(), quiet(), Options{Timeout: time.Minute})
+	if _, err := r.Decide(ctx, General, "add a task"); !errors.Is(err, context.Canceled) || errors.Is(err, ai.ErrUnavailable) {
+		t.Fatalf("a caller that hung up = %v, want context.Canceled and not an outage", err)
+	}
+}
+
+// blockingProvider accepts the request and then waits for the context, the
+// way a model that has not produced a token yet does.
+type blockingProvider struct{}
+
+func (blockingProvider) Model() string { return "blocking" }
+func (blockingProvider) Chat(ctx context.Context, _ []ai.Message, _ ai.Options) (ai.Stream, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestAnAgentWithNoToolsIsNeverRouted(t *testing.T) {
+	m := &ai.Mock{Reply: `{"tool": "create_task"}`}
+	d, err := NewRouter(m, standard(), quiet(), Options{}).Decide(context.Background(), Agent{Name: "empty"}, "add a task")
+	if err != nil || !d.None() || len(m.Calls()) != 0 {
+		t.Fatalf("Decide = %+v, %v after %d calls", d, err, len(m.Calls()))
+	}
+}
+
+// --- the gate ---------------------------------------------------------------
+
+// The gate passes every message of the routing measurement that needed a tool,
+// and none of the conversational ones -- except a delete request, which the
+// router then declines.
+func TestTheGateSkipsConversationAndKeepsRequests(t *testing.T) {
+	for _, m := range []string{
+		"Create a task to buy milk tomorrow",
+		"Add a high priority task: submit the tax return by 2026-09-30",
+		"Mark the scheduler task as done",
+		"Change the priority of the compiler project task to high",
+		"Which of my tasks mention the antenna?",
+		"Find my notes about Rust",
+		"Show my active goals",
+		"What do my uploaded documents say about the aurora?",
+		"Set a goal to run a marathon next year",
+		"Save a note: the wifi password for the cabin is hunter2",
+		"Remind me to call the bank on Friday",
+		"Delete my task about the antenna",
+		"I finished the essay",
+	} {
+		if !MightUseTool(m) {
+			t.Fatalf("the gate skipped %q", m)
+		}
+	}
+	for _, m := range []string{
+		"What is the capital of France?",
+		"Hi, how are you?",
+		"Thanks, that's really helpful",
+		"I went for a run this morning and felt great.",
+		"Explain how Go channels work",
+		"yes, go ahead",
+		"What should I focus on today?",
+		"",
+	} {
+		if MightUseTool(m) {
+			t.Fatalf("the gate would route %q", m)
+		}
+	}
+}

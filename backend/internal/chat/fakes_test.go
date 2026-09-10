@@ -2,11 +2,13 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/actions"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
@@ -28,6 +30,8 @@ type fakeStore struct {
 	// appendErr fails the persistence step, after generation succeeded.
 	appendErr error
 	clock     time.Time
+	// actions is what AppendTurn recorded, in order, across every user.
+	actions []actions.Action
 }
 
 func newFakeStore() *fakeStore {
@@ -105,16 +109,24 @@ func (f *fakeStore) Messages(_ context.Context, userID, convID uuid.UUID, limit 
 	return append([]Message(nil), all...), nil
 }
 
-func (f *fakeStore) AppendTurn(_ context.Context, userID, convID uuid.UUID, msgs []NewMessage, titleIfDefault string) ([]Message, error) {
+func (f *fakeStore) AppendTurn(_ context.Context, userID, convID uuid.UUID, msgs []NewMessage, titleIfDefault string, acts []actions.NewAction) ([]Message, []actions.Action, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.callers = append(f.callers, userID)
 	if f.appendErr != nil {
-		return nil, f.appendErr
+		return nil, nil, f.appendErr
 	}
 	c, ok := f.byUser[userID][convID]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
+	}
+	// The same state-machine check the real Insert makes, before anything is
+	// written: an orchestrator that tried to record a write as executed fails
+	// here exactly as it would against Postgres.
+	for _, n := range acts {
+		if err := n.Validate(); err != nil {
+			return nil, nil, err
+		}
 	}
 	if c.Title == DefaultTitle && titleIfDefault != "" {
 		c.Title = titleIfDefault
@@ -132,7 +144,33 @@ func (f *fakeStore) AppendTurn(_ context.Context, userID, convID uuid.UUID, msgs
 		f.messages[convID] = append(f.messages[convID], written)
 		out = append(out, written)
 	}
-	return out, nil
+	var recorded []actions.Action
+	for _, n := range acts {
+		f.clock = f.clock.Add(time.Millisecond)
+		conv := convID
+		a := actions.Action{
+			ID: uuid.New(), UserID: userID, ConversationID: &conv,
+			ToolName: n.Call.Tool, Input: n.Call.Input, Permission: n.Call.Permission,
+			Status: n.Status, CreatedAt: f.clock, UpdatedAt: f.clock,
+		}
+		if n.Result != nil {
+			raw, err := json.Marshal(n.Result)
+			if err != nil {
+				return nil, nil, err
+			}
+			a.Result = raw
+		}
+		f.actions = append(f.actions, a)
+		recorded = append(recorded, a)
+	}
+	return out, recorded, nil
+}
+
+// recordedActions is every action the store has been asked to record.
+func (f *fakeStore) recordedActions() []actions.Action {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]actions.Action(nil), f.actions...)
 }
 
 func (f *fakeStore) stored(convID uuid.UUID) []Message {

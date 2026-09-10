@@ -135,3 +135,15 @@ func contains(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// The text filter is trimmed and bounded: it is a substring to look for, and
+// it scans every one of the owner's rows.
+func TestFilterQueryIsTrimmedAndBounded(t *testing.T) {
+	f, err := ValidateFilter(Filter{Query: "  antenna  "})
+	if err != nil || f.Query != "antenna" {
+		t.Fatalf("ValidateFilter = %+v, %v", f, err)
+	}
+	if _, err := ValidateFilter(Filter{Query: strings.Repeat("a", validate.MaxQueryLen+1)}); err == nil {
+		t.Fatal("an oversized q was accepted")
+	}
+}

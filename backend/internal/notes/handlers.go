@@ -92,7 +92,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	filter := Filter{Tag: q.Get("tag"), Sort: q.Get("sort")}
+	filter := Filter{Tag: q.Get("tag"), Query: q.Get("q"), Sort: q.Get("sort")}
 	var err error
 	if filter.Limit, err = intParam(q.Get("limit")); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "validation_failed", "limit must be a whole number.")

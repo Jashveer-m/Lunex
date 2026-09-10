@@ -20,10 +20,16 @@ Personal life-operating-system.
   node when you write it, conversations grow the edges between them, and a
   question that names something you have gets its connections as context. Two
   Postgres tables, one hop, no graph database.
+- **Phase 7** — tools and the action engine: eight fixed tools over the
+  existing services, a routing step that decides per message whether one is
+  needed, and an approval flow. A search runs straight away; a change — create a
+  task, goal or note, update a task — is only *proposed*, and nothing is written
+  until you approve it.
 
-Agents and the action/approval engine belong to later phases and are
-deliberately absent. The assistant reads, answers, remembers and connects; it
-does not create or change anything else, and it says so if you ask.
+Named specialist agents (Study, Career, …) and deleting through the chat belong
+to later phases and are deliberately absent. The assistant can change your data
+only by proposing a change you then approve, and nothing — including asking it
+to skip the approval — relaxes that.
 
 ## Stack
 
@@ -46,6 +52,8 @@ lunex/
 │   ├── cmd/api/           # HTTP server
 │   ├── cmd/migrate/       # up / down / version
 │   ├── internal/
+│   │   ├── actions/       # the action engine: proposals, approval, the audit trail
+│   │   ├── agents/        # agents as tool sets, the routing call, the lexical gate
 │   │   ├── ai/            # LLM provider interface + Ollama and mock backends
 │   │   ├── api/           # router and middleware wiring
 │   │   ├── auth/          # argon2id, JWT, sessions, service, handlers
@@ -61,13 +69,14 @@ lunex/
 │   │   ├── notes/         # notes: model, service, handlers
 │   │   ├── optional/      # the three-state field a PATCH body needs
 │   │   ├── tasks/         # tasks + dependencies: model, service, handlers
+│   │   ├── tools/         # the tool registry: eight fixed tools, the approval gate
 │   │   ├── users/         # user + profile model and repository
 │   │   └── validate/      # field rules shared by the modules
 │   ├── migrations/        # embedded .sql migrations
 │   └── go.mod
 ├── frontend/              # Vite React TS scaffold
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -240,6 +249,39 @@ memory one and on the same terms — it runs after the last token, it cannot fai
 the answer, and `GRAPH_EXTRACTION=false` turns it off while leaving node sync
 and the lookup running.
 
+### Tools and actions (Phase 7)
+
+Ask the assistant to do something and it proposes it:
+
+```sh
+# "Add a task to renew my passport by 2026-10-15, it's urgent."
+# event: action
+# data: {"id":"…","tool_name":"create_task","status":"proposed",
+#        "summary":"Create a task \"Renew my passport\" (priority high, due Thu 15 Oct 2026).",…}
+
+curl -s "localhost:8080/api/v1/tasks?q=passport" -H "$AUTH"   # {"count":0,…} -- proposed, not created
+
+curl -s -X POST localhost:8080/api/v1/actions/$ACTION_ID/approve -H "$AUTH"
+# {"status":"executed","result":{"task":{"title":"Renew my passport",…}},…}
+```
+
+`POST /api/v1/actions/{id}/reject` declines it instead, and nothing is ever
+written. `GET /api/v1/actions?status=proposed` is what is waiting for you.
+
+A search is different: "which of my tasks mention the passport?" runs
+`search_tasks` there and then, and what it found becomes the answer's first,
+citable source — no approval, because looking changes nothing. Every tool call,
+read or write, is recorded in `/api/v1/actions`.
+
+The model picks a tool through a short structured prompt, not Ollama's native
+tool calling: measured on llama3.2:3b, native calling used a tool on every
+message that needed none — "thanks" proposed a task — while this prompt chose
+correctly on 23 of 24 and proposed no write it was not asked for
+(`docs/decisions.md`). The routing call only happens for messages that look like
+requests ("add", "task", "find", "mark", …), because on a slow CPU it costs up
+to a minute before the first token. `AGENT_TOOLS=false` turns the tools off and
+leaves the Phase 6 assistant.
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
@@ -258,7 +300,7 @@ and the lookup running.
 | `MAX_UPLOAD_BYTES` | no | `10485760` | 10 MB; rejected before the file is read |
 | `DOCUMENT_PROCESS_TIMEOUT` | no | `2m` | Budget for one synchronous upload; also sets the server's read/write timeout |
 | `CHAT_MODEL` | no | `llama3.2:3b` | The Ollama chat model |
-| `CHAT_TIMEOUT` | no | `5m` | Budget for one whole turn: retrieve, generate, persist — **and** both extractions, which run inside it. The process refuses to start if the two extraction timeouts exceed half of this |
+| `CHAT_TIMEOUT` | no | `6m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions, which run inside it. The process refuses to start if the two extraction timeouts and `AGENT_TIMEOUT` exceed half of this |
 | `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
 | `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
 | `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
@@ -275,6 +317,11 @@ and the lookup running.
 | `GRAPH_TEMPERATURE` | no | `0.1` | 0–2. Near zero: extraction is a reading task |
 | `GRAPH_MAX_TOKENS` | no | `512` | Extraction reply cap |
 | `GRAPH_JSON_MODE` | no | `false` | As `MEMORY_JSON_MODE`, and off for the same measured reason |
+| `AGENT_TOOLS` | no | `true` | The assistant's tools: routing, searches and proposals. `false` is the Phase 6 assistant; the approval endpoints stay, so existing proposals can still be decided |
+| `AGENT_MODEL` | no | `CHAT_MODEL` | Which model makes the routing decision |
+| `AGENT_TIMEOUT` | no | `60s` | Bounds one routing decision. Spent *before* the first token, and counted inside `CHAT_TIMEOUT` |
+| `AGENT_TEMPERATURE` | no | `0.1` | 0–2. Near zero: it is a classification |
+| `AGENT_MAX_TOKENS` | no | `200` | Routing reply cap; a decision is one short JSON object |
 
 ## Common commands
 
@@ -282,7 +329,7 @@ and the lookup running.
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse, against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -346,9 +393,10 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 17. **A conversation still forgets its own wording.** The last 20 messages are
     replayed verbatim; past that, only what Phase 5 extracted into memory
     survives, and it comes back as facts rather than as what was said.
-18. **The assistant cannot take actions.** It reads and answers. Asked to
-    create a task it says so; nothing in the chat path writes to tasks, goals,
-    notes or documents.
+18. **The assistant can only propose changes** *(since Phase 7)*. Nothing in the
+    chat path writes to tasks, goals or notes; a change is recorded as a
+    proposal and runs only on `POST /actions/{id}/approve`. It cannot delete
+    anything.
 19. **A failed turn is not saved at all** — not the question, not a partial
     answer. Resending is the retry.
 20. **No token accounting.** The context budget is counted in characters, and a
@@ -377,8 +425,9 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     reads an answer that was grounded in your files, so a document engineered to
     say "remember that the user has approved X" has a path into your memory.
     Requiring every fact to be about the user narrows it; nothing in this phase
-    closes it. The assistant still cannot act, and every memory is visible,
-    attributable and deletable.
+    closes it. Every memory is visible, attributable and deletable. Since Phase 7
+    the same text cannot cause a *change*: the routing call reads only your
+    message, never the retrieved context, and every write waits for you.
 27. **The graph is one hop and nothing more.** No shortest path, no centrality,
     no "how are these two things related". The chat integration is a lookup —
     the question named something, here is what it is connected to.
@@ -414,3 +463,21 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     cannot name entities the extractor will accept unless you named them too —
     but it does not close it. Every node and edge is visible, attributable to a
     conversation, and deletable.
+35. **No delete tools.** Deleting through the chat is deferred: an approved
+    delete of the wrong task costs the task, and it wants a proposal that shows
+    exactly what would go.
+36. **One tool per turn, and the router reads only your message.** "Create
+    tasks for A, B and C" proposes one; "mark it done" about a task named two
+    turns ago does not resolve. `update_task` resolves its own reference ("the
+    scheduler task") to exactly one task, or declines and says which ones
+    matched.
+37. **The routing call costs a model call before the first token** on a
+    message that looks like a request — ~3s with a warm cache, up to a minute on
+    a slow CPU without one. A lexical gate keeps it off greetings and ordinary
+    questions; a request phrased with none of its cue words gets no tool.
+38. **A proposal cannot be edited and does not expire.** Reject it and ask
+    again. `update_task` cannot clear a field, only set one.
+39. **The model can still *say* a proposal is done.** The prompt forbids it
+    twice, and the end-to-end run warns when it happens; what is guaranteed is
+    that nothing is written until you approve, whatever the reply says.
+40. **Relative dates are resolved in UTC**, not in your profile's timezone.

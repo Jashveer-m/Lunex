@@ -44,10 +44,10 @@ func TestConversationRoundTrip(t *testing.T) {
 		ChunkIndex: &idx, Similarity: &sim, Excerpt: "The aurora borealis…", Cited: true,
 	}}
 
-	written, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
+	written, _, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
 		{Role: chat.RoleUser, Content: "what happened over the tundra?"},
 		{Role: chat.RoleAssistant, Content: "The aurora appeared [S1].", Sources: sources},
-	}, "what happened over the tundra?")
+	}, "what happened over the tundra?", nil)
 	if err != nil {
 		t.Fatalf("AppendTurn: %v", err)
 	}
@@ -114,8 +114,8 @@ func TestAppendTurnLeavesANamedConversationAlone(t *testing.T) {
 	alice := makeUser(t, pool, "alice@example.com")
 
 	conv := seedConversation(t, repo, alice, "Thesis planning")
-	if _, err := repo.AppendTurn(ctx, alice, conv.ID,
-		[]chat.NewMessage{{Role: chat.RoleUser, Content: "where do I start?"}}, "where do I start?"); err != nil {
+	if _, _, err := repo.AppendTurn(ctx, alice, conv.ID,
+		[]chat.NewMessage{{Role: chat.RoleUser, Content: "where do I start?"}}, "where do I start?", nil); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := repo.ConversationByID(ctx, alice, conv.ID)
@@ -135,10 +135,10 @@ func TestMessagesAreScopedThroughTheirConversation(t *testing.T) {
 	bob := makeUser(t, pool, "bob@example.com")
 
 	conv := seedConversation(t, repo, alice, chat.DefaultTitle)
-	if _, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
+	if _, _, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
 		{Role: chat.RoleUser, Content: "the launch code is quetzal seventeen"},
 		{Role: chat.RoleAssistant, Content: "noted"},
-	}, "the launch code"); err != nil {
+	}, "the launch code", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -154,8 +154,8 @@ func TestMessagesAreScopedThroughTheirConversation(t *testing.T) {
 	if len(msgs) != 0 {
 		t.Fatalf("Bob read %d of Alice's messages", len(msgs))
 	}
-	if _, err := repo.AppendTurn(ctx, bob, conv.ID,
-		[]chat.NewMessage{{Role: chat.RoleUser, Content: "hijacked"}}, ""); !errors.Is(err, chat.ErrNotFound) {
+	if _, _, err := repo.AppendTurn(ctx, bob, conv.ID,
+		[]chat.NewMessage{{Role: chat.RoleUser, Content: "hijacked"}}, "", nil); !errors.Is(err, chat.ErrNotFound) {
 		t.Fatalf("AppendTurn as the wrong user = %v, want ErrNotFound", err)
 	}
 	if err := repo.DeleteConversation(ctx, bob, conv.ID); !errors.Is(err, chat.ErrNotFound) {
@@ -195,10 +195,10 @@ func TestMessagesReturnsTheMostRecentWindowInOrder(t *testing.T) {
 	conv := seedConversation(t, repo, alice, chat.DefaultTitle)
 
 	for i := 0; i < 10; i++ {
-		if _, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
+		if _, _, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
 			{Role: chat.RoleUser, Content: "q" + string(rune('0'+i))},
 			{Role: chat.RoleAssistant, Content: "a" + string(rune('0'+i))},
-		}, ""); err != nil {
+		}, "", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -251,10 +251,10 @@ func TestAppendTurnIsAtomic(t *testing.T) {
 	alice := makeUser(t, pool, "alice@example.com")
 	conv := seedConversation(t, repo, alice, chat.DefaultTitle)
 
-	_, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
+	_, _, err := repo.AppendTurn(ctx, alice, conv.ID, []chat.NewMessage{
 		{Role: chat.RoleUser, Content: "a question"},
 		{Role: "narrator", Content: "an invalid role"},
-	}, "a question")
+	}, "a question", nil)
 	if err == nil {
 		t.Fatal("want the invalid role to fail the turn")
 	}
@@ -282,9 +282,9 @@ func TestChatCascades(t *testing.T) {
 	first := seedConversation(t, repo, alice, chat.DefaultTitle)
 	second := seedConversation(t, repo, alice, chat.DefaultTitle)
 	for _, c := range []uuid.UUID{first.ID, second.ID} {
-		if _, err := repo.AppendTurn(ctx, alice, c, []chat.NewMessage{
+		if _, _, err := repo.AppendTurn(ctx, alice, c, []chat.NewMessage{
 			{Role: chat.RoleUser, Content: "q"}, {Role: chat.RoleAssistant, Content: "a"},
-		}, "q"); err != nil {
+		}, "q", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -329,8 +329,8 @@ func TestConversationListIsMostRecentlyActiveFirst(t *testing.T) {
 	older := seedConversation(t, repo, alice, "older")
 	newer := seedConversation(t, repo, alice, "newer")
 	// A turn on the older conversation makes it the most recently active.
-	if _, err := repo.AppendTurn(ctx, alice, older.ID,
-		[]chat.NewMessage{{Role: chat.RoleUser, Content: "q"}}, ""); err != nil {
+	if _, _, err := repo.AppendTurn(ctx, alice, older.ID,
+		[]chat.NewMessage{{Role: chat.RoleUser, Content: "q"}}, "", nil); err != nil {
 		t.Fatal(err)
 	}
 

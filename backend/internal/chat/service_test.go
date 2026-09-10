@@ -344,7 +344,8 @@ type failingSink struct {
 	n     int
 }
 
-func (s *failingSink) Sources([]Source) error { return nil }
+func (s *failingSink) Sources([]Source) error     { return nil }
+func (s *failingSink) Actions([]TurnAction) error { return nil }
 func (s *failingSink) Token(string) error {
 	s.n++
 	if s.n > s.after {

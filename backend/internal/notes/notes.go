@@ -49,7 +49,10 @@ func (p Patch) Empty() bool { return p.Title == nil && p.Content == nil && p.Tag
 
 // Filter is the query behind GET /notes.
 type Filter struct {
-	Tag    string
+	Tag string
+	// Query keeps the notes whose title or content contains it,
+	// case-insensitively and literally; see tasks.Filter.Query.
+	Query  string
 	Sort   string
 	Limit  int
 	Offset int

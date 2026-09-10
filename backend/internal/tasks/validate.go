@@ -172,6 +172,10 @@ func ValidateFilter(f Filter) (Filter, error) {
 	if e := validate.MaxLen("tag", f.Tag, validate.MaxTagLen); e != nil {
 		errs = append(errs, *e)
 	}
+	f.Query = strings.TrimSpace(f.Query)
+	if e := validate.MaxLen("q", f.Query, validate.MaxQueryLen); e != nil {
+		errs = append(errs, *e)
+	}
 	switch {
 	case f.Limit < 0:
 		errs = append(errs, validate.Error{Field: "limit", Message: "must not be negative"})

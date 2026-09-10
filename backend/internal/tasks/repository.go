@@ -91,6 +91,12 @@ func (r *Repository) List(ctx context.Context, userID uuid.UUID, f Filter) ([]Ta
 		// Containment rather than `= ANY(tags)`: only the former uses the GIN index.
 		add("tags @> ARRAY[$%d]::text[]", f.Tag)
 	}
+	if f.Query != "" {
+		// A leading wildcard cannot use an index, so this scans the owner's
+		// rows -- which the user_id index has already narrowed to one person's
+		// tasks. See db.Contains for the escaping.
+		add(`(title ILIKE $%[1]d ESCAPE '\' OR description ILIKE $%[1]d ESCAPE '\')`, db.Contains(f.Query))
+	}
 
 	query := `SELECT ` + taskColumns + ` FROM tasks WHERE ` + strings.Join(where, " AND ") +
 		` ORDER BY ` + Sorts[f.Sort] + `, id ASC` +

@@ -111,9 +111,15 @@ type Filter struct {
 	Status   string
 	Category string
 	Tag      string
-	Sort     string
-	Limit    int
-	Offset   int
+	// Query keeps the tasks whose title or description contains it,
+	// case-insensitively and literally -- `%` and `_` are characters, not
+	// wildcards. It is what the assistant's search_tasks tool searches with,
+	// and GET /tasks exposes it as `q` so the assistant sees exactly what the
+	// API would return.
+	Query  string
+	Sort   string
+	Limit  int
+	Offset int
 }
 
 // Sorts maps the public `sort` values onto SQL. Keeping it a fixed map is what

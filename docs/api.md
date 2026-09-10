@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–6)
+# Lunex API — v1 (Phases 1–7)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -31,6 +31,8 @@ Validation failures add a `fields` array:
 | `not_found` | 404 | No such resource, **or** it belongs to another user |
 | `email_taken` | 409 | An account with that email exists |
 | `dependency_cycle` | 409 | The task dependency would create a loop |
+| `node_is_backed` | 409 | The graph node mirrors a record; delete the record instead |
+| `action_not_pending` | 409 | The action is no longer awaiting approval (already approved, rejected, executed or failed — or a read) |
 | `payload_too_large` | 413 | Body exceeds 64 KiB — or, on an upload, the file exceeds the size limit |
 | `unsupported_media_type` | 415 | `Content-Type` is not `application/json`; or the uploaded file is not a PDF, TXT or Markdown |
 | `invalid_multipart` | 400 | Upload body is not `multipart/form-data` with a `file` part |
@@ -197,6 +199,7 @@ Query parameters, all optional:
 | `status` | `pending`, `in_progress`, `completed` |
 | `category` | exact match |
 | `tag` | matches a task carrying that tag |
+| `q` | text the title or description contains — case-insensitive, taken literally (`%` and `_` are characters); at most 200 characters |
 | `sort` | `created_at`, `updated_at`, `deadline`, `title`, `priority`, each also with a `-` prefix (default `-created_at`) |
 | `limit`, `offset` | paging (default 50, max 200) |
 
@@ -304,6 +307,7 @@ Errors:
 | --- | --- |
 | `status` | `active`, `completed`, `abandoned` |
 | `type` | `short_term`, `long_term`, `career`, `education`, `financial`, `personal`, `project` |
+| `q` | text the title or description contains; as for tasks |
 | `sort` | `created_at`, `updated_at`, `deadline`, `title`, each also with `-` (default `-created_at`) |
 | `limit`, `offset` | paging (default 50, max 200) |
 
@@ -384,6 +388,7 @@ not on that goal, or the goal is not yours.
 | Parameter | Values |
 | --- | --- |
 | `tag` | matches a note carrying that tag |
+| `q` | text the title or content contains; as for tasks |
 | `sort` | `created_at`, `updated_at`, `title`, each also with `-` (default `-created_at`) |
 | `limit`, `offset` | paging (default 50, max 200) |
 
@@ -643,7 +648,7 @@ A **source** is one thing that was retrieved for that answer.
 
 | Field | Meaning |
 | --- | --- |
-| `type` | `document`, `memory`, `task`, `goal` or `note` |
+| `type` | `document`, `memory`, `graph`, `task`, `goal` or `note` — what kind of record it is |
 | `id` | the id of that record, so a client can link to it |
 | `label` | the marker the prompt showed the model (`S1`, `S2`, …) |
 | `title` | filename, the task/goal/note title, or — for a memory, which has none — its type |
@@ -651,6 +656,7 @@ A **source** is one thing that was retrieved for that answer.
 | `similarity` | documents and memories: the cosine score retrieval used. Absent on tasks, goals and notes, which are selected by heuristic and have no score |
 | `excerpt` | the text the model was actually shown; for a memory, the fact itself |
 | `cited` | whether the answer referenced this label |
+| `tool` | present only when a tool the assistant chose found it — `search_tasks`, `search_documents`, … — rather than the retrieval every turn runs |
 
 `cited` is measured by reading the generated answer for its labels, not
 assumed. Retrieval usually offers five things and an answer uses one; `sources`
@@ -692,8 +698,11 @@ data: {"text":"According"}
 event: token
 data: {"text":" to [S1],"}
 
+event: action
+data: {"id":"…","tool_name":"create_task","permission_level":"write","status":"proposed","summary":"Create a task \"Renew my passport\" (priority high, due Thu 15 Oct 2026).",…}
+
 event: done
-data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b","remembered":[],"linked":[]}
+data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b","remembered":[],"linked":[],"actions":[{…}]}
 ```
 
 `done` is the last frame and it arrives late on a substantial turn: the answer
@@ -707,7 +716,8 @@ and `MEMORY_EXTRACTION=false` / `GRAPH_EXTRACTION=false` remove each half of it.
 | --- | --- | --- |
 | `sources` | `{sources, count}` | Once, after the model accepts the request and before the first token. `cited` is always `false` here — nothing has been generated yet. |
 | `token` | `{text}` | Per fragment, in order. Concatenating every `text` gives exactly the stored message content. |
-| `done` | `{conversation_id, user_message, message, model, remembered, linked}` | Once, after the turn is persisted **and** both extractors have run. `message.sources` is the same list with `cited` filled in; `remembered` is what the exchange added to memory and `linked` what it added to the knowledge graph, both `[]` on most turns. |
+| `action` | an action, exactly as `GET /api/v1/actions/{id}` returns it | Once per action the turn produced — a search it ran, or a change it proposed — **after the last token and before `done`**: the turn is committed by then, so the action exists and can be approved at once, without waiting for the extractors. Absent on most turns. |
+| `done` | `{conversation_id, user_message, message, model, remembered, linked, actions}` | Once, after the turn is persisted **and** both extractors have run. `message.sources` is the same list with `cited` filled in; `remembered` is what the exchange added to memory, `linked` what it added to the knowledge graph, and `actions` repeats the `action` frames; all three are `[]` on most turns. |
 | `error` | `{error, message}` | Instead of `done`, if generation failed after the stream started. |
 
 Token text is JSON-encoded rather than written raw because a model emits
@@ -722,12 +732,12 @@ and the model has accepted the request:
 | No such conversation, or it is somebody else's | `404 not_found` |
 | Empty or oversized `content` | `400 validation_failed` |
 | Unknown JSON field | `400 invalid_json` |
-| Model or embedding service unreachable | `503 model_unavailable` |
+| Model or embedding service unreachable — including the routing call, when it fails or runs past `AGENT_TIMEOUT` | `503 model_unavailable` |
 | Generation failed after the stream started | `200` with `event: error` |
 
 A turn that did not finish is **not persisted at all** — not the question, not a
-partial answer. Sending the message again is the retry. The `error` event says
-so.
+partial answer, and not a change it proposed. Sending the message again is the
+retry. The `error` event says so.
 
 ### What the assistant will not do
 
@@ -741,10 +751,17 @@ what it is doing. Retrieval applies a similarity floor (`CHAT_MIN_SIMILARITY`,
 default `0.5`), so an unrelated question is not handed a distant chunk to
 resist in the first place.
 
-**It cannot take actions.** There is no approval engine in this phase, so the
-assistant only reads. Asked to create a task or complete a goal, it says that
-taking actions is not supported yet and describes what you would do yourself.
-No chat endpoint writes to `tasks`, `goals`, `notes` or `documents`.
+**It never changes your data by itself.** Asked to create a task, goal or note,
+or to change a task, it *proposes* the change: the proposal is recorded as an
+action, announced in an `action` frame and in `done`, and nothing is written
+until you approve it with `POST /api/v1/actions/{id}/approve`. That holds even if
+you tell it not to ask — "just do it" gets a proposal like anything else — and
+typing "yes, I approve" into the chat approves nothing. It cannot delete
+anything at all. See **Actions** below.
+
+With the tools switched off (`AGENT_TOOLS=false`) it is the Phase 6 assistant:
+it says taking actions is not supported and describes what you would do
+yourself.
 
 ### What grounds an answer
 
@@ -752,6 +769,7 @@ No chat endpoint writes to `tasks`, `goals`, `notes` or `documents`.
 | --- | --- |
 | Document chunks | Phase 3's vector search over the caller's chunks: top 5 above `CHAT_MIN_SIMILARITY` |
 | Memories | Phase 5's vector search over the caller's enabled memories: top 5 above `MEMORY_MIN_SIMILARITY` |
+| A tool the assistant chose | Phase 7: at most one search per turn — `search_tasks`, `search_goals`, `search_notes` or `search_documents` — with a query the model picked, up to 5 results. These come **first**, marked with `tool` |
 | Knowledge graph | Phase 6's 1-hop lookup: up to 3 nodes whose label the question names as a whole word, each with what it is connected to |
 | Tasks | Up to 5: in progress by recency, then pending by nearest deadline |
 | Goals | Up to 5 active goals by nearest deadline |
@@ -1135,6 +1153,127 @@ so an edge of either type could never have a real node on its far side.
 
 ---
 
+## Actions
+
+What the assistant did, or wants to do, with a tool. Every endpoint is scoped to
+the caller: an action belonging to somebody else answers `404`, exactly like one
+that does not exist.
+
+There are eight tools. Each is a fixed Go function over the same service the
+HTTP API uses — validation, ownership and graph sync included — with a JSON
+Schema for its input and output. No tool runs code or SQL the model wrote, and
+none can delete.
+
+| Tool | Permission | Does |
+| --- | --- | --- |
+| `search_tasks` | read | tasks whose title or description contains a phrase, optionally with one status |
+| `search_goals` | read | goals whose title or description contains a phrase, optionally with one status |
+| `search_notes` | read | notes whose title or content contains a phrase, optionally with one tag |
+| `search_documents` | read | Phase 3's vector search with a query the model chose, above the chat floor |
+| `create_task` | write | title, and optionally deadline, priority, description, category, tags |
+| `update_task` | write | changes the status, priority, title, deadline or description of one existing task |
+| `create_goal` | write | title, type (`personal` if not stated — shown in the proposal), deadline, description |
+| `create_note` | write | title (the first line of the text if none was given), content, tags |
+
+**A read runs during the turn.** When a message looks like it asks to find
+something, the model may choose a search; it runs immediately, what it found
+becomes the turn's first sources, and it is recorded as an action born
+`executed`. Nothing to approve.
+
+**A write is proposed, and runs only when you approve it.** The model's call is
+validated — with the same rules `POST /tasks` applies, so a proposal never fails
+on approval for a reason it could have known — and made canonical: a relative
+date like "friday" resolved to a date, "urgent" mapped to `high`, "the scheduler
+task" resolved to exactly one of your tasks (or declined, with the candidates,
+if it matches several). That canonical input is stored, shown to you, and is
+exactly what runs.
+
+```
+read:   (runs during the turn) ─▶ executed | failed
+write:  proposed ─▶ approved ─▶ executed | failed
+                 └─▶ rejected
+```
+
+`approved` is momentary: it means the tool is running, and it becomes
+`executed` or `failed` in the same request. An action is approved at most once —
+of any number of simultaneous approvals, one runs and the rest get `409`.
+
+An action:
+
+```json
+{
+  "id": "6b0e1f7a-2c4d-4e8f-9a1b-3c5d7e9f1a2b",
+  "conversation_id": "150b47f9-3572-4e85-8f23-ea77d698d2c5",
+  "tool_name": "create_task",
+  "permission_level": "write",
+  "status": "proposed",
+  "input": { "title": "Renew my passport", "priority": "high", "deadline": "2026-10-15T00:00:00Z" },
+  "summary": "Create a task \"Renew my passport\" (priority high, due Thu 15 Oct 2026).",
+  "result": null,
+  "error_message": null,
+  "created_at": "2026-09-10T12:44:08.120Z",
+  "updated_at": "2026-09-10T12:44:08.120Z"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `input` | the canonical input — what runs on approval |
+| `summary` | one sentence saying what the action does, derived from `input` every time it is read (never stored, so it cannot disagree) |
+| `result` | the tool's output once `executed` — for a write, the record it created or changed (`{"task": {…}}`); for a search, what it found. `null` otherwise |
+| `error_message` | why it `failed`, as a sentence; never the underlying error. `null` otherwise |
+| `conversation_id` | the conversation it came from; `null` once that conversation is deleted — the record outlives it, and a proposal in it can still be decided |
+
+### `GET /api/v1/actions`
+
+| Parameter | Values |
+| --- | --- |
+| `status` | `proposed`, `approved`, `rejected`, `executed`, `failed` |
+| `permission_level` | `read`, `write` |
+| `conversation_id` | a conversation's id |
+| `limit`, `offset` | paging (default 50, max 200) |
+
+Newest first. `?status=proposed` is what is waiting for you.
+
+```json
+{ "actions": [ … ], "count": 1, "limit": 50, "offset": 0 }
+```
+
+### `GET /api/v1/actions/{id}`
+
+One action.
+
+### `POST /api/v1/actions/{id}/approve`
+
+Runs the proposed write. No body, or `{}`; any field — including an attempt to
+change the input on the way through — is `400 invalid_json`, and the action is
+left as it was. What runs is what was proposed.
+
+`200 OK` with the action in its final state: `executed` with a `result`, or
+`failed` with an `error_message`. Both are answers to the request — the approval
+was accepted and recorded — so read `status`.
+
+| Situation | Response |
+| --- | --- |
+| Proposed, and the tool succeeded | `200`, `"status": "executed"` |
+| Proposed, and the tool failed (the task was deleted meanwhile, say) | `200`, `"status": "failed"` |
+| Already approved, rejected, executed or failed — or a read | `409 action_not_pending`, naming its state |
+| Somebody else's, or no such action | `404 not_found` |
+
+### `POST /api/v1/actions/{id}/reject`
+
+Declines the proposal; nothing runs, then or later. Same body rule and the same
+`409` and `404` as approve. `200 OK` with `"status": "rejected"`.
+
+### What this is not
+
+There is no `POST /actions`: proposals come from the assistant, and a client that
+wants a task already has `POST /tasks`. There are no delete tools, no named
+specialist agents, and at most one tool call per turn. A proposal cannot be
+edited and does not expire. See `docs/decisions.md`.
+
+---
+
 ## Field limits
 
 | Field | Limit |
@@ -1149,6 +1288,7 @@ so an edge of either type could never have a real node on its far side.
 | uploaded file | 10 MB (`MAX_UPLOAD_BYTES`) |
 | filename | 255 characters |
 | search `query` | 4,000 characters |
+| list `q` (tasks, goals, notes) | 200 characters |
 | chat message `content` | 8,000 characters |
 | memory `content` | 1,000 characters |
 | graph node `label` | 200 characters; an extracted name is also capped at 8 words |

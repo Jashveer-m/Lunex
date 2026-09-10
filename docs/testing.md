@@ -29,7 +29,15 @@
 | Phase 3 SQL: pgvector round trip, cosine ordering, cascades | `internal/db/phase3_integration_test.go` | **yes** |
 | Phase 4 SQL: jsonb sources, turn atomicity, message ordering, cascades | `internal/db/phase4_integration_test.go` | **yes** |
 | Phase 5 SQL: memory vectors, the enabled/expired/unembedded filters, constraints, cascades | `internal/db/phase5_integration_test.go` | **yes** |
+| Tool registry: the approval gate, canonical inputs, reference resolution, dates (fakes) | `internal/tools/*_test.go` | no |
+| Routing: the gate, the prompt, the parser, the router's failure modes (MockProvider) | `internal/agents/agents_test.go` | no |
+| Routing quality against a real model (opt-in: `LUNEX_ROUTING_EVAL=1`) | `internal/agents/ollama_eval_test.go` | no, but Ollama |
+| Action engine: approve/reject, single use, sanitized failures, strict bodies (in-memory store) | `internal/actions/*_test.go` | no |
+| Orchestrator: proposals, reads as sources, the ACTIONS section, rule 8 (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
+| Phase 6 SQL: graph constraints, upserts, 1-hop queries, the delete trigger | `internal/db/phase6_integration_test.go` | **yes** |
+| Phase 7 SQL: the approval gate, constraints, turn atomicity, cascades, the `q` filter | `internal/db/phase7_integration_test.go` | **yes** |
 | Cross-user isolation over the whole stack, documents included | `internal/api/isolation_test.go` | **yes** |
+| Phase 7 over HTTP: propose → approve/reject, concurrency, isolation | `internal/api/actions_isolation_test.go` | **yes** |
 | The whole pipeline and the assistant against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
 
 ## Running
@@ -68,7 +76,12 @@ where pgvector is not installed:
 brew install pgvector        # or: apt install postgresql-16-pgvector
 ```
 
-None of the Go tests need Ollama. The document tests use a deterministic
+None of the Go tests need Ollama, except one that asks for it by name:
+`LUNEX_ROUTING_EVAL=1 go test ./internal/agents -run Ollama -v -timeout 30m`
+runs the production routing gate, prompt and parser against a real model over
+24 messages and fails on a write proposed for a message that asked for none, or
+on accuracy under 85%. It is the reproducible form of the measurement in
+`docs/decisions.md`. The document tests use a deterministic
 bag-of-words embedder (`internal/api/embedder_test.go`) and the chat and memory
 tests use `ai.Mock`, so that what they measure is the routing, the SQL scoping
 and the pipeline's own logic — not whether a model understood a sentence.
@@ -192,9 +205,44 @@ ollama pull llama3.2:3b              # once
 make test-e2e
 ```
 
+Since Phase 7 it ends with the action check, which is the brief's:
+
+- **asking the assistant to create a task** — "Add a task to renew my passport
+  by 2026-10-15, it's urgent." The stream must carry exactly one `action` frame,
+  after the last token and before `done`, for a `create_task` proposal whose
+  title is about the passport; `done` must repeat it;
+- **proposed, not created** — `GET /tasks?q=passport` must be empty and
+  `GET /actions?status=proposed` must list the proposal;
+- **approving it** — `executed`, and now exactly one passport task exists, due
+  2026-10-15, the same task the action's `result` names. A second approval is
+  `409` and creates nothing;
+- **another, rejected** — a dentist task is proposed and rejected; no dentist
+  task exists, and approving it afterwards is `409` and still creates nothing;
+- **a read** — "Which of my tasks mention the passport?" must run `search_tasks`
+  without any approval, surface the task as a `tool` source, and be recorded as
+  an executed read;
+- **the log** — the conversation's actions are one executed create, one
+  rejected create and one executed read, and nothing is pending.
+
+The script also **warns** (without failing) when an answer describes a proposal
+as done. What a 3B model writes is wording; that nothing was created is asserted
+against the database.
+
+`E2E_ONLY=actions ./scripts/e2e.sh` runs only the preflight, registration and
+this check.
+
+The script builds the API and runs the binary directly, and refuses to start if
+anything already answers on its port (`E2E_PORT`, default 8099). Before Phase 7
+it started the server with `go run` and killed the `go run` process on exit,
+which left the compiled server itself listening; the next run's server then
+failed to bind, silently, and every assertion was made against the previous
+run's build. It was found because an answer quoted wording the code no longer
+contained.
+
 A run against a cold model takes several minutes: the first turn includes
 loading llama3.2:3b into memory, and since Phase 6 each substantial turn makes
-*three* model calls rather than one — the answer, the memory extraction and the
+*three* model calls rather than one (four since Phase 7, when the message looks
+like it asks for a tool) — the answer, the memory extraction and the
 relationship extraction, in that order and in sequence, because they all queue
 behind the same resident model.
 
@@ -213,13 +261,13 @@ output, just not inside the budget. Both timeouts and the turn budget are
 passed through to the API, so raise all three together:
 
 ```sh
-MEMORY_EXTRACT_TIMEOUT=240s GRAPH_EXTRACT_TIMEOUT=240s CHAT_TIMEOUT=16m \
+MEMORY_EXTRACT_TIMEOUT=240s GRAPH_EXTRACT_TIMEOUT=240s AGENT_TIMEOUT=240s CHAT_TIMEOUT=24m \
   ./scripts/e2e.sh
 ```
 
-`CHAT_TIMEOUT` has to cover the whole turn *including* both extractions, and
-`config.Load` refuses to start a process where the extractions would take more
-than half of it — so raising one without the others is a boot error rather than
+`CHAT_TIMEOUT` has to cover the whole turn *including* both extractions and the
+routing call, and `config.Load` refuses to start a process where they would take
+more than half of it — so raising one without the others is a boot error rather than
 a mystery.
 
 One other thing got slower rather than merely longer: the run holds a single
@@ -491,3 +539,71 @@ Phase 6:
 - deleting an edge leaves both its nodes; deleting an extracted node takes its
   edges; deleting a user takes both tables; and deleting the conversation an
   edge came from keeps the edge with a NULL provenance.
+
+Phase 7:
+
+- **a write tool never executes without an approved action row** — pinned at
+  four layers. In `internal/tools`, against a fake ledger: asking to run a write
+  as a read (even with a `Call` that claims to be one), and approving an action
+  that does not exist, is somebody else's, or is rejected, executed, failed or
+  already approved, each run nothing; the one proposed action runs once, from the
+  input the ledger holds rather than anything the caller passed, and never
+  twice. In `internal/actions`, the same through the service. In `internal/chat`,
+  a turn asked to create a task — even told "don't ask me, just do it", even
+  followed by "yes, I approve" — reaches the task service zero times, with a
+  registry that has no ledger at all. And in `internal/db`, against the real
+  table and the real task service, with the tasks table counted after every
+  attempt — including a row set to `approved` by hand, which is refused because
+  the gate is the transition out of `proposed`;
+- approval is single-use under real concurrency: sixteen simultaneous
+  `RunApproved` calls against Postgres produce one success, and ten simultaneous
+  HTTP approvals one `200`, nine `409`s and one task;
+- **cross-user isolation for actions**, end to end: user B gets `404` — not
+  `403`, and not the `409` a decided action earns — on reading, approving and
+  rejecting A's proposal; B's lists are empty whatever the filter, including
+  `?conversation_id=` A's conversation; A's proposal is verified still proposed
+  and no task exists for either, so a wrong status code cannot hide a write that
+  landed; and B asking to complete a task by the name of one of A's resolves
+  against B's tasks only and proposes nothing;
+- the end-to-end property over HTTP: a proposal is announced after the last
+  token and before `done`, creates nothing, is listed as proposed, and on
+  approval creates exactly the proposed task — through the ordinary service, so
+  its graph node exists too; a rejected one creates nothing, then or later;
+- a proposal is part of its turn: a turn whose generation fails, or whose write
+  fails, leaves no proposal behind, and a turn recording a write in any state but
+  `proposed` is refused before a row is written;
+- the state machine on insert (a write is born proposed; a read is born executed
+  with a result or failed with a reason) and every CHECK constraint behind it —
+  including that a read can never be proposed or approved;
+- approve and reject take no parameters: an edited input, a confirm flag, two
+  objects or the wrong content type are refused and the action is untouched;
+- a tool that fails on approval leaves the action `failed` with a sentence, never
+  the underlying error (a DSN in the error does not reach the response), and a
+  client that hangs up the moment it approves does not strand the row;
+- routing: a model naming a tool outside its agent, a tool that does not exist,
+  or `run_sql` gets no tool; the router's own deadline and a refused call are a
+  `503` before the stream starts, while a caller that hung up is not an outage;
+  the parser accepts the shapes models write (flattened arguments, a native-style
+  `name`/`parameters`, OpenAI's string arguments, a fence, a list of one) and
+  invents nothing from prose;
+- the gate passes every tool request of the routing measurement and none of its
+  conversational messages, and a message it skips costs no routing call;
+- canonical inputs: relative dates resolved against a fixed clock (a weekday is
+  the next one, "next friday" and "friday" agree, 31 September is refused rather
+  than rolled into October), priority and status synonyms mapped, placeholders
+  treated as absent, the service's own validation applied at proposal time, and
+  no key stored that the schema does not declare;
+- `update_task` resolves a reference to exactly one of the caller's tasks — by
+  exact title, phrase, then word — declines an ambiguous or unmatched one with
+  the reason, refuses another user's task id as "no such task", and declines a
+  change to what the task already has;
+- reads: results become the turn's first sources marked with `tool`,
+  deduplicated against the heuristic, cited when used, recorded as executed
+  reads; a read that fails fails the turn;
+- the model is told what became of earlier proposals — done, rejected, failed
+  with the reason — and never about another user's;
+- an identical pending proposal is reused rather than queued twice;
+- without the Phase 7 dependencies (or with only some of them) the assistant is
+  the Phase 6 assistant: the read-only rule, one model call, nothing recorded;
+- the `q` filter is case-insensitive, owner-scoped and literal — `50%` finds the
+  task containing it, `_` matches nothing it should not.

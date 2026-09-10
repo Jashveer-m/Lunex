@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
@@ -48,14 +49,14 @@ type Config struct {
 	// gets, and, like the document timeout, it also has to fit inside the
 	// server's write timeout or the stream would be cut at the socket.
 	//
-	// The default grew from 3m to 4m in Phase 6, and that is not a round
-	// number picked for comfort. Phase 5 left 2 minutes for retrieval and
-	// generation after subtracting a 60s extraction. Phase 6 adds a second
-	// 60s extraction to the same budget, so keeping the same headroom means
-	// adding the same minute -- and not adding it is a turn that answers,
-	// persists, and *then* has its context cancelled out from under the
-	// end-of-stream frame, reported to the user as a failed answer that was in
-	// fact already saved. MinGenerationBudget below is the boot-time check.
+	// The default has grown by one minute for each model call a phase added to
+	// the turn, and that is not a round number picked for comfort. Phase 6
+	// added a second 60s extraction to the same budget, and Phase 7 a 60s
+	// routing call in front of the answer; keeping the answer's headroom means
+	// adding the same minute each time -- and not adding it is a turn that
+	// answers, persists, and *then* has its context cancelled out from under
+	// the end-of-stream frame, reported to the user as a failed answer that was
+	// in fact already saved. MaxExtractionShare below is the boot-time check.
 	ChatTimeout     time.Duration
 	ChatTemperature float64
 	ChatMaxTokens   int
@@ -112,14 +113,35 @@ type Config struct {
 	// GraphJSONMode asks the provider to constrain extraction to well-formed
 	// JSON. Off by default, for the reason memories.Options.JSONMode records.
 	GraphJSONMode bool
+
+	// Phase 7: tools and the action engine.
+	//
+	// AgentTools switches the assistant's tools on and off as a whole: the
+	// routing call, the read tools and write proposals. Off is exactly the
+	// Phase 6 assistant, which says it cannot take actions. The approval
+	// endpoints stay mounted either way, so a proposal made before the switch
+	// was flipped can still be approved or rejected.
+	AgentTools bool
+	// AgentModel overrides the chat model for the routing call. Empty means
+	// the same model answers and routes.
+	AgentModel string
+	// AgentTimeout bounds one routing decision. Unlike the extractions it is
+	// spent *before* the first token -- it is the latency tools add to a turn
+	// that looks like it asks for one -- and it comes out of the same
+	// ChatTimeout budget.
+	AgentTimeout     time.Duration
+	AgentMaxTokens   int
+	AgentTemperature float64
 }
 
 // DefaultChatTimeout is the budget for one whole turn; see Config.ChatTimeout
-// for why it grew from three minutes to five.
-const DefaultChatTimeout = 5 * time.Minute
+// for why it grew from three minutes to six.
+const DefaultChatTimeout = 6 * time.Minute
 
-// MaxExtractionShare is how much of ChatTimeout the two extractions are allowed
-// to occupy between them. The rest is what retrieval and generation have.
+// MaxExtractionShare is how much of ChatTimeout the model calls that are not
+// the answer -- the two extractions after it and, since Phase 7, the routing
+// call before it -- are allowed to occupy between them. The rest is what
+// retrieval and generation have.
 //
 // The rule is proportional rather than an absolute floor because the absolute
 // number is not knowable here: it is a property of the model, and an operator
@@ -188,6 +210,11 @@ func Load() (Config, error) {
 		GraphModel:       os.Getenv("GRAPH_MODEL"),
 		GraphMaxTokens:   graph.DefaultExtractionMaxTokens,
 		GraphTemperature: graph.DefaultExtractionTemperature,
+
+		AgentTools:       true,
+		AgentModel:       os.Getenv("AGENT_MODEL"),
+		AgentMaxTokens:   agents.DefaultMaxTokens,
+		AgentTemperature: agents.DefaultTemperature,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -247,6 +274,22 @@ func Load() (Config, error) {
 	if cfg.GraphJSONMode, err = boolOr("GRAPH_JSON_MODE", cfg.GraphJSONMode); err != nil {
 		return Config{}, err
 	}
+	if cfg.AgentTools, err = boolOr("AGENT_TOOLS", cfg.AgentTools); err != nil {
+		return Config{}, err
+	}
+	if cfg.AgentTimeout, err = durationOr("AGENT_TIMEOUT", agents.DefaultTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.AgentTemperature, err = floatOr("AGENT_TEMPERATURE", cfg.AgentTemperature, 0, 2); err != nil {
+		return Config{}, err
+	}
+	if v := os.Getenv("AGENT_MAX_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("AGENT_MAX_TOKENS: want a positive integer, got %q", v)
+		}
+		cfg.AgentMaxTokens = n
+	}
 	if v := os.Getenv("GRAPH_MAX_TOKENS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
@@ -287,17 +330,21 @@ func Load() (Config, error) {
 		}
 		cfg.MaxUploadBytes = n
 	}
-	// The extractions run inside the turn's budget, so they cannot be allowed
-	// to eat all of it. Refusing to boot rather than degrading is the same
-	// choice JWT_SECRET makes: the degraded version of this is a turn that
-	// answers correctly and reports itself as failed.
-	if tail := cfg.MemoryExtractTimeout + cfg.GraphExtractTimeout; tail > time.Duration(float64(cfg.ChatTimeout)*MaxExtractionShare) {
+	// The extractions and the routing call run inside the turn's budget, so
+	// they cannot be allowed to eat all of it. Refusing to boot rather than
+	// degrading is the same choice JWT_SECRET makes: the degraded version of
+	// this is a turn that answers correctly and reports itself as failed.
+	routing := time.Duration(0)
+	if cfg.AgentTools {
+		routing = cfg.AgentTimeout
+	}
+	if tail := cfg.MemoryExtractTimeout + cfg.GraphExtractTimeout + routing; tail > time.Duration(float64(cfg.ChatTimeout)*MaxExtractionShare) {
 		return Config{}, fmt.Errorf(
 			"CHAT_TIMEOUT (%s) leaves only %s for retrieval and generation after "+
-				"MEMORY_EXTRACT_TIMEOUT (%s) and GRAPH_EXTRACT_TIMEOUT (%s), which run "+
-				"inside it; raise CHAT_TIMEOUT to at least %s, or lower the extraction timeouts",
+				"MEMORY_EXTRACT_TIMEOUT (%s), GRAPH_EXTRACT_TIMEOUT (%s) and AGENT_TIMEOUT (%s), "+
+				"which run inside it; raise CHAT_TIMEOUT to at least %s, or lower the others",
 			cfg.ChatTimeout, cfg.ChatTimeout-tail,
-			cfg.MemoryExtractTimeout, cfg.GraphExtractTimeout, 2*tail)
+			cfg.MemoryExtractTimeout, cfg.GraphExtractTimeout, routing, 2*tail)
 	}
 
 	if v := os.Getenv("LOGIN_RATE_LIMIT_BURST"); v != "" {

@@ -1,6 +1,8 @@
 package notes
 
 import (
+	"strings"
+
 	"github.com/jashveer/lifeos/backend/internal/validate"
 )
 
@@ -81,6 +83,10 @@ func ValidateFilter(f Filter) (Filter, error) {
 		errs = append(errs, validate.Error{Field: "sort", Message: "is not a sortable field"})
 	}
 	if e := validate.MaxLen("tag", f.Tag, validate.MaxTagLen); e != nil {
+		errs = append(errs, *e)
+	}
+	f.Query = strings.TrimSpace(f.Query)
+	if e := validate.MaxLen("q", f.Query, validate.MaxQueryLen); e != nil {
 		errs = append(errs, *e)
 	}
 	switch {

@@ -136,6 +136,10 @@ func ValidateFilter(f Filter) (Filter, error) {
 			errs = append(errs, *e)
 		}
 	}
+	f.Query = strings.TrimSpace(f.Query)
+	if e := validate.MaxLen("q", f.Query, validate.MaxQueryLen); e != nil {
+		errs = append(errs, *e)
+	}
 	if f.Sort == "" {
 		f.Sort = DefaultSort
 	}

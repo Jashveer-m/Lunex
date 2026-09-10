@@ -8,6 +8,8 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+
+	"github.com/jashveer/lifeos/backend/internal/actions"
 )
 
 // Repository is the Postgres store for conversations and messages.
@@ -162,21 +164,24 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 }
 
 // AppendTurn writes a whole turn and names the conversation, in one
-// transaction.
+// transaction -- the turn's actions included, through actions.Insert, so the
+// SQL for that table still lives in its own package while the commit that
+// makes a proposal real is the same one that makes the answer describing it
+// real.
 //
 // The leading UPDATE does three jobs at once: it proves the conversation is
 // the caller's (no rows means it is not), it applies the derived title if the
 // conversation is still using the default, and it moves updated_at through the
 // set_updated_at trigger so the conversation list sorts by real activity --
 // inserting a message would not otherwise touch the parent row.
-func (r *Repository) AppendTurn(ctx context.Context, userID, convID uuid.UUID, msgs []NewMessage, titleIfDefault string) ([]Message, error) {
-	if len(msgs) == 0 {
-		return nil, nil
+func (r *Repository) AppendTurn(ctx context.Context, userID, convID uuid.UUID, msgs []NewMessage, titleIfDefault string, acts []actions.NewAction) ([]Message, []actions.Action, error) {
+	if len(msgs) == 0 && len(acts) == 0 {
+		return nil, nil, nil
 	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("begin turn: %w", err)
+		return nil, nil, fmt.Errorf("begin turn: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once Commit has run
 
@@ -187,10 +192,10 @@ func (r *Repository) AppendTurn(ctx context.Context, userID, convID uuid.UUID, m
 		WHERE id = $1 AND user_id = $2
 		RETURNING id`, convID, userID, DefaultTitle, titleIfDefault).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("touch conversation: %w", err)
+		return nil, nil, fmt.Errorf("touch conversation: %w", err)
 	}
 
 	out := make([]Message, 0, len(msgs))
@@ -199,7 +204,7 @@ func (r *Repository) AppendTurn(ctx context.Context, userID, convID uuid.UUID, m
 		if len(m.Sources) > 0 {
 			raw, err := json.Marshal(m.Sources)
 			if err != nil {
-				return nil, fmt.Errorf("encode message sources: %w", err)
+				return nil, nil, fmt.Errorf("encode message sources: %w", err)
 			}
 			// Passed as text with an explicit cast: the pgx stdlib driver
 			// sends a []byte as bytea, which jsonb will not take.
@@ -217,13 +222,20 @@ func (r *Repository) AppendTurn(ctx context.Context, userID, convID uuid.UUID, m
 			RETURNING id, conversation_id, role, content, sources, created_at`,
 			convID, m.Role, m.Content, sources))
 		if err != nil {
-			return nil, fmt.Errorf("insert message %d: %w", i, err)
+			return nil, nil, fmt.Errorf("insert message %d: %w", i, err)
 		}
 		out = append(out, written)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit turn: %w", err)
+	var recorded []actions.Action
+	if len(acts) > 0 {
+		if recorded, err = actions.Insert(ctx, tx, userID, &convID, acts); err != nil {
+			return nil, nil, fmt.Errorf("record turn actions: %w", err)
+		}
 	}
-	return out, nil
+
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit turn: %w", err)
+	}
+	return out, recorded, nil
 }

@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/actions"
+	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/graph"
@@ -31,7 +33,12 @@ type Store interface {
 	// it is still using the default title. One transaction, because a stored
 	// question with no answer -- or an answer with no question -- is not a
 	// state any reader should have to handle.
-	AppendTurn(ctx context.Context, userID, convID uuid.UUID, msgs []NewMessage, titleIfDefault string) ([]Message, error)
+	//
+	// The turn's actions are part of it: a read the turn ran, or a write it
+	// proposed, is written in the same transaction as the messages. So a turn
+	// that fails leaves no proposal behind for the user to approve, and a
+	// proposal is never announced before the row it names exists.
+	AppendTurn(ctx context.Context, userID, convID uuid.UUID, msgs []NewMessage, titleIfDefault string, acts []actions.NewAction) ([]Message, []actions.Action, error)
 }
 
 // Sink receives a turn as it is produced. Every method is called from
@@ -44,6 +51,12 @@ type Sink interface {
 	// Token is called for each fragment of the reply, in order. Concatenating
 	// them gives exactly the stored message content.
 	Token(text string) error
+	// Actions is called at most once, after the turn is persisted and before
+	// the extractors run, with the actions the turn produced -- so a proposal
+	// reaches the client as soon as it is approvable, not a minute later when
+	// the extractions finish. Its error is logged, not returned: by then the
+	// turn is saved.
+	Actions(acts []TurnAction) error
 }
 
 // Options are the generation knobs, resolved from configuration at boot.
@@ -70,6 +83,11 @@ type Options struct {
 // and GraphExtractor are the same pair for Phase 6. None is a degraded mode to
 // hide -- they are the halves of two systems, and an operator gets to run any
 // combination of them.
+//
+// Phase 7's three -- Router, Tools, Actions -- are optional together: all
+// three wired is an assistant that can use tools, and anything less is one
+// that cannot, which is exactly Phase 6. Agent is the agent the router decides
+// for; zero means agents.General.
 type Deps struct {
 	Store           Store
 	Provider        ai.Provider
@@ -81,6 +99,10 @@ type Deps struct {
 	Tasks           TaskLister
 	Goals           GoalLister
 	Notes           NoteLister
+	Router          ToolRouter
+	Tools           ToolRunner
+	Actions         ActionLog
+	Agent           agents.Agent
 	Logger          *slog.Logger
 	Options         Options
 }
@@ -99,6 +121,10 @@ type Service struct {
 	tasks     TaskLister
 	goals     GoalLister
 	notes     NoteLister
+	router    ToolRouter
+	tools     ToolRunner
+	actions   ActionLog
+	agent     agents.Agent
 	log       *slog.Logger
 	opts      Options
 	// now is injectable so the prompt's "current date" is assertable.
@@ -117,11 +143,16 @@ func NewService(d Deps) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
+	agent := d.Agent
+	if agent.Name == "" {
+		agent = agents.General
+	}
 	return &Service{
 		store: d.Store, provider: d.Provider,
 		docs: d.Documents, memories: d.Memories, extractor: d.MemoryExtractor,
 		graph: d.Graph, linker: d.GraphExtractor,
 		tasks: d.Tasks, goals: d.Goals, notes: d.Notes,
+		router: d.Router, tools: d.Tools, actions: d.Actions, agent: agent,
 		log: log, opts: opts, now: time.Now,
 	}
 }
@@ -179,6 +210,9 @@ type Turn struct {
 	// Linked is what the relationship extractor took from it, on the same
 	// terms and for the same reason.
 	Linked []graph.Edge
+	// Actions is what the turn did with a tool: a read it ran, or a write it
+	// proposed and that now waits for the user. Nil on most turns.
+	Actions []TurnAction
 }
 
 // SendMessage runs one turn: retrieve, prompt, generate, persist.
@@ -210,7 +244,15 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 		return Turn{}, err
 	}
 
-	sources, err := s.retrieve(ctx, userID, content)
+	// The tool step runs before retrieval, because a read tool's results are
+	// retrieved sources too -- the most targeted ones the turn has -- and they
+	// go first.
+	step, err := s.act(ctx, userID, convID, content)
+	if err != nil {
+		return Turn{}, err
+	}
+
+	sources, err := s.retrieve(ctx, userID, content, step.sources)
 	if err != nil {
 		return Turn{}, err
 	}
@@ -220,7 +262,7 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 		return Turn{}, fmt.Errorf("load history: %w", err)
 	}
 
-	prompt := buildPrompt(s.now(), sources, history, content)
+	prompt := buildPrompt(s.now(), s.toolsEnabled(), sources, step.actionsBlock(sources), history, content)
 	stream, err := s.provider.Chat(ctx, prompt, ai.Options{
 		Model: s.opts.Model, Temperature: s.opts.Temperature, MaxTokens: s.opts.MaxTokens,
 	})
@@ -257,10 +299,10 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 	// from the generated text, never assumed.
 	sources = markCited(sources, text)
 
-	written, err := s.store.AppendTurn(ctx, userID, convID, []NewMessage{
+	written, recorded, err := s.store.AppendTurn(ctx, userID, convID, []NewMessage{
 		{Role: RoleUser, Content: content},
 		{Role: RoleAssistant, Content: text, Sources: sources},
-	}, deriveTitle(content))
+	}, deriveTitle(content), step.newActions())
 	if err != nil {
 		return Turn{}, fmt.Errorf("persist turn: %w", err)
 	}
@@ -268,13 +310,24 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 		return Turn{}, fmt.Errorf("persist turn: wrote %d messages, want 2", len(written))
 	}
 
+	turnActions := step.turnActions(recorded)
+	if len(turnActions) > 0 {
+		if err := sink.Actions(turnActions); err != nil {
+			// The turn is saved and the proposal with it; a client that hung up
+			// finds it at GET /actions. Not a failure to report.
+			s.log.Info("could not announce the turn's actions", "error", err,
+				"user_id", userID, "conversation_id", convID)
+		}
+	}
+
 	s.log.Info("chat turn",
 		"user_id", userID, "conversation_id", convID, "model", s.model(),
 		"sources_retrieved", len(sources), "sources_cited", countCited(sources),
-		"answer_chars", len(text))
+		"answer_chars", len(text), "tool", step.toolName(), "actions", len(turnActions))
 
 	return Turn{
 		User: written[0], Assistant: written[1], Model: s.model(),
+		Actions:    turnActions,
 		Remembered: s.remember(ctx, userID, convID, content, text),
 		Linked:     s.link(ctx, userID, convID, content, text),
 	}, nil
@@ -359,18 +412,29 @@ func countCited(sources []Source) int {
 // discardSink is what a caller that only wants the finished turn gets.
 type discardSink struct{}
 
-func (discardSink) Sources([]Source) error { return nil }
-func (discardSink) Token(string) error     { return nil }
+func (discardSink) Sources([]Source) error     { return nil }
+func (discardSink) Token(string) error         { return nil }
+func (discardSink) Actions([]TurnAction) error { return nil }
 
 // CollectSink accumulates a turn in memory. It is the non-streaming client:
 // used by tests, and by anything later that wants the answer as a value.
 type CollectSink struct {
 	Retrieved []Source
 	Text      strings.Builder
+	Announced []TurnAction
+	// TokensBeforeActions is how many tokens had arrived when the actions were
+	// announced, which is how a test pins that a proposal is announced after
+	// the answer rather than before its row exists.
+	TokensBeforeActions int
+	tokens              int
 }
 
 func (c *CollectSink) Sources(s []Source) error { c.Retrieved = s; return nil }
-func (c *CollectSink) Token(t string) error     { c.Text.WriteString(t); return nil }
+func (c *CollectSink) Token(t string) error     { c.Text.WriteString(t); c.tokens++; return nil }
+func (c *CollectSink) Actions(a []TurnAction) error {
+	c.Announced, c.TokensBeforeActions = a, c.tokens
+	return nil
+}
 
 // Unavailable reports whether an error means the turn could not run because
 // something upstream was down -- the model, or the embedding service retrieval

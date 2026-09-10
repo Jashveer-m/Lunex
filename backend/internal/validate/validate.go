@@ -33,6 +33,10 @@ const (
 	MaxTags           = 25
 	// A year of minutes: past that, the field is being misused.
 	MaxEffortMinutes = 60 * 24 * 365
+	// MaxQueryLen bounds the `q` text filter on the list endpoints. It is a
+	// substring to look for, not a document, and the filter scans every one of
+	// the owner's rows.
+	MaxQueryLen = 200
 )
 
 // Title trims, then requires a non-empty value within the length limit. It

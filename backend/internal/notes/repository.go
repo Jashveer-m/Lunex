@@ -67,6 +67,13 @@ func (r *Repository) List(ctx context.Context, userID uuid.UUID, f Filter) ([]No
 		// Containment rather than `= ANY(tags)`: only the former uses the GIN index.
 		where = append(where, fmt.Sprintf("tags @> ARRAY[$%d]::text[]", len(args)))
 	}
+	if f.Query != "" {
+		// See tasks.Repository.List: a scan of the owner's rows, escaped by
+		// db.Contains. Content rather than a description, because that is
+		// where a note keeps its text.
+		args = append(args, db.Contains(f.Query))
+		where = append(where, fmt.Sprintf(`(title ILIKE $%[1]d ESCAPE '\' OR content ILIKE $%[1]d ESCAPE '\')`, len(args)))
+	}
 
 	query := `SELECT ` + noteColumns + ` FROM notes WHERE ` + strings.Join(where, " AND ") +
 		` ORDER BY ` + Sorts[f.Sort] + `, id ASC` +
