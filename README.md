@@ -16,10 +16,14 @@ Personal life-operating-system.
   exchange back and stores the facts worth keeping about you, embedded and
   searchable, so a later conversation can retrieve and cite them. You can see
   every one of them, correct it, switch it off, delete it, or forget everything.
+- **Phase 6** — the knowledge graph: every task, goal, note and document gets a
+  node when you write it, conversations grow the edges between them, and a
+  question that names something you have gets its connections as context. Two
+  Postgres tables, one hop, no graph database.
 
-Agents, the knowledge graph and the action/approval engine belong to later
-phases and are deliberately absent. The assistant reads, answers and remembers;
-it does not create or change anything else, and it says so if you ask.
+Agents and the action/approval engine belong to later phases and are
+deliberately absent. The assistant reads, answers, remembers and connects; it
+does not create or change anything else, and it says so if you ask.
 
 ## Stack
 
@@ -51,6 +55,7 @@ lunex/
 │   │   ├── documents/     # upload, extract, chunk, embed, search
 │   │   ├── embeddings/    # Ollama client behind an Embedder interface
 │   │   ├── goals/         # goals + milestones: model, service, handlers
+│   │   ├── graph/         # knowledge graph: node sync, relationship extraction, 1-hop lookup
 │   │   ├── memories/      # extraction, embedding, retrieval, management
 │   │   ├── httpx/         # JSON transport helpers shared by the modules
 │   │   ├── notes/         # notes: model, service, handlers
@@ -62,7 +67,7 @@ lunex/
 │   └── go.mod
 ├── frontend/              # Vite React TS scaffold
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> search -> ask -> cite -> remember -> recall, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -187,6 +192,54 @@ Extraction is a second model call on every substantial turn. It runs after the
 last token, so it delays the end of the stream rather than the answer, and
 `MEMORY_EXTRACTION=false` turns it off while leaving retrieval running.
 
+### The knowledge graph (Phase 6)
+
+Nodes appear as you write. Creating a task, goal, note or document creates its
+node in the same request; renaming it moves the label; deleting it takes the
+node and its edges with it.
+
+```sh
+curl -s -X POST localhost:8080/api/v1/tasks -H "$AUTH" \
+  -H 'Content-Type: application/json' -d '{"title":"Finish the compiler project"}'
+
+curl -s localhost:8080/api/v1/knowledge-graph -H "$AUTH"
+# {"nodes":[{"type":"task","label":"Finish the compiler project","ref_table":"tasks",
+#            "ref_id":"…","extracted":false,…}],"edges":[],"node_count":1,"edge_count":0,…}
+```
+
+Edges come from conversations. After a substantial turn the exchange is read a
+third time, this time for the relationships in it:
+
+```sh
+# "I have been learning Rust so I can finish the compiler project."
+# event: done
+# data: {…,"linked":[{"from_node_id":"…","to_node_id":"…","relationship":"STUDIES","confidence":0.9}]}
+
+curl -s localhost:8080/api/v1/knowledge-graph/nodes/$NODE_ID -H "$AUTH"
+# {"node":{"type":"skill","label":"Rust","extracted":true,…},
+#  "neighbors":[{"node":{"type":"goal","label":"the compiler project",…},
+#                "edge":{"relationship":"REQUIRES","confidence":0.85,…},"incoming":true}],
+#  "neighbor_count":1}
+```
+
+And a later question that *names* one of your nodes gets its connections as a
+citable source, in a conversation that shares nothing else with the first:
+
+```
+[S1] graph: "Rust"
+"the compiler project" (goal) REQUIRES "Rust" (skill) · confidence 0.85
+"You" (person) STUDIES "Rust" (skill) · confidence 0.90
+```
+
+The match is on the node's *name*, exactly and case-insensitively, on a word
+boundary — "Rust" matches "learning Rust" and not "trusted". It is a lookup,
+not a traversal: one hop, no path finding, no graph algorithms.
+
+Relationship extraction is a third model call on a substantial turn, after the
+memory one and on the same terms — it runs after the last token, it cannot fail
+the answer, and `GRAPH_EXTRACTION=false` turns it off while leaving node sync
+and the lookup running.
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
@@ -205,7 +258,7 @@ last token, so it delays the end of the stream rather than the answer, and
 | `MAX_UPLOAD_BYTES` | no | `10485760` | 10 MB; rejected before the file is read |
 | `DOCUMENT_PROCESS_TIMEOUT` | no | `2m` | Budget for one synchronous upload; also sets the server's read/write timeout |
 | `CHAT_MODEL` | no | `llama3.2:3b` | The Ollama chat model |
-| `CHAT_TIMEOUT` | no | `3m` | Budget for one whole turn: retrieve, generate, persist |
+| `CHAT_TIMEOUT` | no | `5m` | Budget for one whole turn: retrieve, generate, persist — **and** both extractions, which run inside it. The process refuses to start if the two extraction timeouts exceed half of this |
 | `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
 | `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
 | `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
@@ -216,6 +269,12 @@ last token, so it delays the end of the stream rather than the answer, and
 | `MEMORY_MAX_TOKENS` | no | `512` | Extraction reply cap |
 | `MEMORY_MIN_SIMILARITY` | no | `0.6` | 0–1. Retrieval floor for memories, tuned separately from the document one and higher |
 | `MEMORY_JSON_MODE` | no | `false` | Constrain extraction to JSON. Off: it makes llama3.2:3b answer `{}` and pad whitespace |
+| `GRAPH_EXTRACTION` | no | `true` | The writing half of the graph. `false` keeps node sync and the 1-hop lookup, and stops the assistant inferring new relationships |
+| `GRAPH_MODEL` | no | `CHAT_MODEL` | Which model extracts relationships |
+| `GRAPH_EXTRACT_TIMEOUT` | no | `60s` | Bounds one relationship extraction; the second piece of latency at the end of a turn |
+| `GRAPH_TEMPERATURE` | no | `0.1` | 0–2. Near zero: extraction is a reading task |
+| `GRAPH_MAX_TOKENS` | no | `512` | Extraction reply cap |
+| `GRAPH_JSON_MODE` | no | `false` | As `MEMORY_JSON_MODE`, and off for the same measured reason |
 
 ## Common commands
 
@@ -223,7 +282,7 @@ last token, so it delays the end of the stream rather than the answer, and
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search -> ask -> cite -> remember -> recall, against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -320,3 +379,38 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     Requiring every fact to be about the user narrows it; nothing in this phase
     closes it. The assistant still cannot act, and every memory is visible,
     attributable and deletable.
+27. **The graph is one hop and nothing more.** No shortest path, no centrality,
+    no "how are these two things related". The chat integration is a lookup —
+    the question named something, here is what it is connected to.
+28. **Nodes are matched by name, exactly and case-insensitively.** "Go" and
+    "go" are one node; "Go" and "Golang" are two. Fuzzy matching is not used on
+    purpose: a wrong merge does not lose a distinction, it invents
+    relationships. Node embeddings are the upgrade path, and they need a UI for
+    confirming a merge.
+29. **Rows written before Phase 6 have no node** until they are next updated.
+    Sync is idempotent and runs on every update, so the graph fills in as things
+    are touched, but nothing backfills the four tables. That belongs with the
+    job queue.
+30. **A relationship extraction is a third model call on a substantial turn.**
+    The tail of a turn is now roughly twice what Phase 5 made it. It runs after
+    the last token and cannot fail the answer; `GRAPH_EXTRACTION=false` removes
+    it, `GRAPH_MODEL` points it at a smaller model.
+31. **Nothing merges, decays or contradicts an edge.** `STUDIES` never becomes
+    `KNOWS`, a new edge that contradicts an old one is not noticed, and
+    confidence is recorded once and never re-estimated. Deleting an edge is not
+    a suppression list — a later conversation that states it again recreates it.
+32. **A graph source carries links, not details.** A node knows the goal it
+    mirrors but not that goal's deadline; the goal's own retrieval path supplies
+    that, and only if the goal is in the top five active ones. The graph adds a
+    lookup, not a join planner.
+33. **"Asked about" and "stated about" are told apart by the prompt only.**
+    Entity names are required to come from *your* message rather than the
+    assistant's reply, which stops the retrieved context becoming nodes — but a
+    thing you asked a question about is a thing you named, and only the model's
+    judgement stops it becoming an edge.
+34. **The same prompt-injection path reaches the graph.** The relationship
+    extractor reads an answer grounded in your files. Requiring both entity
+    names to appear in *your* message narrows it considerably — a document
+    cannot name entities the extractor will accept unless you named them too —
+    but it does not close it. Every node and edge is visible, attributable to a
+    conversation, and deletable.

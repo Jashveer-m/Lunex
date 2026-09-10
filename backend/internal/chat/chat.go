@@ -10,10 +10,19 @@
 // extractor, which is the only writing this package does and the only one that
 // cannot fail the request.
 //
-// What it deliberately is not: there are no agents, no knowledge graph and no
-// action engine. The assistant reads and answers. It cannot create, modify or
-// delete tasks, goals, notes or documents, and the system prompt says so, so a
-// user who asks for an action is told rather than quietly ignored.
+// Phase 6 adds one more retrieval source and one more thing the turn writes.
+// When the question names something the user already has a graph node for, the
+// node's 1-hop neighbourhood joins the context; and after the turn, the same
+// exchange the memory extractor reads is read again for the relationships in
+// it. Both are wired the same way the memory system is -- as optional,
+// independently switchable interfaces -- so an assistant with no graph
+// retrieves exactly what Phase 5 did.
+//
+// What it deliberately is not: there are no agents, no graph traversal beyond
+// one hop and no action engine. The assistant reads and answers. It cannot
+// create, modify or delete tasks, goals, notes or documents, and the system
+// prompt says so, so a user who asks for an action is told rather than quietly
+// ignored.
 package chat
 
 import (
@@ -83,9 +92,14 @@ type NewMessage struct {
 const (
 	SourceDocument = "document"
 	SourceMemory   = "memory"
-	SourceTask     = "task"
-	SourceGoal     = "goal"
-	SourceNote     = "note"
+	// SourceGraph is a node from the personal knowledge graph, together with
+	// what it is connected to. It is the only source that carries no text of
+	// the user's own: it is a set of links, and it earns its place by saying
+	// how two things they already have relate to each other.
+	SourceGraph = "graph"
+	SourceTask  = "task"
+	SourceGoal  = "goal"
+	SourceNote  = "note"
 )
 
 // Source is one retrieved item, recorded on the assistant message that was
@@ -95,15 +109,15 @@ const (
 // wire shape at once, so what the API returns is what the column holds.
 type Source struct {
 	Type string `json:"type"`
-	// ID is the document, memory, task, goal or note id -- something the client
-	// can follow to the underlying record.
+	// ID is the document, memory, graph node, task, goal or note id --
+	// something the client can follow to the underlying record.
 	ID uuid.UUID `json:"id"`
 	// Label is the marker the prompt showed the model ("S1", "S2", ...). It is
 	// stored because Cited is derived from finding it in the answer, and
 	// because a client rendering "[S1]" needs to know what S1 was.
 	Label string `json:"label"`
-	// Title is the filename, the task/goal/note title, or -- for a memory,
-	// which has no title -- its type.
+	// Title is the filename, the task/goal/note title, the graph node's label,
+	// or -- for a memory, which has no title -- its type.
 	Title string `json:"title"`
 	// ChunkIndex is set for documents only. Similarity is set for everything
 	// retrieved semantically, which is documents and memories; the task, goal

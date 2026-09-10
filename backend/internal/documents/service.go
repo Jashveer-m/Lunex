@@ -26,6 +26,38 @@ type Store interface {
 	Search(ctx context.Context, userID uuid.UUID, embedding []float32, q SearchQuery) ([]SearchResult, error)
 }
 
+// NodeSyncer mirrors a document into the personal knowledge graph. Phase 6's
+// internal/graph implements it; nil means no graph is wired and this module
+// behaves exactly as it did in Phase 3.
+//
+// The interface is declared here rather than imported, the same way
+// internal/chat declares the searchers it consumes: this package depends on
+// "something that records a document in the graph", not on the graph package.
+//
+// SyncNode returns no error on purpose. It runs after the document row is
+// written, so there is nothing useful to do with a failure. The graph logs its
+// own failures; see graph.Service.SyncNode.
+//
+// There is deliberately no delete counterpart: removing the node when the
+// document goes is done by a trigger in migration 000006, so it fires on every
+// path a row can leave by, not only the ones this service is on.
+type NodeSyncer interface {
+	SyncNode(ctx context.Context, userID uuid.UUID, refTable string, refID uuid.UUID, label string)
+}
+
+// graphRefTable is what a document's node records in `ref_table`. It matches
+// the allow-list in migration 000006 and graph's own map; the round trip is
+// pinned in internal/db's Phase 6 tests.
+const graphRefTable = "documents"
+
+// Option configures a Service at construction. It is variadic rather than a
+// parameter because the graph is genuinely optional: every existing caller,
+// including this module's own tests, builds a service without one.
+type Option func(*Service)
+
+// WithNodeSync wires the knowledge graph into the write path.
+func WithNodeSync(g NodeSyncer) Option { return func(s *Service) { s.graph = g } }
+
 // Service holds the document use cases. It is transport agnostic: Search in
 // particular is the retrieval entry point the AI chat phase will call directly,
 // with no HTTP in the way.
@@ -33,17 +65,22 @@ type Service struct {
 	store    Store
 	embedder embeddings.Embedder
 	log      *slog.Logger
+	graph    NodeSyncer
 	// processTimeout bounds the whole upload pipeline. Processing is
 	// synchronous in this phase, so this is the number that decides how long a
 	// client waits before an upload is abandoned.
 	processTimeout time.Duration
 }
 
-func NewService(store Store, embedder embeddings.Embedder, log *slog.Logger, processTimeout time.Duration) *Service {
+func NewService(store Store, embedder embeddings.Embedder, log *slog.Logger, processTimeout time.Duration, opts ...Option) *Service {
 	if processTimeout <= 0 {
 		processTimeout = 2 * time.Minute
 	}
-	return &Service{store: store, embedder: embedder, log: log, processTimeout: processTimeout}
+	s := &Service{store: store, embedder: embedder, log: log, processTimeout: processTimeout}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Upload runs the whole pipeline: record the document, extract, chunk, embed,
@@ -80,10 +117,36 @@ func (s *Service) Upload(ctx context.Context, userID uuid.UUID, in UploadInput) 
 			// and the caller needs a real error, not a misleading document.
 			return Document{}, fmt.Errorf("document %s stuck in processing: %w", doc.ID, ferr)
 		}
+		// On the detached context, for the same reason Fail is: the usual way
+		// to arrive here is that the deadline expired, and syncing on a context
+		// that is already done would lose the node every time the path that
+		// most needs it is taken.
+		s.sync(failCtx, userID, failed)
 		return failed, nil
 	}
 
-	return s.store.ByID(ctx, userID, doc.ID)
+	ready, err := s.store.ByID(ctx, userID, doc.ID)
+	if err != nil {
+		return Document{}, err
+	}
+	s.sync(ctx, userID, ready)
+	return ready, nil
+}
+
+// sync mirrors a document into the graph.
+//
+// It runs for a failed document as well as a ready one, and that is the
+// decision: the node stands for the document, not for its text. A failed
+// document is a row the user can list, read the error from and delete, and it
+// is a filename a later conversation may well name -- and there is no update
+// path to mirror it later, because a document cannot be renamed. Leaving it
+// out would mean the graph disagreed with the documents list about what the
+// user has.
+func (s *Service) sync(ctx context.Context, userID uuid.UUID, d Document) {
+	if s.graph == nil {
+		return
+	}
+	s.graph.SyncNode(ctx, userID, graphRefTable, d.ID, d.Filename)
 }
 
 // process is the extract → chunk → embed → store half of Upload. Every error

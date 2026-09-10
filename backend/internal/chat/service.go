@@ -12,6 +12,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 )
 
@@ -63,17 +64,20 @@ type Options struct {
 
 // Deps are everything the orchestrator needs.
 //
-// Memories and MemoryExtractor are both optional and independently so: a nil
-// Memories is an assistant that retrieves exactly what Phase 4 did, and a nil
-// MemoryExtractor is one that uses what it already knows without learning
-// anything new. Neither is a degraded mode to hide -- they are the two halves
-// of the memory system, and an operator gets to run either.
+// Four of them are optional and independently so: a nil Memories is an
+// assistant that retrieves exactly what Phase 4 did, a nil MemoryExtractor is
+// one that uses what it already knows without learning anything new, and Graph
+// and GraphExtractor are the same pair for Phase 6. None is a degraded mode to
+// hide -- they are the halves of two systems, and an operator gets to run any
+// combination of them.
 type Deps struct {
 	Store           Store
 	Provider        ai.Provider
 	Documents       DocumentSearcher
 	Memories        MemorySearcher
 	MemoryExtractor MemoryExtractor
+	Graph           GraphSearcher
+	GraphExtractor  GraphExtractor
 	Tasks           TaskLister
 	Goals           GoalLister
 	Notes           NoteLister
@@ -90,6 +94,8 @@ type Service struct {
 	docs      DocumentSearcher
 	memories  MemorySearcher
 	extractor MemoryExtractor
+	graph     GraphSearcher
+	linker    GraphExtractor
 	tasks     TaskLister
 	goals     GoalLister
 	notes     NoteLister
@@ -114,6 +120,7 @@ func NewService(d Deps) *Service {
 	return &Service{
 		store: d.Store, provider: d.Provider,
 		docs: d.Documents, memories: d.Memories, extractor: d.MemoryExtractor,
+		graph: d.Graph, linker: d.GraphExtractor,
 		tasks: d.Tasks, goals: d.Goals, notes: d.Notes,
 		log: log, opts: opts, now: time.Now,
 	}
@@ -169,6 +176,9 @@ type Turn struct {
 	// that writes down facts about a user without telling them is the version
 	// of this feature nobody asked for.
 	Remembered []memories.Memory
+	// Linked is what the relationship extractor took from it, on the same
+	// terms and for the same reason.
+	Linked []graph.Edge
 }
 
 // SendMessage runs one turn: retrieve, prompt, generate, persist.
@@ -266,6 +276,7 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 	return Turn{
 		User: written[0], Assistant: written[1], Model: s.model(),
 		Remembered: s.remember(ctx, userID, convID, content, text),
+		Linked:     s.link(ctx, userID, convID, content, text),
 	}, nil
 }
 
@@ -296,6 +307,30 @@ func (s *Service) remember(ctx context.Context, userID, convID uuid.UUID, questi
 	stored, err := s.extractor.ExtractFromTurn(ctx, userID, convID, question, answer)
 	if err != nil {
 		s.log.Warn("memory extraction failed",
+			"error", err, "user_id", userID, "conversation_id", convID,
+			"stored_before_failure", len(stored))
+	}
+	return stored
+}
+
+// link hands the finished exchange to the relationship extractor, on exactly
+// the terms remember does: after the turn is persisted and streamed, on the
+// turn's own context, and unable to fail it.
+//
+// It runs *after* the memory extraction rather than beside it, and that is a
+// decision rather than an omission. Both calls go to the same Ollama, which
+// holds one model resident and serves requests to it in sequence: running them
+// concurrently would not halve the wait, it would interleave two queue entries
+// and make the turn's tail latency harder to reason about for no gain. On a
+// deployment with two model servers -- or one hosted provider -- that
+// arithmetic changes, and this is the function that would change with it.
+func (s *Service) link(ctx context.Context, userID, convID uuid.UUID, question, answer string) []graph.Edge {
+	if s.linker == nil {
+		return nil
+	}
+	stored, err := s.linker.ExtractFromTurn(ctx, userID, convID, question, answer)
+	if err != nil {
+		s.log.Warn("relationship extraction failed",
 			"error", err, "user_id", userID, "conversation_id", convID,
 			"stored_before_failure", len(stored))
 	}

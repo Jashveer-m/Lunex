@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,13 +11,14 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
-// The five things the orchestrator can retrieve from, and the one thing it
-// writes to. Each is the narrowest slice of an existing Phase 2/3/5 service,
+// The six things the orchestrator can retrieve from, and the two things it
+// writes to. Each is the narrowest slice of an existing Phase 2/3/5/6 service,
 // and each takes the owner id as an argument -- so the orchestrator cannot
 // reach another user's data even by mistake, for the same structural reason the
 // repositories cannot.
@@ -43,6 +45,22 @@ type (
 	MemoryExtractor interface {
 		ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]memories.Memory, error)
 	}
+	// GraphSearcher is Phase 6's 1-hop lookup: given the text of a question, it
+	// answers with the neighbourhoods of the nodes that text names. The
+	// matching lives behind the interface rather than here, because the labels
+	// to match against are the graph's and the orchestrator has no business
+	// holding a copy of them.
+	GraphSearcher interface {
+		Mentioned(ctx context.Context, userID uuid.UUID, text string, limit int) ([]graph.Neighborhood, error)
+	}
+	// GraphExtractor is the other half of Phase 6, split from the searcher for
+	// exactly the reason MemoryExtractor is split from MemorySearcher: the two
+	// are independently switchable, and an operator who wants the assistant to
+	// use the graph without growing it wires the first and not the second
+	// (GRAPH_EXTRACTION=false).
+	GraphExtractor interface {
+		ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]graph.Edge, error)
+	}
 	TaskLister interface {
 		List(ctx context.Context, userID uuid.UUID, f tasks.Filter) ([]tasks.Task, error)
 	}
@@ -68,7 +86,10 @@ type (
 // Memories come after documents and before the heuristic items because that is
 // their standing: a fact the assistant recorded about the user is stronger
 // evidence than "here is a task you have open", and weaker than the user's own
-// document saying so.
+// document saying so. The graph sits between the memories and the heuristic
+// items for the same kind of reason: it fires only when the question actually
+// names something, which makes it a targeted match rather than background --
+// but what it carries is a set of links, not a claim in the user's own words.
 //
 // Any retrieval failure fails the whole turn. Answering without the tasks
 // table because its query errored would produce "I could not find anything in
@@ -99,6 +120,12 @@ func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question strin
 		return nil, err
 	}
 	out = append(out, remembered...)
+
+	linked, err := s.related(ctx, userID, question)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, linked...)
 
 	found2, err := s.currentTasks(ctx, userID)
 	if err != nil {
@@ -157,6 +184,33 @@ func (s *Service) recall(ctx context.Context, userID uuid.UUID, question string)
 		out = append(out, Source{
 			Type: SourceMemory, ID: m.ID, Title: m.Type, Similarity: &sim,
 			Excerpt: truncate(m.Content, MaxExcerptChars),
+		})
+	}
+	return out, nil
+}
+
+// related is the knowledge-graph half of retrieval. It is a no-op when no
+// graph service is wired, which is what an assistant with the graph switched
+// off looks like: it retrieves exactly what Phase 5 did.
+//
+// The node's label becomes the source title and its neighbourhood becomes the
+// excerpt. There is no similarity to report: a node either was named in the
+// question or it was not, and reporting a score for an exact match would
+// invite the model to weigh it against the cosine scores next to it, which
+// measure something else entirely.
+func (s *Service) related(ctx context.Context, userID uuid.UUID, question string) ([]Source, error) {
+	if s.graph == nil {
+		return nil, nil
+	}
+	found, err := s.graph.Mentioned(ctx, userID, truncate(question, MaxGraphQueryChars), MaxGraphNodes)
+	if err != nil {
+		return nil, fmt.Errorf("retrieve graph: %w", err)
+	}
+	out := make([]Source, 0, len(found))
+	for _, n := range found {
+		out = append(out, Source{
+			Type: SourceGraph, ID: n.Node.ID, Title: n.Node.Label,
+			Excerpt: truncate(graphSummary(n), MaxExcerptChars),
 		})
 	}
 	return out, nil
@@ -231,6 +285,40 @@ func labelled(in []Source) []Source {
 // Each renders one Phase 2 row as the few lines the model is shown. They are
 // deliberately telegraphic: the fields that decide whether an item answers the
 // question (status, priority, dates) come first, free text after.
+
+// graphSummary renders one node's neighbourhood as the lines the model is
+// shown.
+//
+// Every neighbour is written as a whole triple in subject-relationship-object
+// order, with both types named, rather than as an arrow relative to the node
+// the block is about. Direction is the meaning here -- "the user STUDIES Go"
+// and "Go STUDIES the user" are different claims -- and a rendering the model
+// has to combine with a header line to work out which way round it is, is a
+// rendering it will sometimes get backwards.
+func graphSummary(n graph.Neighborhood) string {
+	lines := make([]string, 0, len(n.Neighbors)+1)
+	if n.Node.RefTable != nil && n.Node.RefID != nil {
+		// The node mirrors a record, so say which. It lets a client follow the
+		// link, and it tells the model that the goal named on the far side of
+		// an edge is the same goal it may have been given as its own source --
+		// which is where the deadline and the status come from, since the node
+		// itself carries neither.
+		lines = append(lines, "this is the "+singular(*n.Node.RefTable)+" "+n.Node.RefID.String())
+	}
+	for _, nb := range n.Neighbors {
+		from, to := n.Node, nb.Node
+		if nb.Incoming {
+			from, to = nb.Node, n.Node
+		}
+		lines = append(lines, fmt.Sprintf("%s (%s) %s %s (%s) · confidence %.2f",
+			strconv.Quote(from.Label), from.Type, nb.Edge.Relationship,
+			strconv.Quote(to.Label), to.Type, nb.Edge.Confidence))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// singular turns a ref_table name into the word for one of its rows.
+func singular(table string) string { return strings.TrimSuffix(table, "s") }
 
 func taskSummary(t tasks.Task) string {
 	parts := []string{"priority " + t.Priority, "status " + t.Status}

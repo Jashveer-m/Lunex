@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/httpx"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 )
@@ -99,6 +101,22 @@ type doneEvent struct {
 	// with the scores and the switches, is at /api/v1/memories -- this is the
 	// notification, not the management surface.
 	Remembered []rememberedResponse `json:"remembered"`
+	// Linked is what the turn added to the knowledge graph, on the same terms:
+	// [] on most turns, the notification rather than the management surface.
+	// The full graph is at /api/v1/knowledge-graph.
+	Linked []linkedResponse `json:"linked"`
+}
+
+// linkedResponse is one newly recorded relationship, reported on the turn that
+// produced it. The node ids are what a client follows to
+// /knowledge-graph/nodes/{id}; the labels are what it can show without a
+// second request.
+type linkedResponse struct {
+	ID           string  `json:"id"`
+	FromNodeID   string  `json:"from_node_id"`
+	ToNodeID     string  `json:"to_node_id"`
+	Relationship string  `json:"relationship"`
+	Confidence   float64 `json:"confidence"`
 }
 
 // rememberedResponse is one newly stored memory, reported on the turn that
@@ -113,6 +131,19 @@ func toRememberedResponse(stored []memories.Memory) []rememberedResponse {
 	out := make([]rememberedResponse, 0, len(stored))
 	for _, m := range stored {
 		out = append(out, rememberedResponse{ID: m.ID.String(), Type: m.Type, Content: m.Content})
+	}
+	return out
+}
+
+func toLinkedResponse(stored []graph.Edge) []linkedResponse {
+	out := make([]linkedResponse, 0, len(stored))
+	for _, e := range stored {
+		out = append(out, linkedResponse{
+			ID: e.ID.String(), FromNodeID: e.FromNodeID.String(), ToNodeID: e.ToNodeID.String(),
+			Relationship: e.Relationship,
+			// Rounded because the column is `real`; see graph's own handler.
+			Confidence: math.Round(e.Confidence*100) / 100,
+		})
 	}
 	return out
 }
@@ -281,6 +312,7 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		Message:        toMessageResponse(turn.Assistant),
 		Model:          turn.Model,
 		Remembered:     toRememberedResponse(turn.Remembered),
+		Linked:         toLinkedResponse(turn.Linked),
 	})
 }
 

@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–5)
+# Lunex API — v1 (Phases 1–6)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -693,20 +693,21 @@ event: token
 data: {"text":" to [S1],"}
 
 event: done
-data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b","remembered":[]}
+data: {"conversation_id":"…","user_message":{…},"message":{…},"model":"llama3.2:3b","remembered":[],"linked":[]}
 ```
 
 `done` is the last frame and it arrives late on a substantial turn: the answer
 is fully streamed first, then the memory extractor reads the finished exchange,
-and only then is `done` sent. The reply is complete and readable throughout —
-what waits is the end-of-stream marker. `MEMORY_EXTRACT_TIMEOUT` bounds that
-wait, and `MEMORY_EXTRACTION=false` removes it.
+then the relationship extractor reads it, and only then is `done` sent. The
+reply is complete and readable throughout — what waits is the end-of-stream
+marker. `MEMORY_EXTRACT_TIMEOUT` and `GRAPH_EXTRACT_TIMEOUT` bound that wait,
+and `MEMORY_EXTRACTION=false` / `GRAPH_EXTRACTION=false` remove each half of it.
 
 | Event | Payload | When |
 | --- | --- | --- |
 | `sources` | `{sources, count}` | Once, after the model accepts the request and before the first token. `cited` is always `false` here — nothing has been generated yet. |
 | `token` | `{text}` | Per fragment, in order. Concatenating every `text` gives exactly the stored message content. |
-| `done` | `{conversation_id, user_message, message, model, remembered}` | Once, after the turn is persisted **and** the memory extractor has run. `message.sources` is the same list with `cited` filled in; `remembered` is what the exchange added to memory, `[]` on most turns. |
+| `done` | `{conversation_id, user_message, message, model, remembered, linked}` | Once, after the turn is persisted **and** both extractors have run. `message.sources` is the same list with `cited` filled in; `remembered` is what the exchange added to memory and `linked` what it added to the knowledge graph, both `[]` on most turns. |
 | `error` | `{error, message}` | Instead of `done`, if generation failed after the stream started. |
 
 Token text is JSON-encoded rather than written raw because a model emits
@@ -751,14 +752,30 @@ No chat endpoint writes to `tasks`, `goals`, `notes` or `documents`.
 | --- | --- |
 | Document chunks | Phase 3's vector search over the caller's chunks: top 5 above `CHAT_MIN_SIMILARITY` |
 | Memories | Phase 5's vector search over the caller's enabled memories: top 5 above `MEMORY_MIN_SIMILARITY` |
+| Knowledge graph | Phase 6's 1-hop lookup: up to 3 nodes whose label the question names as a whole word, each with what it is connected to |
 | Tasks | Up to 5: in progress by recency, then pending by nearest deadline |
 | Goals | Up to 5 active goals by nearest deadline |
 | Notes | The 3 most recently updated |
 
-Documents and memories are the semantic half, each with its own floor. Tasks,
-goals and notes are selected by that heuristic rather than semantically — they
-have no embeddings yet — so they reach the model as background that the
-question may or may not be about.
+Documents and memories are the semantic half, each with its own floor. Graph
+nodes are matched on their *name*, exactly and case-insensitively, on a word
+boundary — so "Go" matches "learning Go" and not "going". Tasks, goals and
+notes are selected by that heuristic rather than semantically — they have no
+embeddings yet — so they reach the model as background that the question may or
+may not be about.
+
+A graph source carries no text of yours. It is the node's links, one per line:
+
+```
+[S3] graph: "Go"
+"the backend project" (goal) REQUIRES "Go" (skill) · confidence 0.85
+"You" (person) STUDIES "Go" (skill) · confidence 0.90
+```
+
+Every line is a whole triple in subject-relationship-object order, because
+direction is part of the meaning. A node that mirrors a record says so, so the
+model can join the link to the goal it may also have been given as its own
+source — the node itself carries no deadline and no status.
 
 Sources are labelled in that order, so `S1` is the strongest document match
 whenever any document matched, and the ones past the context budget are dropped
@@ -905,6 +922,219 @@ what you say now wins.
 
 ---
 
+## Knowledge graph
+
+What is connected to what. Every endpoint is scoped to the caller: a node or
+edge belonging to somebody else answers `404`, exactly like one that does not
+exist.
+
+The graph has two kinds of node and they behave differently.
+
+**Mirrored nodes** stand for a row you already have — a task, goal, note or
+document. They are created when you create the thing, their label follows its
+title, and they are removed when you delete it. `ref_table` and `ref_id` point
+at the record; `extracted` is `false`.
+
+**Extracted nodes** are skills, people and projects, and they exist only
+because a conversation named them. There is no skills table and no people
+table. `ref_table` and `ref_id` are `null`; `extracted` is `true`.
+
+Neither kind is created by a client — there is no `POST`. Edges are written by
+the extraction that runs at the end of a substantial chat turn; see **How a
+relationship is made** below.
+
+A node:
+
+```json
+{
+  "id": "b1c0f2a4-7d3e-4a91-8f55-2c9e6b1d7a03",
+  "type": "skill",
+  "label": "Go",
+  "ref_table": null,
+  "ref_id": null,
+  "extracted": true,
+  "created_at": "2026-09-10T09:12:44.108Z",
+  "updated_at": "2026-09-10T09:12:44.108Z"
+}
+```
+
+An edge:
+
+```json
+{
+  "id": "9d4b7e10-6a52-4c38-b0f7-1e83a5c94d26",
+  "from_node_id": "c7e2…",
+  "to_node_id": "b1c0…",
+  "relationship": "REQUIRES",
+  "confidence": 0.85,
+  "source_conversation_id": "150b47f9-3572-4e85-8f23-ea77d698d2c5",
+  "created_at": "2026-09-10T09:12:44.108Z"
+}
+```
+
+`type` is one of `task`, `goal`, `note`, `document`, `skill`, `person`,
+`project`. `relationship` is one of `RELATED_TO`, `REQUIRES`, `DEPENDS_ON`,
+`WORKS_ON`, `KNOWS`, `INTERESTED_IN`, `STUDIES`, `COMPLETED`, `GOAL_OF`. Both
+are closed sets, enforced by a `CHECK` constraint.
+
+`confidence` is the model's own estimate, in `[0, 1]`, that it *read* the
+relationship rather than inferred it. It is recorded, not trusted: nothing
+ranks by it, and anything below `0.5` was never stored.
+
+`source_conversation_id` is `null` once that conversation has been deleted —
+the edge outlives its source and says so — and it names where the relationship
+was **first** learned, not the last conversation to restate it.
+
+### `GET /api/v1/knowledge-graph`
+
+| Parameter | Values |
+| --- | --- |
+| `type` | one of the seven node types; anything else is `400` |
+| `limit`, `offset` | paging over nodes (default 500, max 2,000) |
+
+```json
+{
+  "nodes": [ … ],
+  "edges": [ … ],
+  "node_count": 3,
+  "edge_count": 2,
+  "limit": 500,
+  "offset": 0
+}
+```
+
+`edges` is closed over `nodes`: every edge returned has **both** of its
+endpoints in the node list, so a filtered or paged read is a graph you can draw
+rather than a node list with dangling references. Filtering to `?type=skill`
+therefore usually returns no edges at all — a skill's links point at projects
+and people, which the filter excluded.
+
+### `GET /api/v1/knowledge-graph/nodes/{id}`
+
+One node and everything one hop from it.
+
+```json
+{
+  "node": { "id": "b1c0…", "type": "skill", "label": "Go", "extracted": true, … },
+  "neighbors": [
+    {
+      "node": { "id": "c7e2…", "type": "goal", "label": "the backend project", "ref_table": "goals", "ref_id": "…", "extracted": false, … },
+      "edge": { "id": "9d4b…", "relationship": "REQUIRES", "confidence": 0.85, … },
+      "incoming": true
+    }
+  ],
+  "neighbor_count": 1
+}
+```
+
+`incoming` says which way the edge points: `true` means it points *at* the node
+you asked about. "The user STUDIES Go" and "Go STUDIES the user" are different
+claims, so the direction is carried rather than flattened away.
+
+One hop is all there is. There is no path finding, no second hop and no
+traversal depth parameter — see **What this is not** below.
+
+Up to 25 neighbours, strongest confidence first.
+
+### `DELETE /api/v1/knowledge-graph/nodes/{id}`
+
+`204 No Content` — for an **extracted** node. Its edges go with it.
+
+`409 node_is_backed` — for a node that mirrors a task, goal, note or document:
+
+```json
+{
+  "error": "node_is_backed",
+  "message": "This node mirrors a task, goal, note or document and follows it. Delete that record instead and the node goes with it."
+}
+```
+
+Those nodes are not independent things to curate. They exist because the record
+exists, the next edit to it would recreate one, and a graph that disagreed with
+your task list until something happened to repair it would be worse than one
+that will not let you make it disagree. `DELETE /api/v1/tasks/{id}` removes the
+task and its node together.
+
+It is `409`, not `400`: nothing about the request is malformed, the resource is
+in a state that forbids the operation. It is not `404` either — the node exists
+and you own it. Somebody *else's* mirrored node is still `404`, because
+answering `409` would confirm the id is real.
+
+### `DELETE /api/v1/knowledge-graph/edges/{id}`
+
+`204 No Content`. Both nodes stay.
+
+Deleting an edge says "this is wrong", not "never record this". A later
+conversation that states the same relationship again will recreate it — there
+is no suppression list in this phase.
+
+### How a relationship is made
+
+Two things put things in the graph, and only one of them involves a model.
+
+**Nodes come from writes.** Creating a task, goal, note or document creates its
+node in the same request; updating one refreshes its label; deleting one
+removes it. That last step is a database trigger rather than application code,
+because a row can leave by routes the API never sees — a parent task cascading
+to its subtasks, an account being deleted.
+
+**Edges come from conversations.** At the end of a chat turn, if the question
+and the answer together come to at least 120 characters, the exchange is sent
+back to the model a second time with an extraction prompt asking for 0–3
+relationships, each naming two entities and how they relate.
+
+Three things are dropped before anything is written:
+
+- relationships the model scored below **0.5** on confidence. The floor is
+  higher than the memory system's 0.4 because a memory is filtered on two
+  scores and an edge has only one — the schema gives a relationship no
+  "importance" column, so the confidence floor carries both filters' weight;
+- entity names that are not names. A node is "Go" or "Alice" or "the backend
+  project"; a small model asked to name entities will sometimes answer with a
+  clause lifted out of your own documents, so anything over eight words is
+  rejected;
+- relationships whose two ends turn out to be the same node — "the user" and
+  "I", most often.
+
+Each surviving entity name is then matched against the nodes you already have,
+**exactly and case-insensitively**, before anything new is created. That is why
+"Go" mentioned in five conversations is one node, and why a conversation about
+"the backend project" attaches to the *goal* by that name rather than inventing
+a second idea of it. The match is deliberately not fuzzy: a wrong merge does
+not merely lose a distinction, it invents relationships, giving Godot every
+edge Go has. A duplicate node is visible and deletable; an invented edge reads
+exactly like a real one.
+
+"I", "me", "myself", "the user" and "you" all resolve to one `person` node
+labelled **You**. It is an ordinary node otherwise — listed, traversable and
+deletable — with one exception: it is never matched by the mention scan, so it
+does not become a retrieved source. In a message you wrote, "you" means the
+assistant, and a node that fired on that would fire on almost every turn and be
+wrong about why. It still appears on the far end of any edge that is retrieved.
+
+The same relationship stated twice is one edge, keeping the higher confidence
+and the original provenance.
+
+Extraction never affects the answer. It runs after the turn is persisted, and
+if it fails — the model is down, the reply is unparseable, the deadline passes
+— the failure is logged and the answer is returned unchanged.
+
+### What this is not
+
+There is no graph database. This is two Postgres tables, an index on each
+endpoint, and a query one join deep.
+
+There is no traversal beyond one hop, and no graph algorithm: no shortest path,
+no centrality, no community detection, no "how are these two things related".
+The chat integration is a lookup — the question named something, here is what
+it is connected to — not reasoning over structure.
+
+There are no `expense`, `trip`, `place`, `habit`, `course` or `job` node types,
+and no `SPENT_ON` or `VISITED` relationships. Those modules do not exist yet,
+so an edge of either type could never have a real node on its far side.
+
+---
+
 ## Field limits
 
 | Field | Limit |
@@ -921,6 +1151,7 @@ what you say now wins.
 | search `query` | 4,000 characters |
 | chat message `content` | 8,000 characters |
 | memory `content` | 1,000 characters |
+| graph node `label` | 200 characters; an extracted name is also capped at 8 words |
 | chunks per document | 800 (~1.5 MB of prose); a larger document fails to process |
 
 Lengths count characters (runes), not bytes.

@@ -16,6 +16,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -30,6 +31,7 @@ type Deps struct {
 	Documents   *documents.Handler
 	Chat        *chat.Handler
 	Memories    *memories.Handler
+	Graph       *graph.Handler
 	Tokens      *auth.TokenIssuer
 	RateLimiter *auth.IPRateLimiter
 	DB          *sql.DB
@@ -102,6 +104,12 @@ func NewRouter(d Deps) http.Handler {
 			// to `content` triggers, which is a single vector and comfortably
 			// inside the ordinary budget.
 			r.Mount("/memories", d.Memories.Routes())
+
+			// Phase 6. Reading and pruning the knowledge graph is database
+			// work: two indexed selects and a delete. The model is only
+			// involved in the chat turn that grows an edge, and the sync that
+			// creates a node is a single upsert on the resource's own request.
+			r.Mount("/knowledge-graph", d.Graph.Routes())
 		})
 
 		// Phase 3. The upload pipeline runs inside the request -- extract,

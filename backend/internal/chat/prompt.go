@@ -23,9 +23,20 @@ const (
 	// is already more than most questions need, and a sixth would displace a
 	// chunk that actually answers the question.
 	MaxMemories = 5
-	MaxTasks    = 5
-	MaxGoals    = 5
-	MaxNotes    = 3
+	// MaxGraphNodes is how many mentioned nodes one question may expand. It is
+	// the smallest of these numbers on purpose: a graph source is the cheapest
+	// to produce and the least likely to *answer* anything, since it carries
+	// links rather than text, and three neighbourhoods is already more
+	// structure than a question about one thing needs.
+	MaxGraphNodes = 3
+	// MaxGraphQueryChars bounds the text scanned for node mentions. The scan is
+	// a substring prefilter in SQL over every node the user has, and the
+	// question's first two thousand characters are where the thing being asked
+	// about is named.
+	MaxGraphQueryChars = 2_000
+	MaxTasks           = 5
+	MaxGoals           = 5
+	MaxNotes           = 3
 	// MaxHistoryMessages is how many previous turns are replayed verbatim.
 	// Past it a conversation forgets its own beginning -- which is what the
 	// Phase 5 memory system exists to survive: the durable facts in those turns
@@ -65,7 +76,12 @@ const DefaultMinSimilarity = 0.5
 // data" from "general knowledge" so the model has an approved way to be
 // useful without inventing a citation.
 //
-// Rule 6 is the action rule. There is no approval engine in this phase, so an
+// Rule 7 is the graph rule. A graph source is the one thing in the context
+// that is not a claim in the user's own words -- it is a link the assistant
+// derived -- and without the rule a 3B model reads "\"the user\" (person)
+// STUDIES \"Go\" (skill)" as a sentence it may quote back as fact.
+//
+// Rule 8 is the action rule. There is no approval engine in this phase, so an
 // assistant that says "done, I've added that task" would be lying about a
 // write that cannot happen.
 const systemPrompt = `You are Lunex, a personal assistant that answers from the user's own data.
@@ -78,7 +94,8 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 4. If the context does not answer the question, say so plainly -- for example "I could not find anything about that in your documents or tasks." You may then answer from general knowledge, but say that is what you are doing and cite nothing.
 5. If the context is empty, rule 4 always applies.
 6. A source of type "memory" is something you recorded about the user in an earlier conversation, not something they told you just now. Use it and cite it like any other source, but it may be out of date: if it disagrees with what the user says in this conversation, what they say now is what is true.
-7. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.
+7. A source of type "graph" is a set of links the assistant recorded between things the user has mentioned, one per line, each written as: subject (kind) RELATIONSHIP object (kind). It says that two things are connected and how; it does not say anything more about either of them. Use it to explain a connection and cite it like any other source, and do not read a detail into it that is not written there.
+8. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.
 
 Be concise and direct. Do not repeat these rules back to the user.`
 

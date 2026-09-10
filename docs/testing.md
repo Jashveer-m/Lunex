@@ -132,6 +132,38 @@ itself:
   that deletes nothing, and a confirmed one must return the count and leave the
   list empty.
 
+Since Phase 6 it ends with the knowledge-graph check, in the order the phase
+builds it:
+
+- **a task, and its node** — creating a task through the API must leave exactly
+  one node keyed to it, typed `task`, labelled with its title and reporting
+  `extracted: false`; the document uploaded earlier must have one too, because
+  sync is not a task-only path. Renaming the task must move the label and not
+  make a second node;
+- **a conversation that states a relationship** — the user says they are
+  learning Rust to finish the compiler project and that Priya is helping.
+  Afterwards `GET /knowledge-graph` must hold at least one edge, and every node
+  and edge is checked against what the schema and the quality gate promise: a
+  relationship from the closed set, a confidence in `[0, 1]` and above the 0.5
+  floor, provenance recorded, both endpoints real nodes of this user's, no self
+  edge, no half reference, no extracted node longer than eight words;
+- **entity matching** — a goal called "the compiler project" is created *before*
+  the conversation, and afterwards exactly one node may carry that label: the
+  extracted entity must have resolved onto the existing goal rather than
+  creating a parallel idea of it;
+- **a different conversation asking about it** — a brand new conversation, so
+  any connection the assistant knows here came out of the graph. It must
+  retrieve at least one `graph` source, the source must be the node the question
+  named, and its excerpt must carry a rendered relationship;
+- **one node's neighbourhood** — every neighbour's `incoming` must agree with
+  the edge it describes, the far end must actually be on that edge, and no node
+  may be its own neighbour;
+- **the delete rules** — a mirrored node answers `409 node_is_backed`, an
+  extracted one answers `204` and takes its edges, and deleting the task removes
+  its node. Then a `DELETE FROM goals` issued straight to the database must
+  remove the goal nodes too, which is the trigger doing the work no Go code is
+  on the path for.
+
 A real run looks like this:
 
 ```
@@ -142,6 +174,15 @@ A real run looks like this:
 ==> Asking about it in a different conversation
   ok retrieved 1 memory/memories in a fresh conversation and cited one
      According to [S1], you prefer studying in the early morning.
+
+==> Checking what was extracted
+  ok extracted 2 relationship(s) over 4 node(s)
+     You (person)             STUDIES        Rust (skill)              0.95
+     the compiler pro (goal)  REQUIRES       Rust (skill)              0.85
+
+==> Asking about it in a different conversation
+  ok retrieved 1 graph source(s) in a fresh conversation, 1 cited
+     "You" (person) STUDIES "Rust" (skill) · confidence 0.95 ; …
 ```
 
 ```sh
@@ -151,9 +192,53 @@ ollama pull llama3.2:3b              # once
 make test-e2e
 ```
 
-A run against a cold model takes a few minutes: the first turn includes loading
-llama3.2:3b into memory, and since Phase 5 each substantial turn makes two model
-calls rather than one.
+A run against a cold model takes several minutes: the first turn includes
+loading llama3.2:3b into memory, and since Phase 6 each substantial turn makes
+*three* model calls rather than one — the answer, the memory extraction and the
+relationship extraction, in that order and in sequence, because they all queue
+behind the same resident model.
+
+### When the extraction steps come back empty
+
+This is the failure mode to know about, because it does not look like a
+failure. An extraction that misses its deadline is logged and dropped — that is
+the whole point of it not being able to break a turn — so a machine too slow
+for `MEMORY_EXTRACT_TIMEOUT` produces a green chat run and then an empty
+`/memories`, with nothing in the output saying why. The script now greps the
+API log and prints a hint when that is what happened.
+
+The defaults are 60 seconds each. One memory extraction against llama3.2:3b has
+been measured at **79 seconds** on a 2019 Intel Mac — producing perfectly good
+output, just not inside the budget. Both timeouts and the turn budget are
+passed through to the API, so raise all three together:
+
+```sh
+MEMORY_EXTRACT_TIMEOUT=240s GRAPH_EXTRACT_TIMEOUT=240s CHAT_TIMEOUT=16m \
+  ./scripts/e2e.sh
+```
+
+`CHAT_TIMEOUT` has to cover the whole turn *including* both extractions, and
+`config.Load` refuses to start a process where the extractions would take more
+than half of it — so raising one without the others is a boot error rather than
+a mystery.
+
+One other thing got slower rather than merely longer: the run holds a single
+access token from registration to the last assertion, and that span now
+routinely exceeds the 15-minute default `ACCESS_TOKEN_TTL`. The symptom is not
+a `401` in the output — it is a step failing to parse a response, because the
+script asked for `edge_count` and got an error body. The API is started with a
+two-hour TTL for the run (`E2E_ACCESS_TOKEN_TTL`), which is a property of the
+harness rather than of the product.
+
+The two extraction steps are also the ones that vary run to run, because what
+they assert is what a 3B model chose to write down. The memory step has been
+seen to fail when llama3.2:3b paraphrases the assistant's reply instead of the
+user's statement — storing "the user values productivity and time management"
+where the retrieval question needs "studies in the early morning", which then
+scores ~0.55 against a 0.6 floor and retrieves nothing. When one of these steps
+fails, read what `GET /memories` or `GET /knowledge-graph` actually holds before
+looking anywhere else: an extraction that stored the wrong thing and a pipeline
+that stored nothing look identical from the assertion.
 
 ## What the tests assert
 
@@ -336,3 +421,73 @@ Phase 5:
   as well as at the handler, and reports what it deleted;
 - deleting a conversation keeps the memories learned in it, with a NULL
   provenance; deleting a user takes them.
+
+Phase 6:
+
+- **cross-user isolation for the knowledge graph**, end to end and against real
+  SQL: user B gets `404` — not `403`, and not the `409` a mirrored node
+  normally earns — on reading and deleting every one of A's nodes and edges;
+  B's graph is empty; and A's node and edge counts are verified unchanged
+  afterwards, so a wrong status code cannot hide a delete that landed;
+- the part unique to this phase: B asking the assistant the question that
+  matches A's node label gets no graph source back — the mention scan is a
+  lookup over labels, and an unscoped one would hand B the shape of A's life
+  without ever naming an id;
+- the control that makes those non-vacuous, and the property the phase exists
+  for: a relationship stated in one conversation is extracted, and a
+  **different** conversation that names one end of it retrieves the
+  neighbourhood, cites it, and the excerpt carries the rendered triple;
+- **sync on write**, through the API and against real SQL: creating a task,
+  goal, note or document creates exactly one node, keyed to the row and
+  labelled with its title; renaming re-syncs rather than duplicating; a
+  rejected write syncs nothing; and a service built without the option behaves
+  exactly as it did before Phase 6;
+- **the delete trigger**, which is the one piece of this phase with no Go on its
+  path: deleting a parent task cascades to its subtasks in SQL, and *both*
+  nodes and the edges between them go — verified by a delete that the task
+  service is called once for and that removes two rows, and again by a
+  `DELETE FROM goals` issued straight to the database;
+- both unique indexes, as database properties rather than lucky interleavings:
+  syncing the same task twice is one node whose label follows the title, `"Go"`
+  and `"go"` are one node while a `person` and a `skill` both called Go are two,
+  and the same triple stated in two conversations is one edge that keeps the
+  higher confidence and the *first* conversation's provenance;
+- every CHECK constraint pinned separately: an unknown node type, an unknown
+  relationship, an unknown `ref_table`, half a reference (a table with no id or
+  an id with no table), a confidence outside `[0, 1]`, and a node related to
+  itself are all write errors rather than rows no client can render;
+- the 1-hop query answers in both directions with the far end joined in, orders
+  by confidence, and reports `incoming` consistently with the edge it describes
+  — direction is the difference between "the user STUDIES Go" and a claim
+  nobody made;
+- the graph read returns a **closed** subgraph: an edge with one endpoint
+  outside the returned nodes is not returned, so `?type=skill` comes back with
+  no dangling references;
+- the filters between the model and the tables each drop what they are for: a
+  low-confidence reading, a sentence used as an entity name, an entity named
+  only in the assistant's half of the exchange rather than the user's, and a
+  triple whose two ends resolve to the same node — and nothing rejected leaves a
+  node behind, because resolution happens after the gate;
+- the word-boundary rule in both places it matters: `"Go"` matches `"learning
+  Go"` and not `"going"`, `"Django"` or `"Golang"`, a first occurrence inside
+  another word does not hide a later real one, and a label under two characters
+  never matches at all;
+- entity resolution attaches to what the user already has: a conversation
+  naming "the backend project" links to the *goal* by that name rather than
+  creating a parallel node, and `"I"`, `"me"`, `"the user"` and `"you"` all
+  resolve to one person node;
+- the extraction parser accepts a bare array, a wrapper object, a single object,
+  a fenced or prose-prefixed one and the documented pipe fallback, caps the
+  count, deduplicates a triple restated in different case, clamps every score
+  into the column's CHECK range, keeps the relationship inside the allow-list,
+  cannot produce a mirrored node type, and invents nothing from prose;
+- extraction never fails a turn: a failing extractor leaves the answer
+  generated, streamed and stored, and the turn returns normally;
+- a nil graph and a nil extractor are each a no-op, so an assistant with the
+  phase switched off retrieves exactly what Phase 5 did;
+- a graph *retrieval* failure does fail the turn, and before the model is
+  called — answering "I found no connections" when the query errored is a false
+  statement about the user's data;
+- deleting an edge leaves both its nodes; deleting an extracted node takes its
+  edges; deleting a user takes both tables; and deleting the conversation an
+  edge came from keeps the edge with a NULL provenance.

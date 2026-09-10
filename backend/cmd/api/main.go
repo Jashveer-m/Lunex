@@ -20,6 +20,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -74,10 +75,6 @@ func run(logger *slog.Logger) error {
 	tokens := auth.NewTokenIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL)
 	service := auth.NewService(userRepo, sessionRepo, tokens, cfg.RefreshTokenTTL)
 
-	taskSvc := tasks.NewService(tasks.NewRepository(pool))
-	goalSvc := goals.NewService(goals.NewRepository(pool))
-	noteSvc := notes.NewService(notes.NewRepository(pool))
-
 	// The embedding client is built, not dialled: Ollama being down is a
 	// per-request failure that the document ends up recording, not a reason to
 	// refuse to serve tasks and notes.
@@ -85,7 +82,6 @@ func run(logger *slog.Logger) error {
 		cfg.EmbeddingDimensions, cfg.DocumentProcessTimeout)
 	logger.Info("embeddings configured",
 		"base_url", cfg.OllamaBaseURL, "model", embedder.Model(), "dimensions", embedder.Dimensions())
-	docSvc := documents.NewService(documents.NewRepository(pool), embedder, logger, cfg.DocumentProcessTimeout)
 
 	// Same story for the chat model: built, not dialled. Ollama being down
 	// makes a chat turn a 503; it does not stop the API serving tasks.
@@ -97,6 +93,32 @@ func run(logger *slog.Logger) error {
 	logger.Info("chat provider configured",
 		"base_url", cfg.OllamaBaseURL, "model", provider.Model(),
 		"min_similarity", cfg.ChatMinSimilarity)
+
+	// Phase 6's knowledge graph is built before the resources that write into
+	// it, because each of them takes it as a construction option: node sync is
+	// part of the write path rather than something bolted on after it. That
+	// ordering is the only reason the provider is created above rather than
+	// below -- the graph shares it, so a relationship is read out of a turn by
+	// the same kind of model that answered it.
+	graphSvc := graph.NewService(graph.Deps{
+		Store:    graph.NewRepository(pool),
+		Provider: provider,
+		Logger:   logger,
+		Options: graph.Options{
+			Model:       cfg.GraphModel,
+			Temperature: cfg.GraphTemperature,
+			MaxTokens:   cfg.GraphMaxTokens,
+			Timeout:     cfg.GraphExtractTimeout,
+			JSONMode:    cfg.GraphJSONMode,
+		},
+	})
+
+	taskSvc := tasks.NewService(tasks.NewRepository(pool), tasks.WithNodeSync(graphSvc))
+	goalSvc := goals.NewService(goals.NewRepository(pool), goals.WithNodeSync(graphSvc))
+	noteSvc := notes.NewService(notes.NewRepository(pool), notes.WithNodeSync(graphSvc))
+	docSvc := documents.NewService(documents.NewRepository(pool), embedder, logger,
+		cfg.DocumentProcessTimeout, documents.WithNodeSync(graphSvc))
+
 	// The memory system. It shares the chat provider and the embedder: a fact
 	// is extracted by the same kind of model that answered, and embedded by the
 	// same one that embedded the documents -- which it has to be, since both
@@ -126,6 +148,18 @@ func run(logger *slog.Logger) error {
 		"extraction", cfg.MemoryExtraction, "model", orElse(cfg.MemoryModel, provider.Model()),
 		"min_similarity", cfg.MemoryMinSimilarity, "extract_timeout", cfg.MemoryExtractTimeout)
 
+	// Phase 6 has the same switch on the same half, and for the same reason: a
+	// third model call per substantial turn. Switching it off leaves node sync
+	// and the 1-hop lookup running, so the assistant still uses the graph it
+	// has -- including the nodes every task and note keep writing into it.
+	var linker chat.GraphExtractor
+	if cfg.GraphExtraction {
+		linker = graphSvc
+	}
+	logger.Info("knowledge graph configured",
+		"extraction", cfg.GraphExtraction, "model", orElse(cfg.GraphModel, provider.Model()),
+		"extract_timeout", cfg.GraphExtractTimeout)
+
 	chatSvc := chat.NewService(chat.Deps{
 		Store:    chat.NewRepository(pool),
 		Provider: provider,
@@ -136,10 +170,13 @@ func run(logger *slog.Logger) error {
 		// Both halves of Phase 5, wired separately so either can be absent.
 		Memories:        memorySvc,
 		MemoryExtractor: extractor,
-		Tasks:           taskSvc,
-		Goals:           goalSvc,
-		Notes:           noteSvc,
-		Logger:          logger,
+		// Both halves of Phase 6, on the same terms.
+		Graph:          graphSvc,
+		GraphExtractor: linker,
+		Tasks:          taskSvc,
+		Goals:          goalSvc,
+		Notes:          noteSvc,
+		Logger:         logger,
 		Options: chat.Options{
 			Temperature:         cfg.ChatTemperature,
 			MaxTokens:           cfg.ChatMaxTokens,
@@ -156,6 +193,7 @@ func run(logger *slog.Logger) error {
 		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
 		Chat:        chat.NewHandler(chatSvc, logger),
 		Memories:    memories.NewHandler(memorySvc, logger),
+		Graph:       graph.NewHandler(graphSvc, logger),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(cfg.LoginRateLimit, cfg.LoginRateLimitBurst),
 		DB:          pool,

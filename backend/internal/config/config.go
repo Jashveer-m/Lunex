@@ -12,6 +12,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 )
 
@@ -38,11 +39,23 @@ type Config struct {
 
 	// Phase 4: the AI assistant.
 	ChatModel string
-	// ChatTimeout bounds one whole turn: retrieval, generation and the write.
+	// ChatTimeout bounds one whole turn: retrieval, generation, the write --
+	// *and* the memory and relationship extractions, which run on the turn's
+	// own context after it.
+	//
 	// A local 3B model answering from five retrieved chunks is tens of seconds
 	// of honest work, so it is far larger than the 30s the rest of the API
-	// gets -- and, like the document timeout, it also has to fit inside the
+	// gets, and, like the document timeout, it also has to fit inside the
 	// server's write timeout or the stream would be cut at the socket.
+	//
+	// The default grew from 3m to 4m in Phase 6, and that is not a round
+	// number picked for comfort. Phase 5 left 2 minutes for retrieval and
+	// generation after subtracting a 60s extraction. Phase 6 adds a second
+	// 60s extraction to the same budget, so keeping the same headroom means
+	// adding the same minute -- and not adding it is a turn that answers,
+	// persists, and *then* has its context cancelled out from under the
+	// end-of-stream frame, reported to the user as a failed answer that was in
+	// fact already saved. MinGenerationBudget below is the boot-time check.
 	ChatTimeout     time.Duration
 	ChatTemperature float64
 	ChatMaxTokens   int
@@ -77,7 +90,52 @@ type Config struct {
 	// MemoryMinSimilarity is the retrieval floor for memories, separate from
 	// the document floor and higher; see memories.DefaultMinSimilarity.
 	MemoryMinSimilarity float64
+
+	// Phase 6: the knowledge graph.
+	//
+	// GraphExtraction switches the *writing* half on and off, exactly as
+	// MemoryExtraction does and for the same reason: it is the half that costs
+	// a model call on every substantial turn. Node sync and the 1-hop lookup
+	// are always wired -- syncing a node is one upsert on a write the user
+	// already made, and an assistant that has a graph should use it.
+	GraphExtraction bool
+	// GraphModel overrides the chat model for relationship extraction. Empty
+	// means the same model answers and extracts.
+	GraphModel string
+	// GraphExtractTimeout bounds one relationship extraction. It is the second
+	// piece of latency the tail of a chat turn carries, after the memory
+	// extraction it runs behind, and both have to fit inside ChatTimeout since
+	// they run on the turn's own context.
+	GraphExtractTimeout time.Duration
+	GraphMaxTokens      int
+	GraphTemperature    float64
+	// GraphJSONMode asks the provider to constrain extraction to well-formed
+	// JSON. Off by default, for the reason memories.Options.JSONMode records.
+	GraphJSONMode bool
 }
+
+// DefaultChatTimeout is the budget for one whole turn; see Config.ChatTimeout
+// for why it grew from three minutes to five.
+const DefaultChatTimeout = 5 * time.Minute
+
+// MaxExtractionShare is how much of ChatTimeout the two extractions are allowed
+// to occupy between them. The rest is what retrieval and generation have.
+//
+// The rule is proportional rather than an absolute floor because the absolute
+// number is not knowable here: it is a property of the model, and an operator
+// on a hosted one may reasonably run the whole turn in thirty seconds. "The
+// answer gets at least as much of the budget as the bookkeeping after it" is
+// true at every scale.
+//
+// It exists because the failure it prevents looks like something else
+// entirely. The extractions run on the turn's own context, so an operator who
+// raises MEMORY_EXTRACT_TIMEOUT and GRAPH_EXTRACT_TIMEOUT without touching
+// CHAT_TIMEOUT does not get slower extraction -- they get turns that generate a
+// good answer, persist it, and then have the context cancelled under the
+// end-of-stream frame, which the client is shown as "the answer could not be
+// completed, and nothing was saved". Both halves of that are false, and the
+// answer is sitting in the database while the user reads it.
+const MaxExtractionShare = 0.5
 
 // WriteTimeout is how long the HTTP server will spend producing a response.
 //
@@ -89,7 +147,9 @@ func (c Config) WriteTimeout() time.Duration {
 	const base = 30 * time.Second
 	// The longest thing a single request can legitimately do, plus slack for
 	// writing the response. Chat streams for as long as the model generates,
-	// so it counts here alongside an upload.
+	// so it counts here alongside an upload. The memory and graph extractions
+	// run inside the chat turn's own budget, not after it, so they add nothing
+	// here.
 	longest := max(c.DocumentProcessTimeout, c.ChatTimeout)
 	if d := longest + 15*time.Second; d > base {
 		return d
@@ -123,6 +183,11 @@ func Load() (Config, error) {
 		MemoryMaxTokens:     memories.DefaultExtractionMaxTokens,
 		MemoryTemperature:   memories.DefaultExtractionTemperature,
 		MemoryMinSimilarity: memories.DefaultMinSimilarity,
+
+		GraphExtraction:  true,
+		GraphModel:       os.Getenv("GRAPH_MODEL"),
+		GraphMaxTokens:   graph.DefaultExtractionMaxTokens,
+		GraphTemperature: graph.DefaultExtractionTemperature,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -144,7 +209,7 @@ func Load() (Config, error) {
 	if cfg.DocumentProcessTimeout, err = durationOr("DOCUMENT_PROCESS_TIMEOUT", 2*time.Minute); err != nil {
 		return Config{}, err
 	}
-	if cfg.ChatTimeout, err = durationOr("CHAT_TIMEOUT", 3*time.Minute); err != nil {
+	if cfg.ChatTimeout, err = durationOr("CHAT_TIMEOUT", DefaultChatTimeout); err != nil {
 		return Config{}, err
 	}
 	if cfg.ChatTemperature, err = floatOr("CHAT_TEMPERATURE", cfg.ChatTemperature, 0, 2); err != nil {
@@ -169,6 +234,25 @@ func Load() (Config, error) {
 	}
 	if cfg.MemoryJSONMode, err = boolOr("MEMORY_JSON_MODE", cfg.MemoryJSONMode); err != nil {
 		return Config{}, err
+	}
+	if cfg.GraphExtractTimeout, err = durationOr("GRAPH_EXTRACT_TIMEOUT", graph.DefaultExtractionTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.GraphTemperature, err = floatOr("GRAPH_TEMPERATURE", cfg.GraphTemperature, 0, 2); err != nil {
+		return Config{}, err
+	}
+	if cfg.GraphExtraction, err = boolOr("GRAPH_EXTRACTION", cfg.GraphExtraction); err != nil {
+		return Config{}, err
+	}
+	if cfg.GraphJSONMode, err = boolOr("GRAPH_JSON_MODE", cfg.GraphJSONMode); err != nil {
+		return Config{}, err
+	}
+	if v := os.Getenv("GRAPH_MAX_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("GRAPH_MAX_TOKENS: want a positive integer, got %q", v)
+		}
+		cfg.GraphMaxTokens = n
 	}
 	if v := os.Getenv("MEMORY_MAX_TOKENS"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -203,6 +287,19 @@ func Load() (Config, error) {
 		}
 		cfg.MaxUploadBytes = n
 	}
+	// The extractions run inside the turn's budget, so they cannot be allowed
+	// to eat all of it. Refusing to boot rather than degrading is the same
+	// choice JWT_SECRET makes: the degraded version of this is a turn that
+	// answers correctly and reports itself as failed.
+	if tail := cfg.MemoryExtractTimeout + cfg.GraphExtractTimeout; tail > time.Duration(float64(cfg.ChatTimeout)*MaxExtractionShare) {
+		return Config{}, fmt.Errorf(
+			"CHAT_TIMEOUT (%s) leaves only %s for retrieval and generation after "+
+				"MEMORY_EXTRACT_TIMEOUT (%s) and GRAPH_EXTRACT_TIMEOUT (%s), which run "+
+				"inside it; raise CHAT_TIMEOUT to at least %s, or lower the extraction timeouts",
+			cfg.ChatTimeout, cfg.ChatTimeout-tail,
+			cfg.MemoryExtractTimeout, cfg.GraphExtractTimeout, 2*tail)
+	}
+
 	if v := os.Getenv("LOGIN_RATE_LIMIT_BURST"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {

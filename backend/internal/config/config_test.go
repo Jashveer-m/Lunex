@@ -83,8 +83,8 @@ func TestChatDefaults(t *testing.T) {
 	if cfg.ChatModel != ai.DefaultModel {
 		t.Fatalf("ChatModel = %q, want %q", cfg.ChatModel, ai.DefaultModel)
 	}
-	if cfg.ChatTimeout != 3*time.Minute {
-		t.Fatalf("ChatTimeout = %v, want 3m", cfg.ChatTimeout)
+	if cfg.ChatTimeout != DefaultChatTimeout {
+		t.Fatalf("ChatTimeout = %v, want %v", cfg.ChatTimeout, DefaultChatTimeout)
 	}
 	if cfg.ChatMinSimilarity != chat.DefaultMinSimilarity {
 		t.Fatalf("ChatMinSimilarity = %v, want %v", cfg.ChatMinSimilarity, chat.DefaultMinSimilarity)
@@ -124,7 +124,13 @@ func TestChatKnobsAreBounded(t *testing.T) {
 	t.Setenv("CHAT_TEMPERATURE", "0.7")
 	t.Setenv("CHAT_MIN_SIMILARITY", "0.65")
 	t.Setenv("CHAT_MAX_TOKENS", "2048")
+	// 90s used to be a valid whole-turn budget on its own. Since Phase 6 the
+	// turn also carries two extractions on the same context, so a budget this
+	// short has to bring them down with it; see
+	// TestChatTimeoutMustLeaveRoomToGenerate.
 	t.Setenv("CHAT_TIMEOUT", "90s")
+	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "20s")
+	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "20s")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +138,57 @@ func TestChatKnobsAreBounded(t *testing.T) {
 	if cfg.ChatTemperature != 0.7 || cfg.ChatMinSimilarity != 0.65 ||
 		cfg.ChatMaxTokens != 2048 || cfg.ChatTimeout != 90*time.Second {
 		t.Fatalf("cfg = %+v, want the values from the environment", cfg)
+	}
+}
+
+// The extractions run on the turn's own context, so raising their timeouts
+// without raising the turn's does not buy slower extraction -- it buys turns
+// that answer, persist, and then fail at the end-of-stream frame, reported to
+// the user as an answer that could not be completed and was not saved. Both
+// halves of that message would be false.
+//
+// The default configuration has to satisfy the rule, which is the other half
+// of what this pins: it is why DefaultChatTimeout is four minutes.
+func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
+	t.Setenv("JWT_SECRET", validSecret)
+
+	defaults, err := Load()
+	if err != nil {
+		t.Fatalf("the default configuration does not satisfy its own rule: %v", err)
+	}
+	tail := defaults.MemoryExtractTimeout + defaults.GraphExtractTimeout
+	if left := defaults.ChatTimeout - tail; left < tail {
+		t.Fatalf("the defaults leave %s for generation against %s of extraction", left, tail)
+	}
+
+	for _, tc := range []struct{ name, chat, mem, graph string }{
+		{"the extractions eat the whole budget", "2m", "60s", "60s"},
+		{"one extraction raised without the turn", "4m", "60s", "3m"},
+		{"a turn budget lowered under its own tail", "1m", "60s", "60s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CHAT_TIMEOUT", tc.chat)
+			t.Setenv("MEMORY_EXTRACT_TIMEOUT", tc.mem)
+			t.Setenv("GRAPH_EXTRACT_TIMEOUT", tc.graph)
+			_, err := Load()
+			if err == nil {
+				t.Fatal("a budget with no room to generate was accepted")
+			}
+			if !strings.Contains(err.Error(), "CHAT_TIMEOUT") {
+				t.Fatalf("err = %v, want it to name CHAT_TIMEOUT", err)
+			}
+		})
+	}
+
+	// Lowering the extractions to match is the other way out, and it works --
+	// which is what makes the rule a coherence check rather than a floor under
+	// how fast an operator's model is allowed to be.
+	t.Setenv("CHAT_TIMEOUT", "30s")
+	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "5s")
+	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "5s")
+	if _, err := Load(); err != nil {
+		t.Fatalf("a budget that does leave room was refused: %v", err)
 	}
 }
 

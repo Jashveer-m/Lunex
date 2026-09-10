@@ -892,3 +892,428 @@ The pipeline is sound and the model is small. It misses facts, occasionally
 keeps a marginal one, and is influenced by what the assistant said as well as by
 what the user said. `MEMORY_MODEL` points extraction at a different model
 without touching anything else, and that is the intended fix.
+
+# Phase 6 decisions
+
+## Node sync happens inline on write, not lazily on read
+
+Creating a task creates its graph node in the same request, through a one-method
+`NodeSyncer` interface each resource module declares for itself. The brief named
+the alternative — compute nodes lazily on the first graph query — and it was
+rejected for three reasons.
+
+It is consistent with everything else here. Nothing in this codebase defers work
+to a later read: documents are extracted, chunked and embedded inside the
+upload, memories are extracted inside the chat turn. A lazily-materialised graph
+would be the only place where reading changes the database.
+
+It keeps the read honest. Lazy population means the first `GET
+/knowledge-graph` after any write does a scan of four tables and a batch insert,
+so the endpoint's cost depends on how much has happened since it was last
+called — and the *extraction* path would need the same backfill before it could
+match a name against an existing node, because a conversation is not a graph
+read. Both paths would end up calling the same reconcile function, and then
+there is no laziness left, only a worse place to trigger it from.
+
+And it makes the failure visible. An upsert on the resource's own request either
+works or logs a warning next to the write that caused it. A reconcile pass that
+silently misses a table is a graph that is quietly incomplete, which is the
+failure mode that matters least when the graph is small and most when it is not.
+
+The cost is that each of the four modules gains a dependency it did not have.
+That is paid for by keeping it a locally-declared one-method interface — the
+same pattern `internal/chat` uses for the searchers it consumes — so
+`internal/tasks` still does not import `internal/graph`, and a service built
+without the option is byte-for-byte the Phase 2 behaviour.
+
+## `SyncNode` returns no error
+
+It runs *after* the row is committed. There is nothing useful for the caller to
+do with a failure: returning an error would report a task that exists as
+failed, and undoing the write would throw away what the user asked for to
+protect an index derived from it. So the graph logs its own failures, and the
+resource module gets an interface it cannot misuse.
+
+The repair is the update path. Sync runs on every update as well as every
+create — it has to, so a renamed task's node does not keep matching on a name
+the user has stopped using — which means the next edit fixes a create whose sync
+was lost. There is no backfill for rows written before this phase; see
+**deferred** below.
+
+## Deleting a node is a trigger, not application code
+
+The brief said a deleted task's node should go "automatically via FK". It cannot:
+`ref_id` names four different tables, so there is no foreign key to hang a
+cascade on. That is a real gap in the specified schema rather than a detail, and
+it needed a decision rather than a silent omission.
+
+The schema stayed as specified — `ref_table` + `ref_id`, which is what makes the
+node table one table and the graph queries uniform — and the deletion moved into
+an `AFTER DELETE` trigger on each of the four tables, sharing one function.
+
+A trigger rather than a `DropNode` call from each service, because a row can
+leave by routes the service never sees. Deleting a parent task cascades to its
+subtasks in SQL: `tasks.Service.Delete` is called once and four rows go. A
+`DELETE FROM users` takes everything. A future bulk operation, a `psql` session,
+a repair script — none of them are on a path anybody would remember to wire. A
+trigger fires on cascaded deletes too, which is exactly the case that would
+otherwise leave orphan nodes pointing at rows that no longer exist.
+
+The alternative that *would* have given a real foreign key is four nullable
+columns — `task_id`, `goal_id`, `note_id`, `document_id` — with a `CHECK` that
+at most one is set. It was rejected: it makes every query on the node's
+provenance a four-way `COALESCE`, it makes adding a fifth mirrored type a
+migration on a table with data, and it trades a clear polymorphic pair for four
+columns that are three-quarters `NULL` on every row.
+
+## Entity matching is exact and case-insensitive, not fuzzy
+
+Two mentions of a name are the same node when their labels match after trimming,
+collapsing internal whitespace, stripping surrounding quotes and punctuation,
+and folding case. Nothing more.
+
+Nodes carry no embeddings this phase, so "fuzzy" here means edit distance or
+trigrams, and both merge names that are genuinely different: Go and Godot, Alice
+and Alicia, "OS coursework" and "OS homework". The asymmetry is what decides it.
+A duplicate node is visible, harmless and deletable. A wrong merge does not lose
+a distinction — it **invents relationships**, handing Godot every edge Go has and
+then feeding them back into later prompts as things the assistant knows about
+the user. One failure is untidy; the other is a fabrication that reads exactly
+like a fact.
+
+Case folding and whitespace collapsing are kept because they catch the
+duplication that actually happens: the same model writes "Go" in one turn and
+"go" in the next. The stored label keeps its case — it is what a client displays
+— and only the comparison folds, in SQL (`lower(label)`) and in Go
+(`FoldLabel`), which is the same rule said in the two places it has to be said.
+
+The matching looks at *every* node the user has, not only the extracted ones.
+That is the point of it: a conversation about "the backend project" should
+attach its edge to the goal the user already has by that name, so asking about
+it later reaches the real record. When several nodes share a label, a type match
+wins and the oldest node wins after that — a name the user already has a record
+for is more likely to be that record than a new entity spelled the same way.
+
+The upgrade path is node embeddings, where a merge can be proposed with a score
+instead of guessed at with a string metric. That is a phase with a UI for
+confirming merges, which this one is not.
+
+## Relationship extraction is a separate model call from memory extraction
+
+The brief offered combining them. They are two calls.
+
+The outputs are different shapes with different failure modes. Memory extraction
+asks for sentences about a person; relationship extraction asks for typed
+triples over two closed vocabularies. Asked for both in one reply, llama3.2:3b
+does one of them well and the other badly — the same behaviour that made JSON
+mode counterproductive in Phase 5 — and the two are then indistinguishable in
+the parser, so a bad half cannot be dropped without dropping the good one.
+
+They are independently switchable, which is the pattern Phase 5 established when
+it split `MemorySearcher` from `MemoryExtractor`. `MEMORY_EXTRACTION=false` with
+`GRAPH_EXTRACTION=true` is an assistant that maps how your work connects without
+recording facts about you. That is a coherent thing to want, and one call cannot
+offer it.
+
+And a failure in one does not lose the other.
+
+The cost is stated rather than hidden: a substantial turn now makes **three**
+model calls, and the tail of the turn is roughly twice as long as it was in
+Phase 5. `GRAPH_EXTRACTION=false` removes it, `GRAPH_MODEL` points it at a
+smaller model, and `GRAPH_EXTRACT_TIMEOUT` bounds it.
+
+## The two extractions run in sequence, not concurrently
+
+They both go to the same Ollama, which holds one model resident and serves
+requests to it in sequence. Running them concurrently would not halve the wait;
+it would put two entries in the same queue and make the turn's tail latency
+harder to reason about, for nothing. On a deployment with two model servers, or
+a hosted provider, that arithmetic changes — and `chat.Service.link` is the
+function that would change with it.
+
+## The turn's budget grew, and the process now refuses an incoherent one
+
+`CHAT_TIMEOUT` defaults to 5 minutes rather than 3, and the process will not
+start if `MEMORY_EXTRACT_TIMEOUT + GRAPH_EXTRACT_TIMEOUT` exceeds half of it.
+
+Both come out of running the end-to-end script rather than out of reasoning.
+The extractions run on the *turn's* context — that is Phase 5's decision, so a
+client that hangs up cancels them — which means they spend the same budget the
+answer does. Phase 5's arithmetic was 3 minutes minus one 60s extraction, so
+two minutes for retrieval and generation. Phase 6 added a second 60s extraction
+to the same budget without moving it, and quietly halved what the answer had.
+
+On a machine where llama3.2:3b takes a while, that tips over, and the failure
+is worse than slow. The turn generates a good answer, streams it, and persists
+it — all before the extractions run — and then the deadline expires under the
+end-of-stream frame. `SendMessage` returns `context.DeadlineExceeded`, which is
+neither `ai.ErrUnavailable` nor an embedding failure, so `Unavailable` says no
+and the client is told: *"The answer could not be completed, and nothing was
+saved. Send the message again."* Both halves are false. The answer is complete
+and it is in the database, and the user has just read it on their screen.
+
+So the default moved to leave the answer three of the five minutes, and the
+coherence check went into `config.Load` next to the `JWT_SECRET` one, on the
+same principle: refuse to boot rather than degrade. The rule is proportional
+rather than an absolute floor because the absolute number is a property of the
+model — an operator on a hosted one may reasonably run the whole turn in thirty
+seconds, and `CHAT_TIMEOUT=30s` with 5s extractions passes.
+
+The narrower fix — reporting a deadline that expires *after* persistence as a
+success — is a real improvement and is not in this phase. It would mean
+`SendMessage` distinguishing "failed" from "finished, then the clock ran out",
+which is a change to the Phase 4 orchestrator's error contract rather than to
+anything Phase 6 owns.
+
+## The confidence floor is 0.5, not the memory system's 0.4
+
+A memory is filtered on two scores: the model's confidence that it read the fact,
+and its importance. The measured behaviour of llama3.2:3b is that the worthless
+extractions are the ones it scores low on *importance* while remaining perfectly
+confident about them, so both filters earn their place.
+
+An edge has one score. The schema gives a relationship no importance column —
+"how important is it that Go relates to the backend project" is not a question
+with an answer — so the confidence floor is carrying the weight of both filters
+and is raised to compensate.
+
+The neutral default for an omitted or unreadable score sits exactly *on* the
+floor, at 0.5. So a relationship the model did not score is admitted, and one it
+scored 0.3 is not. Dropping unscored relationships would look more principled
+and would in practice mean that a model which simply does not emit the field
+extracts nothing at all, silently. An omitted score is a model that did not
+answer the question; only a low score is evidence against.
+
+## The length threshold is the same constant, referenced not copied
+
+`graph.MinExtractionChars` is `memories.MinExtractionChars`. The two gate on the
+same measurement of the same input for the same reason, and an alias makes that
+a compile-time fact rather than two constants that drift. If a later phase finds
+that relationships need more text than facts do — they name two entities, not
+one — that is the line that splits, and the reason will be written there.
+
+## The user is an ordinary `person` node
+
+Most of what a conversation states is a relationship the user is one end of, so
+the graph needs a node for them. It is an extracted `person` node labelled
+**You**, created the first time an extraction refers to the user, listed and
+traversed and deletable like any other. The only thing special about it is that
+"I", "me", "myself", "the user" and "you" all resolve to it — which is what stops
+one person becoming five.
+
+A dedicated column or a reserved id was considered and rejected: it would make
+every query special-case a row, to buy nothing the alias table does not already
+give.
+
+## Extraction cannot create a mirrored node type
+
+`NormalizeNodeType` can only ever return `skill`, `person` or `project`. A model
+that writes `"type": "task"` gets `project`.
+
+A node claiming to be a task while carrying no `ref_table` would be a node that
+says it mirrors a row and does not — invisible to sync, undeletable through the
+API (the delete rule refuses backed types by `ref_table`, but a client reading
+`type` would show no delete button), and wrong in the one field a client
+branches on. Mirrored nodes come from writes. Conversations cannot name one into
+existence.
+
+## Entity names must come from the user's half of the exchange
+
+`GroundedInMessage` requires at least one significant word of each entity name
+to appear in the *user's* message, as a whole word. The user themselves is
+always grounded, whatever pronoun they used.
+
+This is the graph's counterpart to `memories.AboutTheUser`, and it was added
+because of a failure that only appeared when the thing was actually run.
+Handed a turn where the assistant had quoted the user's own field notes back at
+them, llama3.2:3b returned `aurora borealis`, `tundra` and `field notes from 14
+March` as the entities, wired them into confident relationships, and stored
+them as things it knew about the user's life. Every one passes `Nameable` —
+they are perfectly good names. They are simply not what the exchange was about,
+and the graph would then have matched a later question mentioning "the tundra"
+and offered the model a neighbourhood built entirely out of its own retrieval.
+
+The extraction prompt already says to read the exchange and not the context, in
+the same words the memory prompt uses. This is the enforcement, because a
+prompt is a request and a filter is a guarantee.
+
+The test is loose on purpose — one word of the label, at least two characters,
+not a stop word, matched on a word boundary. That admits "the systems
+programming coursework" against "this term's systems programming coursework is
+in Rust", where no substring match exists. The two-character floor is not a free
+choice: it is `MinMentionLen`, and the tests caught a three-character floor
+silently discarding every relationship about **Go**, which is the canonical
+entity of the entire phase. Short function words are excluded by name instead.
+
+The cost: a relationship where the user said "it" and the assistant supplied
+the name is lost. That is the trade — a wrong edge is fed back into later
+prompts as a fact, and a missing one is restated the next time the user
+mentions the thing.
+
+## An unknown relationship becomes `RELATED_TO`
+
+Same reasoning as `memories.normalizeType` falling back to `semantic`. The pair
+is the finding; the label on the arrow is a facet. "The user and the compiler
+project are connected somehow" is true and useful; discarding it because the
+model wrote `USES` costs the connection itself. The entity *type*, when the
+model omits it, is guessed from the relationship rather than from a constant —
+`STUDIES` points at something learnable, `WORKS_ON` at work.
+
+## Chat retrieval is a mention lookup, and nothing more
+
+If the question names a node — as a whole word, case-insensitively — that node's
+1-hop neighbourhood joins the context. That is the entire integration.
+
+The prefilter is a substring match in SQL (`position(lower(label) in
+lower($1)) > 0`) and the word-boundary test is applied in Go. Doing the boundary
+test in SQL would mean building a regular expression out of a user-supplied
+label, which is an injection into the pattern language rather than into the
+statement, and Postgres has no quoting function for it. So SQL narrows and Go
+decides.
+
+The boundary test is not optional: without it "Go" matches "going",
+"algorithm" and "Django", and the graph fires on every second message. It costs
+the near-miss on "Golang", which is a name a user can have their own node for.
+
+Graph sources rank after memories and before the task/goal/note heuristic. They
+fire on a real mention, which makes them targeted rather than background — but
+what they carry is a set of links, not a claim in the user's own words.
+
+The **self node never matches a mention**, and that is a correctness rule
+rather than a tuning choice — one found by running the thing rather than by
+reading it. Its label is "You", and in a message written by the user the word
+"you" means the *assistant*: "can you check my deadlines" is not the user
+naming themselves. So the node the scan would fire on most often is the one it
+would be wrong about every time, and it would fire on nearly every turn, which
+is not what "the question named something" is supposed to mean. Matching it on
+first-person pronouns instead is no better — "I" and "my" are in most messages
+too. What the user is like is what the memory system retrieves; what a *named
+thing* connects to is what this does. The self node is still perfectly visible
+on the far end of any edge that is returned.
+
+A node with no edges is skipped rather than returned. The task it mirrors is
+already reachable through the task list, and an isolated extracted node is a
+name with no claim attached; spending a source on it would displace one that
+carries something.
+
+## A graph source carries links, not details
+
+The brief's example ends "…and that goal's deadline". The node does not have the
+deadline, and it deliberately does not go and fetch it: that would make the
+graph a second, worse path to the goals table.
+
+Instead a mirrored node names the record it stands for (`this is the goal
+<uuid>`), and the goal's own retrieval path supplies the deadline — active goals
+are already in the context. When the goal is not in that top-5, the deadline is
+not there. That is a real limit and it is the right trade for a phase that is
+supposed to add a lookup, not a join planner.
+
+The system prompt gained a rule for it (rule 7). A graph source is the one thing
+in the context that is not a claim in the user's own words, and without the rule
+a 3B model reads a rendered triple as a sentence it may quote back as fact.
+
+## The graph read returns a closed subgraph
+
+`GET /knowledge-graph` returns the edges whose **both** endpoints are among the
+nodes it returned — not the edges incident to them. A client drawing the result
+needs every edge to have two nodes it was also given, and `?type=skill` would
+otherwise come back full of references to projects it was not sent.
+
+The visible consequence is that `?type=skill` usually returns zero edges, since
+a skill's links point at projects and people. That is correct: it is the
+subgraph of skills, and skills are rarely connected to each other.
+
+## Deleting a mirrored node is `409`, not `400` or `404`
+
+The node exists, the caller owns it, and nothing about the request is malformed
+— the resource is in a state that forbids the operation, which is what `409`
+means. The message names what to delete instead.
+
+Somebody else's mirrored node is still `404`: answering `409` there would
+confirm the id is real, which is the property every other endpoint in this API
+is careful about.
+
+## The same relationship twice is one edge
+
+A unique index on `(user_id, from_node_id, to_node_id, relationship)`, and an
+upsert that keeps the higher confidence. Without it the graph grows a parallel
+edge every time the user mentions the same pair again, and the 1-hop lookup
+hands the model the same line five times.
+
+`source_conversation_id` keeps the *first* conversation rather than the latest.
+The column records where the assistant learned this; overwriting it would make
+the earliest evidence unfindable.
+
+## Deleting an edge is not a suppression list
+
+A later conversation that states the same relationship recreates it. Deleting an
+edge says "this is wrong", not "never record this". A real suppression list is a
+table of negative assertions and a prompt that respects them, which is more
+machinery than a phase with no UI can justify.
+
+# Phase 6 — explicitly deferred
+
+## 21. No backfill for rows written before this phase
+
+A task created in Phase 2 has no node until it is next updated. Sync is
+idempotent and runs on update, so the graph fills in as things are touched, but
+nothing walks the four tables on startup. A migration that did it would have to
+be re-run for every future mirrored type; a startup pass would make boot time
+depend on table size. The reconcile job belongs with the job queue.
+
+## 22. No multi-hop anything
+
+One hop, in the API and in retrieval. No shortest path, no centrality, no
+community detection, no "how are these two things related". The chat
+integration is a lookup, not reasoning over structure.
+
+## 23. Extraction sees one turn, not the conversation
+
+Inherited from Phase 5 and true for the same reason: the extractor is never
+shown two turns at once, so a relationship stated across three of them is not
+assembled.
+
+## 24. Nothing decays, merges or contradicts
+
+Edges accumulate. Nothing notices that "the user STUDIES Go" should become
+"KNOWS" eventually, nothing merges two nodes a human would call the same thing,
+and nothing detects that a new edge contradicts an existing one. Confidence is
+recorded and never re-estimated.
+
+## 25. The per-turn cap is applied before the quality gate
+
+`MaxRelationshipsPerTurn` is enforced in `ParseExtraction`, so a reply whose
+first three relationships are all junk yields nothing even if its fourth was
+good. This matches `memories.MaxFactsPerTurn`, which is why it was left alone
+rather than "fixed" into a divergence — but it is a real limitation, and the
+better order is parse to a hard ceiling, gate, then cap. It is a two-line change
+in both packages when somebody makes it in both.
+
+## 26. "Asked about" and "stated about" are told apart by the prompt only
+
+The extraction prompt says it outright — *"The user asking a question about
+something does not connect them to it"* — and nothing enforces it. A user who
+asks "what do my field notes say about the tundra?" has named the tundra, so
+`GroundedInMessage` admits it, and only the model's judgement stops
+`(You)-[INTERESTED_IN]->(the tundra)` being recorded.
+
+The grounding filter is not the place to fix it: its job is to stop entities
+from the *retrieved context* becoming nodes, and it does that — "aurora
+borealis", which appeared only in the assistant's reply, is rejected. Telling a
+question apart from a statement is a semantic judgement, and the honest options
+are a better model or a second classifying pass, neither of which belongs in
+this phase.
+
+## 27. The thresholds were reasoned, not swept
+
+0.5 for the confidence floor, 8 words for an entity name, 3 relationships per
+turn, 3 mentioned nodes per question, 25 neighbours per node. Every one is a
+defensible number with a knob or a constant on it, not a measured optimum.
+Nobody has run a labelled set through any of them.
+
+## 28. Extraction quality is a 3B model's quality
+
+The pipeline is sound and the model is small. It misses relationships, states
+some in the wrong direction, and reaches for `RELATED_TO` when a specific
+relationship was available. `GRAPH_MODEL` points extraction at a different model
+without touching anything else, and that is the intended fix.

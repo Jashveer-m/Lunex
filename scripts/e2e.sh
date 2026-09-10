@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end check for the Phase 3 retrieval pipeline, the Phase 4 assistant
-# and the Phase 5 memory system.
+# End-to-end check for the Phase 3 retrieval pipeline, the Phase 4 assistant,
+# the Phase 5 memory system and the Phase 6 knowledge graph.
 #
 # Boots the API against TEST_DATABASE_URL, registers a user, uploads a small
 # text file, searches for a phrase from it, then asks the assistant two
@@ -12,6 +12,12 @@
 # whose answer must retrieve and cite that memory -- followed by switching the
 # memory off and watching the assistant stop using it.
 #
+# Then the graph check: create a task and confirm its node appeared; state a
+# relationship between two things in one conversation and confirm the edge was
+# extracted; ask about one end of it in a *new* conversation and confirm the
+# graph context surfaces; and confirm the delete rules -- a mirrored node is
+# refused, an extracted one is not, and deleting the task takes its node.
+#
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
 # generation, real extraction.
 #
@@ -19,6 +25,27 @@
 #
 # Requires: a Postgres with the `vector` extension available, and Ollama
 # serving nomic-embed-text and llama3.2:3b.
+#
+# On a slow machine the two extractions are what fails first, and they fail
+# silently -- an extraction that misses its deadline is logged and dropped, so
+# the symptom is an empty /memories or an empty graph rather than an error. One
+# extraction against llama3.2:3b has been measured at 79s on a 2019 Intel Mac,
+# against a 60s default. Raise the budgets if the extraction steps come back
+# empty; they are passed through to the API:
+#
+#   MEMORY_EXTRACT_TIMEOUT=180s GRAPH_EXTRACT_TIMEOUT=180s CHAT_TIMEOUT=12m \
+#     ./scripts/e2e.sh
+#
+# CHAT_TIMEOUT has to cover the whole turn including both extractions, and the
+# API refuses to start if it does not leave them room -- so raise all three
+# together or none.
+#
+# The run also holds one access token from registration to the last assertion,
+# and since Phase 6 that span routinely exceeds the 15-minute default TTL --
+# which shows up as a step failing to parse a response that is in fact a clean
+# 401. The API is started with a 2h TTL for that reason, overridable with
+# E2E_ACCESS_TOKEN_TTL. Refreshing mid-run would be the other fix and would
+# make every later assertion depend on the refresh path working.
 set -euo pipefail
 
 DB="${TEST_DATABASE_URL:-postgres://postgres@localhost:5432/lunex_test?sslmode=disable}"
@@ -33,6 +60,22 @@ ok()   { printf '  \033[32mok\033[0m %s\n' "$1"; }
 
 # jq is not assumed; python3 is already required by the README's examples.
 json() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
+
+# expect <what> <body> <expression> -- read one field out of a JSON body, and
+# fail with the body itself when it is not there.
+#
+# Without this, a response that is valid JSON of the wrong shape -- a 401 after
+# a long run, a 500, a validation error -- surfaces as a Python KeyError
+# traceback with the body nowhere in the output, which says nothing about what
+# actually went wrong. Every assertion below that reaches into a response goes
+# through it.
+expect() {
+  local what="$1" body="$2" expr="$3" out
+  if ! out=$(printf '%s' "${body}" | python3 -c "import sys,json;d=json.load(sys.stdin);print(${expr})" 2>/dev/null); then
+    fail "${what}: the response was not what this expects -- ${body:-<empty>}"
+  fi
+  printf '%s' "${out}"
+}
 
 step "Preflight"
 curl -sf --max-time 5 "${OLLAMA}/api/version" >/dev/null \
@@ -60,8 +103,12 @@ LOG="$(mktemp)"
   DATABASE_URL="${DB}" \
   JWT_SECRET="e2e-secret-that-is-comfortably-over-32-bytes-long" \
   PORT="${PORT}" \
+  ACCESS_TOKEN_TTL="${E2E_ACCESS_TOKEN_TTL:-2h}" \
   OLLAMA_BASE_URL="${OLLAMA}" \
   CHAT_MODEL="${CHAT_MODEL}" \
+  CHAT_TIMEOUT="${CHAT_TIMEOUT:-}" \
+  MEMORY_EXTRACT_TIMEOUT="${MEMORY_EXTRACT_TIMEOUT:-}" \
+  GRAPH_EXTRACT_TIMEOUT="${GRAPH_EXTRACT_TIMEOUT:-}" \
   go run ./cmd/api >"${LOG}" 2>&1) &
 API_PID=$!
 trap 'kill "${API_PID}" 2>/dev/null || true; wait "${API_PID}" 2>/dev/null || true' EXIT
@@ -129,12 +176,19 @@ sse() { python3 - "$1" "$2" <<'PYEOF'
 import sys, json
 path, want = sys.argv[1], sys.argv[2]
 events, name = [], None
-for line in open(path):
-    line = line.rstrip("\n")
+raw = open(path).read()
+for line in raw.split("\n"):
+    line = line.rstrip("\r")
     if line.startswith("event: "):
         name = line[7:]
     elif line.startswith("data: "):
         events.append((name, json.loads(line[6:])))
+if not events:
+    # Not a stream at all: the request was refused before the first frame, so
+    # the body is an ordinary JSON error and it is the only thing that says
+    # why. Without this the caller sees an empty answer and a -1 source count
+    # and has nothing to go on.
+    sys.exit("the request produced no stream: %s" % (raw.strip()[:400] or "<empty response>"))
 by = lambda n: next((d for k, d in events if k == n), None)
 answer = "".join(d["text"] for k, d in events if k == "token")
 done, err, srcs = by("done"), by("error"), by("sources")
@@ -142,6 +196,7 @@ if err:
     sys.exit("stream failed: %s" % err)
 sources = (done or {}).get("message", {}).get("sources", [])
 memories = [s for s in sources if s["type"] == "memory"]
+graph = [s for s in sources if s["type"] == "graph"]
 out = {
     "answer": answer,
     "source_count": len(sources),
@@ -158,6 +213,15 @@ out = {
     "memories_cited": len([s for s in memories if s["cited"]]),
     "remembered": " | ".join(m["content"] for m in (done or {}).get("remembered", [])),
     "remembered_count": len((done or {}).get("remembered", [])),
+    # Phase 6: what was retrieved from the graph, what of it the answer used,
+    # and what the turn itself added to the graph.
+    "graph_count": len(graph),
+    "graph": " | ".join(s["excerpt"].replace("\n", " ; ") for s in graph),
+    "graph_titles": ",".join(s["title"] for s in graph),
+    "graph_cited": len([s for s in graph if s["cited"]]),
+    "linked": " | ".join("%s -%s-> %s" % (l["from_node_id"][:8], l["relationship"], l["to_node_id"][:8])
+                         for l in (done or {}).get("linked", [])),
+    "linked_count": len((done or {}).get("linked", [])),
 }
 print(out[want])
 PYEOF
@@ -254,9 +318,12 @@ printf '     %s\n' "$(sse "${STATING}" answer | tr '\n' ' ' | head -c 200)"
 
 step "Checking what was extracted"
 MEMS=$(curl -s "${API}/api/v1/memories" -H "${AUTH}")
-MEM_COUNT=$(echo "${MEMS}" | json 'd["count"]')
-[ "${MEM_COUNT}" -ge 1 ] \
-  || fail "nothing was extracted from an exchange stating a durable fact: ${MEMS}"
+MEM_COUNT=$(expect "listing memories" "${MEMS}" 'd["count"]')
+[ "${MEM_COUNT}" -ge 1 ] || {
+  grep -q "extraction failed" "${LOG}" && \
+    printf '  \033[33mhint\033[0m the extraction missed its deadline; raise MEMORY_EXTRACT_TIMEOUT (see the header of this script)\n' >&2
+  fail "nothing was extracted from an exchange stating a durable fact: ${MEMS}"
+}
 
 echo "${MEMS}" | json '" | ".join(m["content"] for m in d["memories"])' | grep -qi "morning\|rust\|stud" \
   || fail "the extracted memories are not about what was said: $(echo "${MEMS}" | json 'd["memories"]')"
@@ -303,6 +370,13 @@ printf '     %s\n' "$(sse "${RECALL}" memories | head -c 200)"
 printf '     %s\n' "$(echo "${RECALL_ANSWER}" | tr '\n' ' ' | head -c 260)"
 
 step "Switching the memories off"
+# Re-read the list first. The recall turn above was itself a substantial
+# exchange, so extraction ran on it too and may have stored another memory --
+# and disabling the snapshot taken before it would leave that one live, which
+# looks exactly like a disabled memory still being retrieved.
+MEMS=$(curl -s "${API}/api/v1/memories" -H "${AUTH}")
+MEM_COUNT=$(echo "${MEMS}" | json 'd["count"]')
+
 # All of them, so the assertion below can be "nothing was retrieved" rather
 # than "the one I disabled was missing from a list of several".
 for id in $(echo "${MEMS}" | json '" ".join(m["id"] for m in d["memories"])'); do
@@ -339,6 +413,222 @@ DELETED=$(curl -s -X DELETE "${API}/api/v1/memories" -H "${AUTH}" \
   || fail "memories survived a confirmed clear"
 ok "confirmed clear removed all ${DELETED}"
 
+# --- Phase 6: the knowledge graph -------------------------------------------
+#
+# Three properties, in the order the brief names them: a created task has a
+# node; a conversation that states a relationship grows an edge; and a *new*
+# conversation that names one end of that edge is handed the connection.
+
+step "Creating a task and checking its node exists"
+TASK_ID=$(curl -s -X POST "${API}/api/v1/tasks" -H "${AUTH}" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Finish the compiler project","priority":"high","status":"in_progress"}' \
+  | json 'd["id"]')
+[ -n "${TASK_ID}" ] || fail "the task was not created"
+
+GRAPH=$(curl -s "${API}/api/v1/knowledge-graph" -H "${AUTH}")
+expect "reading the graph" "${GRAPH}" 'd["node_count"]' >/dev/null
+echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+task_id = sys.argv[1]
+nodes = [n for n in d["nodes"] if n["ref_table"] == "tasks" and n["ref_id"] == task_id]
+assert len(nodes) == 1, "the task has %d nodes, want 1: %s" % (len(nodes), d["nodes"])
+n = nodes[0]
+assert n["type"] == "task", "node type is %r" % n["type"]
+assert n["label"] == "Finish the compiler project", "node label is %r" % n["label"]
+assert n["extracted"] is False, "a synced node reports itself as extracted"
+' "${TASK_ID}" || fail "the task did not get a graph node: ${GRAPH}"
+
+# The document uploaded earlier is mirrored too -- sync is not a task-only path.
+echo "${GRAPH}" | json '",".join(n["ref_table"] or "" for n in d["nodes"])' | grep -q documents \
+  || fail "the uploaded document has no node: ${GRAPH}"
+ok "the task and the document each have exactly one node"
+
+step "Renaming the task and checking the node follows"
+curl -s -o /dev/null -X PATCH "${API}/api/v1/tasks/${TASK_ID}" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{"title":"Finish the Lunex compiler project"}'
+GRAPH=$(curl -s "${API}/api/v1/knowledge-graph" -H "${AUTH}")
+expect "reading the graph after the rename" "${GRAPH}" 'd["node_count"]' >/dev/null
+echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+task_id = sys.argv[1]
+nodes = [n for n in d["nodes"] if n["ref_id"] == task_id]
+assert len(nodes) == 1, "renaming made %d nodes" % len(nodes)
+assert nodes[0]["label"] == "Finish the Lunex compiler project", "label is %r" % nodes[0]["label"]
+' "${TASK_ID}" || fail "the node did not follow the rename: ${GRAPH}"
+ok "one node, carrying the new title"
+
+step "Stating a relationship in a conversation"
+# A goal by the name the conversation will use, so the extracted entity has an
+# existing node to resolve onto rather than making a parallel one. This is the
+# entity-matching property, checked below.
+GOAL_ID=$(curl -s -X POST "${API}/api/v1/goals" -H "${AUTH}" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"the compiler project","type":"project"}' | json 'd["id"]')
+[ -n "${GOAL_ID}" ] || fail "the goal was not created"
+
+REL_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+STATING_REL="$(mktemp)"
+ask "${REL_CONV}" "Some background on what I am doing: I have been learning Rust this term specifically so that I can finish the compiler project, and my flatmate Priya has been helping me with the borrow checker." "${STATING_REL}"
+sse "${STATING_REL}" answer >/dev/null || fail "the stating turn failed"
+ok "stated it, assistant answered ($(sse "${STATING_REL}" linked_count) relationship(s) reported on the turn)"
+printf '     %s\n' "$(sse "${STATING_REL}" answer | tr '\n' ' ' | head -c 200)"
+
+step "Checking what was extracted"
+GRAPH=$(curl -s "${API}/api/v1/knowledge-graph" -H "${AUTH}")
+EDGE_COUNT=$(expect "reading the graph" "${GRAPH}" 'd["edge_count"]')
+[ "${EDGE_COUNT}" -ge 1 ] || {
+  grep -q "relationship extraction failed" "${LOG}" && \
+    printf '  \033[33mhint\033[0m the extraction missed its deadline; raise GRAPH_EXTRACT_TIMEOUT (see the header of this script)\n' >&2
+  fail "nothing was extracted from an exchange stating a relationship: ${GRAPH}"
+}
+
+# Every edge is well formed: a relationship from the closed set, a confidence in
+# range and above the floor, provenance recorded, and both ends real nodes of
+# this user's -- the columns the CHECK constraints and the quality gate guard.
+echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+rels = {"RELATED_TO","REQUIRES","DEPENDS_ON","WORKS_ON","KNOWS","INTERESTED_IN","STUDIES","COMPLETED","GOAL_OF"}
+kinds = {"task","goal","note","document","skill","person","project"}
+ids = {n["id"] for n in d["nodes"]}
+for n in d["nodes"]:
+    assert n["type"] in kinds, "unknown node type %r" % n["type"]
+    assert n["label"].strip(), "a node has no label: %r" % n
+    assert len(n["label"].split()) <= 8 or not n["extracted"], "an extracted node is a sentence: %r" % n["label"]
+    assert (n["ref_table"] is None) == (n["ref_id"] is None), "half a reference: %r" % n
+    assert n["extracted"] == (n["ref_table"] is None), "extracted disagrees with ref_table: %r" % n
+for e in d["edges"]:
+    assert e["relationship"] in rels, "unknown relationship %r" % e["relationship"]
+    assert 0.5 <= e["confidence"] <= 1, "confidence out of range or under the floor: %r" % e["confidence"]
+    assert e["source_conversation_id"], "edge has no provenance: %r" % e
+    assert e["from_node_id"] in ids and e["to_node_id"] in ids, "dangling edge: %r" % e
+    assert e["from_node_id"] != e["to_node_id"], "self edge: %r" % e
+' || fail "an extracted node or edge is malformed: ${GRAPH}"
+
+# The entity match: "the compiler project" resolved onto the goal that already
+# had that name rather than creating a second, parallel node for it.
+echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+goal_id = sys.argv[1]
+same = [n for n in d["nodes"] if n["label"].lower() == "the compiler project"]
+assert len(same) == 1, "%d nodes are called the compiler project: %s" % (len(same), same)
+' "${GOAL_ID}" || fail "the extracted entity did not resolve onto the existing goal: ${GRAPH}"
+
+ok "extracted ${EDGE_COUNT} relationship(s) over $(echo "${GRAPH}" | json 'd["node_count"]') node(s)"
+echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+by = {n["id"]: n for n in d["nodes"]}
+for e in d["edges"]:
+    f, t = by[e["from_node_id"]], by[e["to_node_id"]]
+    print("     %-24s %-14s %-24s  %.2f" % (
+        "%s (%s)" % (f["label"][:16], f["type"]), e["relationship"],
+        "%s (%s)" % (t["label"][:16], t["type"]), e["confidence"]))
+'
+
+step "Asking about it in a different conversation"
+# A brand new conversation: no shared history, so any connection the assistant
+# knows here came out of the graph. The question names an entity by the label a
+# node carries, which is what the mention scan matches on.
+NAMED=$(echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+linked = {e["from_node_id"] for e in d["edges"]} | {e["to_node_id"] for e in d["edges"]}
+# The node with the most edges, so the neighbourhood is worth showing.
+counts = {i: 0 for i in linked}
+for e in d["edges"]:
+    counts[e["from_node_id"]] += 1
+    counts[e["to_node_id"]] += 1
+best = max(counts, key=counts.get)
+print(next(n["label"] for n in d["nodes"] if n["id"] == best))
+')
+[ -n "${NAMED}" ] || fail "no connected node to ask about: ${GRAPH}"
+
+GRAPH_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+GRECALL="$(mktemp)"
+ask "${GRAPH_CONV}" "Remind me how ${NAMED} fits in with everything else I have going on." "${GRECALL}"
+
+GRAPH_RETRIEVED=$(sse "${GRECALL}" graph_count)
+[ "${GRAPH_RETRIEVED}" -ge 1 ] \
+  || fail "the new conversation retrieved no graph context for ${NAMED}: types=$(sse "${GRECALL}" types)"
+sse "${GRECALL}" graph_titles | grep -qi "${NAMED}" \
+  || fail "the graph source is not the node the question named: $(sse "${GRECALL}" graph_titles)"
+# The excerpt is the node's links, one whole triple per line.
+sse "${GRECALL}" graph | grep -qE '\) (RELATED_TO|REQUIRES|DEPENDS_ON|WORKS_ON|KNOWS|INTERESTED_IN|STUDIES|COMPLETED|GOAL_OF) ' \
+  || fail "the graph source carries no rendered relationship: $(sse "${GRECALL}" graph)"
+ok "retrieved ${GRAPH_RETRIEVED} graph source(s) in a fresh conversation, $(sse "${GRECALL}" graph_cited) cited"
+printf '     %s\n' "$(sse "${GRECALL}" graph | head -c 240)"
+printf '     %s\n' "$(sse "${GRECALL}" answer | tr '\n' ' ' | head -c 260)"
+
+step "Reading one node's neighbourhood"
+NODE_ID=$(echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+label = sys.argv[1]
+print(next(n["id"] for n in d["nodes"] if n["label"] == label))
+' "${NAMED}")
+HOOD=$(curl -s "${API}/api/v1/knowledge-graph/nodes/${NODE_ID}" -H "${AUTH}")
+[ "$(echo "${HOOD}" | json 'd["neighbor_count"]')" -ge 1 ] \
+  || fail "the node has no neighbours: ${HOOD}"
+echo "${HOOD}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+me = d["node"]["id"]
+for nb in d["neighbors"]:
+    e = nb["edge"]
+    # `incoming` has to agree with the edge it describes, or the direction the
+    # model is shown is backwards.
+    assert nb["incoming"] == (e["to_node_id"] == me), "incoming disagrees with the edge: %r" % nb
+    assert nb["node"]["id"] in (e["from_node_id"], e["to_node_id"]), "the far end is not on the edge"
+    assert nb["node"]["id"] != me, "a node is its own neighbour"
+' || fail "a neighbour is malformed: ${HOOD}"
+ok "${NAMED} has $(echo "${HOOD}" | json 'd["neighbor_count"]') neighbour(s), each with a consistent direction"
+
+step "Checking the delete rules"
+# A node that mirrors a record is refused, and says what to delete instead.
+TASK_NODE=$(echo "${GRAPH}" | python3 -c '
+import sys, json
+print(next(n["id"] for n in json.load(sys.stdin)["nodes"] if n["ref_table"] == "tasks"))
+')
+CODE=$(curl -s -o /tmp/e2e-node-delete.json -w '%{http_code}' \
+  -X DELETE "${API}/api/v1/knowledge-graph/nodes/${TASK_NODE}" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "deleting a mirrored node returned ${CODE}, want 409: $(cat /tmp/e2e-node-delete.json)"
+grep -q node_is_backed /tmp/e2e-node-delete.json \
+  || fail "the refusal does not name the reason: $(cat /tmp/e2e-node-delete.json)"
+
+# An extracted node is the user's to remove, and its edges go with it.
+EXTRACTED=$(echo "${GRAPH}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+linked = {e["from_node_id"] for e in d["edges"]} | {e["to_node_id"] for e in d["edges"]}
+print(next(n["id"] for n in d["nodes"] if n["extracted"] and n["id"] in linked))
+')
+BEFORE_EDGES=$(echo "${GRAPH}" | json 'd["edge_count"]')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X DELETE "${API}/api/v1/knowledge-graph/nodes/${EXTRACTED}" -H "${AUTH}")
+[ "${CODE}" = "204" ] || fail "deleting an extracted node returned ${CODE}, want 204"
+AFTER=$(curl -s "${API}/api/v1/knowledge-graph" -H "${AUTH}")
+[ "$(echo "${AFTER}" | json 'd["edge_count"]')" -lt "${BEFORE_EDGES}" ] \
+  || fail "the deleted node's edges survived it: ${AFTER}"
+ok "a mirrored node is refused with 409, an extracted one deletes with its edges"
+
+step "Deleting the task and watching its node go"
+curl -s -o /dev/null -w '%{http_code}' -X DELETE "${API}/api/v1/tasks/${TASK_ID}" -H "${AUTH}" \
+  | grep -q 204 || fail "deleting the task did not return 204"
+LEFT=$(psql "${DB}" -tAc "SELECT count(*) FROM knowledge_nodes WHERE ref_table = 'tasks' AND ref_id = '${TASK_ID}'")
+[ "${LEFT}" = "0" ] || fail "${LEFT} nodes survived the deleted task"
+# And the trigger fires on a cascade too, which is the case no Go code is on.
+psql "${DB}" -q -c 'DELETE FROM goals' >/dev/null
+LEFT=$(psql "${DB}" -tAc "SELECT count(*) FROM knowledge_nodes WHERE ref_table = 'goals'")
+[ "${LEFT}" = "0" ] || fail "${LEFT} goal nodes survived a delete the API never saw"
+ok "the node went with the task, and with a goal deleted straight from SQL"
+
 step "Deleting the document"
 curl -s -o /dev/null -w '%{http_code}' -X DELETE "${API}/api/v1/documents/${DOC_ID}" -H "${AUTH}" \
   | grep -q 204 || fail "delete did not return 204"
@@ -346,4 +636,4 @@ LEFT=$(psql "${DB}" -tAc 'SELECT count(*) FROM document_chunks')
 [ "${LEFT}" = "0" ] || fail "${LEFT} chunks survived the deleted document"
 ok "document deleted, chunks cascaded"
 
-printf '\n\033[32mPASS\033[0m upload -> extract -> chunk -> embed -> store -> retrieve -> ask -> cite -> remember -> recall\n'
+printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse\n'

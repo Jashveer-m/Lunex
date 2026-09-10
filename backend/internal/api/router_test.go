@@ -17,6 +17,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -62,10 +63,18 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	// The document service gets a deterministic embedder rather than a live
 	// Ollama, so these tests measure the routing and the SQL scoping and
 	// nothing else. See embedder_test.go.
-	docSvc := documents.NewService(documents.NewRepository(pool), &hashingEmbedder{}, discard, 30*time.Second)
-	taskSvc := tasks.NewService(tasks.NewRepository(pool))
-	goalSvc := goals.NewService(goals.NewRepository(pool))
-	noteSvc := notes.NewService(notes.NewRepository(pool))
+	// Phase 6's graph runs on the same mock model, and is wired into all four
+	// resource services -- so these tests exercise the real sync-on-write path
+	// and the real SQL behind it, which is where "a task always has a node"
+	// actually has to hold.
+	graphSvc := graph.NewService(graph.Deps{
+		Store: graph.NewRepository(pool), Provider: provider, Logger: discard,
+	})
+	docSvc := documents.NewService(documents.NewRepository(pool), &hashingEmbedder{}, discard,
+		30*time.Second, documents.WithNodeSync(graphSvc))
+	taskSvc := tasks.NewService(tasks.NewRepository(pool), tasks.WithNodeSync(graphSvc))
+	goalSvc := goals.NewService(goals.NewRepository(pool), goals.WithNodeSync(graphSvc))
+	noteSvc := notes.NewService(notes.NewRepository(pool), notes.WithNodeSync(graphSvc))
 	// The assistant runs against a mock model for the same reason the document
 	// tests run against a deterministic embedder: what these tests measure is
 	// the routing and the SQL scoping, not whether a model understood a
@@ -80,6 +89,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	chatSvc := chat.NewService(chat.Deps{
 		Store: chat.NewRepository(pool), Provider: provider,
 		Documents: docSvc, Memories: memorySvc, MemoryExtractor: memorySvc,
+		Graph: graphSvc, GraphExtractor: graphSvc,
 		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc,
 		Logger: discard,
 		Options: chat.Options{
@@ -102,6 +112,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Documents:   documents.NewHandler(docSvc, discard, 0),
 		Chat:        chat.NewHandler(chatSvc, discard),
 		Memories:    memories.NewHandler(memorySvc, discard),
+		Graph:       graph.NewHandler(graphSvc, discard),
 		Tokens:      tokens,
 		RateLimiter: auth.NewIPRateLimiter(100, 100),
 		DB:          pool, // nil degrades healthz to a liveness check

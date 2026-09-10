@@ -9,6 +9,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
+	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -297,6 +298,72 @@ func (f *fakeExtractor) ExtractFromTurn(ctx context.Context, userID, convID uuid
 }
 
 func (f *fakeExtractor) seen() []extraction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]extraction(nil), f.calls...)
+}
+
+// --- Phase 6 fakes ----------------------------------------------------------
+
+type fakeGraph struct {
+	mu      sync.Mutex
+	byUser  map[uuid.UUID][]graph.Neighborhood
+	err     error
+	callers []uuid.UUID
+	// queries records the text the orchestrator handed the lookup, which is
+	// what proves the *question* is what gets matched against node labels.
+	queries []string
+	limits  []int
+}
+
+func (f *fakeGraph) Mentioned(_ context.Context, userID uuid.UUID, text string, limit int) ([]graph.Neighborhood, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callers = append(f.callers, userID)
+	f.queries = append(f.queries, text)
+	f.limits = append(f.limits, limit)
+	if f.err != nil {
+		return nil, f.err
+	}
+	// The mention test is applied here as well as recorded, so a test can seed
+	// a node the question does not name and see it left out rather than only
+	// assert on the arguments.
+	out := []graph.Neighborhood{}
+	for _, n := range f.byUser[userID] {
+		if graph.Mentions(text, n.Node.Label) {
+			out = append(out, n)
+		}
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// fakeLinker records what the orchestrator handed the relationship extractor
+// after a turn.
+type fakeLinker struct {
+	mu    sync.Mutex
+	calls []extraction
+	err   error
+	// stored is what the extractor claims to have written.
+	stored []graph.Edge
+}
+
+func (f *fakeLinker) ExtractFromTurn(ctx context.Context, userID, convID uuid.UUID, question, answer string) ([]graph.Edge, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, extraction{
+		userID: userID, convID: convID, question: question, answer: answer,
+		ctxWasSet: ctx != nil,
+	})
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.stored, nil
+}
+
+func (f *fakeLinker) seen() []extraction {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]extraction(nil), f.calls...)
