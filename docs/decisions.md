@@ -325,13 +325,12 @@ These are **not** silently skipped — they are known gaps.
 A shared store (Redis) is the fix, and Redis is explicitly out of scope for
 Phase 1. The `TODO(phase-2)` comment sits on the type.
 
-## 2. No auth UI
+## 2. No auth UI *(resolved in the UI phase)*
 
-`frontend/` is a Vite + React + TypeScript + Tailwind scaffold that renders a
-health panel and nothing else. There is no login form, no token storage, no
-routing, and `src/lib/api.ts` only wires `/healthz`. The brief made the UI
-optional for this phase; the auth screens belong with the token-storage decision
-(memory + refresh cookie vs. localStorage), which is a Phase 2 call.
+Phase 1 shipped a health panel and nothing else. The UI phase added the auth
+screens and made the token-storage call deferred here: the access token in
+memory, the refresh token in `localStorage`. See "The refresh token lives in
+localStorage" under the UI phase below.
 
 ## 3. No email verification or password reset
 
@@ -343,6 +342,10 @@ trusts the address as given.
 Not as an `HttpOnly; Secure; SameSite` cookie. That is the right shape for the
 API-client and mobile-free scope of Phase 1, but a browser SPA storing a refresh
 token in JavaScript-reachable storage is XSS-exposed. Revisit with the auth UI.
+
+*UI phase:* still true, and now load-bearing — the SPA does store it in
+`localStorage`. The cookie is a backend change and was out of scope for a
+frontend-only phase; see deferred item 38.
 
 ## 5. No CORS middleware
 
@@ -1681,3 +1684,95 @@ the tools or the model can be re-measured the same way.
 A user can hold as many proposals open as they can type requests. Every one
 waits for them, so the harm is clutter rather than writes, but a rate limit on
 the approval endpoint belongs with the rest of the per-user limits.
+
+# UI phase decisions
+
+## The refresh token lives in localStorage; the access token only in memory
+
+The access token is a module-level variable in `frontend/src/lib/api.ts`: never
+persisted, gone on reload. The refresh token is in `localStorage` so a reload
+can mint a new access token. That is XSS-exposed — any script running on the
+origin can read a 30-day credential — and it is accepted for this project's
+scope because the alternative, an `HttpOnly; Secure; SameSite=Strict` refresh
+cookie, needs the backend to set and read it (deferred item 38). The mitigations
+in place: the access token is short-lived and never stored, logout removes the
+refresh token and revokes its session server-side, and nothing in the UI
+renders user or model text as HTML.
+
+## Refreshing is single-flight, and serialised across tabs
+
+Refresh tokens rotate on every use and the old value dies at once, so two
+refreshes racing with one token log the user out. Inside a tab, concurrent
+401s share one refresh promise. Across tabs, the refresh runs under a Web Locks
+API lock (`navigator.locks`), and reads the token from storage only after taking
+it — so the second tab refreshes with the token the first tab just received.
+Only a `401` from `/auth/refresh` ends a session; a network error or a 5xx
+leaves the stored token alone, so restarting the backend does not sign anybody
+out. A logout in one tab signs the others out through the `storage` event.
+
+## A 401 is refreshed and retried once, POST included
+
+A 401 means the server did not act on the request, so repeating it after a
+refresh is safe even for a write or a chat turn. An access token that expires
+within 15 seconds is refreshed before the request rather than after it fails.
+
+## No router or state library
+
+Seven flat routes and no nested layouts: a 60-line router over the History API
+(`src/lib/router.tsx`) covers them. State is component state plus one context
+for the session; the only cross-screen signal — "proposed actions changed", for
+the sidebar badge — is a window event.
+
+## The chat stream is read with fetch, not EventSource
+
+`EventSource` cannot send a body or an `Authorization` header. The reader in
+`src/lib/sse.ts` splits frames on blank lines and dispatches `sources`, `token`,
+`action`, `done` and `error`. A stream that closes without `done` or `error`
+(a proxy timeout, a restart) is reported as an error, and the view re-reads the
+conversation to find out whether the turn was saved — it may have been, since
+the turn commits before the extractors run.
+
+## Leaving a conversation does not cancel its turn
+
+The request context is the turn's context, so aborting the fetch would lose the
+turn. Navigating away keeps reading the stream in the background and lets the
+turn finish; only the Stop button aborts.
+
+## The action card is the only thing that says an action happened
+
+The model's prose can claim a proposal is done (deferred item 39 of Phase 7).
+The card's status line comes from the actions API alone — "Awaiting your
+approval — not done yet" until Approve returns `executed`. Approve and Reject
+send no body, as the endpoints require. Reloading a conversation re-attaches
+each action to the answer that proposed it by timestamp: actions are inserted in
+the turn's transaction just after its messages, with `clock_timestamp()`.
+
+## Deadlines are calendar dates in UTC
+
+The date inputs write midnight UTC and dates are formatted in UTC, matching the
+backend's own date resolution (item 35). An edit sends only the fields that
+changed, so a deadline with a time of day set through the API survives an edit
+that did not touch it.
+
+# UI phase — explicitly deferred
+
+## 38. No HttpOnly refresh cookie
+
+The fix for the `localStorage` exposure is for `/auth/login`, `/register` and
+`/refresh` to set the refresh token as an `HttpOnly; Secure; SameSite=Strict`
+cookie scoped to `/api/v1/auth`, and for `/refresh` and `/logout` to read it
+from there. That is a backend change; this phase made none.
+
+## 39. The composer waits for `done`
+
+A new message cannot be sent until the previous turn's `done` frame, which
+arrives after both extractors — on a slow CPU, a minute or two after the answer
+is visibly complete. The UI says so ("Answer complete · updating memory and
+connections…"). Sending while the extractors run is probably safe, because the
+turn is committed, but it has not been designed or tested.
+
+## 40. Lists show what was loaded
+
+The parent-task and dependency pickers offer the tasks on the loaded pages, not
+every task. There is no endpoint to remove a dependency or delete a milestone,
+so the UI offers neither.

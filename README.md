@@ -25,6 +25,9 @@ Personal life-operating-system.
   needed, and an approval flow. A search runs straight away; a change — create a
   task, goal or note, update a task — is only *proposed*, and nothing is written
   until you approve it.
+- **UI phase** — the web app over all of it: sign-in, tasks/goals/notes,
+  document upload, a streaming chat with inline citations and Approve/Reject
+  cards for proposed changes, and a memory manager.
 
 Named specialist agents (Study, Career, …) and deleting through the chat belong
 to later phases and are deliberately absent. The assistant can change your data
@@ -42,7 +45,7 @@ to skip the approval — relaxes that.
 | PDF text | [ledongthuc/pdf](https://github.com/ledongthuc/pdf) — text layer only |
 | Passwords | Argon2id (`golang.org/x/crypto/argon2`) |
 | Tokens | HS256 access JWT (15 min) + rotating opaque refresh token (30 days) |
-| Frontend | Vite + React 19 + TypeScript + Tailwind v4 (scaffold only) |
+| Frontend | Vite + React 19 + TypeScript + Tailwind v4, no router or state library |
 
 ## Layout
 
@@ -74,7 +77,7 @@ lunex/
 │   │   └── validate/      # field rules shared by the modules
 │   ├── migrations/        # embedded .sql migrations
 │   └── go.mod
-├── frontend/              # Vite React TS scaffold
+├── frontend/              # the web UI (Vite + React)
 ├── docs/                  # api.md, decisions.md, testing.md
 ├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve, against real Postgres and Ollama
 └── Makefile
@@ -104,7 +107,7 @@ export JWT_SECRET="$(openssl rand -base64 48)"
 go run ./cmd/migrate up
 go run ./cmd/api              # listens on :8080
 
-# 4. Frontend (optional; proxies /api to :8080)
+# 4. Frontend (proxies /api to :8080) -- open http://localhost:5173
 cd ../frontend && npm install && npm run dev
 ```
 
@@ -282,6 +285,21 @@ requests ("add", "task", "find", "mark", …), because on a slow CPU it costs up
 to a minute before the first token. `AGENT_TOOLS=false` turns the tools off and
 leaves the Phase 6 assistant.
 
+## The web UI
+
+`make frontend-dev` (with the API running) serves it at http://localhost:5173;
+Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
+
+| Screen | Route | What it does |
+| --- | --- | --- |
+| Sign in / register | `/login`, `/register` | Access token in memory, refresh token in `localStorage`; a 401 refreshes silently and retries |
+| Today | `/`, `/?tab=goals`, `/?tab=notes` | Tasks (quick add, filters, search, edit, complete, dependencies), goals with milestones, notes |
+| Assistant | `/chat`, `/chat/:id` | Conversations; answers stream token by token with `[S1]` citation chips and a source list; proposed changes appear as cards with Approve / Reject |
+| Documents | `/documents` | Drag-and-drop upload, status and chunk count, extracted-text viewer, delete |
+| Memories | `/memories` | Filter by type and state, edit, switch off, delete, and "Forget everything" behind a confirmation |
+| Approvals | `/approvals` | Every proposal, including ones from deleted conversations |
+| Connections | `/graph` | The knowledge graph as two lists — nodes and relationships — no renderer |
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
@@ -350,8 +368,10 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 1. **Rate limiting is in-process.** A real per-IP token bucket protects
    login/register, but it resets on restart and is per-replica. Redis is out of
    scope for this phase.
-2. **No auth UI.** The frontend is a scaffold with a health panel; no login
-   form, no token storage.
+2. **The web UI keeps the refresh token in `localStorage`.** The access token
+   lives only in memory, but the 30-day refresh token is readable by any script
+   on the origin, so an XSS bug would leak it. An `HttpOnly` cookie is the fix
+   and needs a backend change.
 3. **No email verification or password reset.**
 4. **Refresh tokens are returned in the JSON body**, not as an `HttpOnly` cookie.
 5. **No CORS middleware** — development relies on the Vite proxy.
