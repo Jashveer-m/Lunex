@@ -48,6 +48,13 @@ func ParseDate(s string, now time.Time) (time.Time, error) {
 		return t, nil
 	}
 
+	// Today is today *in UTC* (docs/decisions.md, 35), which is the date the
+	// chat prompt tells the model it is. Reading the calendar fields off a
+	// local-time now -- which is what time.Now returns -- put "today" a day
+	// ahead of the prompt's date on any server east of Greenwich for part of
+	// every day (00:00-05:30 in IST), so "tomorrow" resolved to the day after
+	// the one the assistant then named.
+	now = now.UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	switch s {
 	case "today", "tonight", "this evening", "end of day", "end of today", "eod":

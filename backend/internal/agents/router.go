@@ -36,7 +36,7 @@ type Options struct {
 const (
 	DefaultTemperature = 0.1
 	DefaultMaxTokens   = 200
-	DefaultTimeout     = 60 * time.Second
+	DefaultTimeout     = 180 * time.Second
 )
 
 // Router makes the per-message decision.
@@ -110,7 +110,41 @@ func (r *Router) Decide(ctx context.Context, agent Agent, message string) (Decis
 			"agent", agent.Name, "tool", d.Tool)
 		return Decision{}, nil
 	}
+	r.dropUngroundedFilters(offered, &d, message)
 	return d, nil
+}
+
+// dropUngroundedFilters removes every filter argument whose value the message
+// does not give, so the tool runs as if the model had left it out -- which is
+// what it should have done. See tools.FilterGrounded for the measured failure.
+//
+// Dropped rather than refused: the rest of the call is usually right ("search
+// my notes for seedlings" with an invented tag is still a search for
+// seedlings), and running it without the filter answers the question the user
+// asked. Only filters are checked. A write's arguments are shown to the user
+// in the proposal before anything happens, and a search's query is the model's
+// own wording by design.
+func (r *Router) dropUngroundedFilters(offered []tools.Tool, d *Decision, message string) {
+	for _, t := range offered {
+		if t.Name != d.Tool {
+			continue
+		}
+		for _, p := range t.Params {
+			if !p.Filter {
+				continue
+			}
+			raw, present := d.Args[p.Name]
+			if !present {
+				continue
+			}
+			if value := d.Args.String(p.Name); value != "" && tools.FilterGrounded(p, value, message) {
+				continue
+			}
+			delete(d.Args, p.Name)
+			r.log.Info("routing dropped a filter the message does not give",
+				"tool", d.Tool, "param", p.Name, "value", raw)
+		}
+	}
 }
 
 // offered is the agent's tools that the registry actually has, in the

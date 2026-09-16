@@ -1776,3 +1776,67 @@ turn is committed, but it has not been designed or tested.
 The parent-task and dependency pickers offer the tasks on the loaded pages, not
 every task. There is no endpoint to remove a dependency or delete a milestone,
 so the UI offers neither.
+
+# Hardening pass
+
+## 41. Extraction reads only confirmed reality
+
+Three bugs had one cause: the memory and graph extractors read a turn as text,
+and the text of a turn is not all fact. A proposed or rejected change ("book a
+flight to Delhi") became a memory of something the user did; a proposal became
+an extracted graph node that the approved task's real node never joined; and a
+retrieved document's content became "The user knows that ...".
+
+The chat turn now hands each extractor a `Turn` rather than two strings: the
+exchange, the text of every change in the conversation that has *not* been
+carried out (this turn's proposal, and earlier ones still waiting, rejected or
+failed — never an executed one), and, for memories, the retrieved document
+passages. Each is enforced in code, not only asked for in the prompt:
+
+- A memory sharing a content word with an unconfirmed change is dropped
+  (`memories.RestatesUnconfirmed`). One word is strict on purpose: the message
+  that proposes a change *is* the request, so a fact about its subject was read
+  out of it. A fact about something else in the same message is kept.
+- A memory whose content words mostly come from a retrieved passage and not
+  from the user's own message is dropped (`memories.RestatesRetrieved`),
+  however it is phrased. Words the user said are never counted against it.
+- A relationship with an end named in an unconfirmed change is dropped from the
+  turn. When the change is approved and executes, the action engine's
+  `OnExecuted` hook reads the proposing turn again with the created record as an
+  anchor: an end naming the record resolves to the record's own node, and only
+  relationships touching it are kept. It runs in the background after the
+  approval answers; it is a model call, and the user should see their task now.
+
+Memories get no second pass after approval: the task, goal or note is itself
+the record, and a memory restating it would not follow it through an edit or a
+delete.
+
+The cost of the lexical checks is a genuine fact that shares a word with a
+pending change or with a document the user did not quote — the same trade
+`AboutTheUser` makes, on a path where a wrong memory costs more than a missing
+one.
+
+## 42. A filter argument must come from the message
+
+`search_notes`' `tag` and the search tools' `status` are marked `Filter`, and
+the router drops a filter whose value the user's message does not give — the
+value or a synonym for an enum, the words plus a cue ("tag", "tagged", or a
+`#hashtag") for a tag. An invented filter was the one argument error that
+failed silently: a valid value, a search that ran, and a true "nothing
+matched". Write arguments are not checked; they are shown to the user in the
+proposal.
+
+## 43. Retrieval scores are not shown to the model
+
+Source headers used to carry "(similarity 0.79)", and the model recited it to
+the user. The score stays on the source for the client; the model gets sources
+in relevance order. Graph edges still carry "confidence" in their excerpt —
+the same class of leak, not observed, and left alone in this pass.
+
+## 44. Timeouts default to this machine
+
+The extraction and routing timeouts default to 180s and the turn to 18m
+(twice their sum, per `MaxExtractionShare`), which is what `scripts/e2e.sh`
+already needed on the development machine. A faster model can lower all four.
+`LOG_LEVEL` (default `info`) makes the extractors' drop reasons visible at
+`debug`.

@@ -553,3 +553,29 @@ func TestToolsAreAllOrNothing(t *testing.T) {
 		}
 	}
 }
+
+// The assistant has to describe the approval flow that exists. Told only that
+// a proposal "waits for approval", llama3.2:3b invented one -- "type 'approve'
+// to confirm" -- and typing it does nothing: the only way to decide a proposal
+// is the card's Approve and Reject buttons, which call POST
+// /actions/{id}/approve and /reject. Both the rule and the line describing this
+// turn's proposal name the buttons and forbid the invented command.
+func TestTheAssistantIsToldApprovalIsAButtonNotAChatCommand(t *testing.T) {
+	h := newToolHarness(t, routingReply(
+		`{"tool": "create_task", "arguments": {"title": "Renew my passport"}}`,
+		func(string) string { return "I have prepared it." }))
+	if _, _, err := h.send(t, "Add a task to renew my passport"); err != nil {
+		t.Fatal(err)
+	}
+	prompt := h.answerPrompt()
+	for _, want := range []string{
+		"Approve and Reject buttons on the card",
+		"press Approve on the card shown with your reply",
+		`never tell the user to type or reply "approve", "yes", "no"`,
+		"never ask the user to type or reply anything to approve it",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("the answering prompt is missing %q:\n%s", want, prompt)
+		}
+	}
+}

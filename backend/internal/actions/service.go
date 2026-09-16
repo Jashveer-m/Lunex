@@ -46,13 +46,29 @@ type Runner interface {
 // a hung database cannot hold an approval open forever.
 const DefaultExecutionTimeout = 20 * time.Second
 
+// ExecutedHook is told about a write that the user approved and that ran
+// successfully, with the one-sentence summary of what it did and the records it
+// produced.
+//
+// It is how what happened reaches the things derived from conversations. The
+// relationship extractor reads a turn as it happened, and for a turn that
+// proposed a change that is the moment the change does not exist; this is the
+// moment it does. See chat.Service.ActionExecuted.
+type ExecutedHook func(ctx context.Context, userID uuid.UUID, a Action, summary string, result tools.Result)
+
 // Service holds the action use cases. It is transport agnostic.
 type Service struct {
-	store   Store
-	runner  Runner
-	log     *slog.Logger
-	timeout time.Duration
+	store    Store
+	runner   Runner
+	log      *slog.Logger
+	timeout  time.Duration
+	executed ExecutedHook
 }
+
+// OnExecuted registers the hook run after an approved action executes. It is
+// set after construction because the natural implementer, the chat service, is
+// built after this one; call it before serving requests.
+func (s *Service) OnExecuted(h ExecutedHook) { s.executed = h }
 
 func NewService(store Store, runner Runner, log *slog.Logger) *Service {
 	if log == nil {
@@ -113,6 +129,15 @@ func (s *Service) Approve(ctx context.Context, userID, id uuid.UUID) (Action, er
 			"error", err, "user_id", userID, "action_id", id, "tool", exec.Approved.Tool,
 			"tool_failed", exec.Err != nil)
 		return Action{}, fmt.Errorf("record outcome of action %s: %w", id, err)
+	}
+	if s.executed != nil && exec.Err == nil && a.Status == StatusExecuted {
+		// In the background, and on a context that outlives the request: the
+		// hook is a model call measured in tens of seconds, the approval's
+		// answer is already decided, and the user should see their task
+		// created now rather than after the graph has caught up with it.
+		// Anything the hook fails to do it logs; it cannot change the outcome
+		// recorded above.
+		go s.executed(context.WithoutCancel(ctx), userID, a, s.Describe(a), exec.Result)
 	}
 	return a, nil
 }

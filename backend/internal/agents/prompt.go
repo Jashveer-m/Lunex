@@ -39,6 +39,8 @@ Tools:
 Nothing can be deleted: a request to delete something is "none".
 A reply like "yes" or "ok" is "none".
 
+Only give an argument the message states. Leave out every optional argument the message does not give -- never guess one and never write a placeholder such as "unknown".
+
 Reply with one JSON object and nothing else: {"tool": "<tool name>", "arguments": {<only the arguments the message gives>}}`
 
 // shot is one worked example, replayed as a real user/assistant exchange.

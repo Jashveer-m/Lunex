@@ -104,6 +104,15 @@ type Param struct {
 	Description string
 	Enum        []string
 	Required    bool
+	// Filter marks an optional argument that narrows what a read returns. The
+	// router drops one whose value the user's message does not give, rather
+	// than let a guessed value empty a search; see FilterGrounded.
+	Filter bool
+	// Synonyms are the words that ground an Enum filter besides its values.
+	Synonyms map[string]string
+	// Cues are words one of which must also be in the message for a free-text
+	// filter to be grounded -- "tag" for a tag, so a topic is not read as one.
+	Cues []string
 }
 
 // Tool is one registered capability.

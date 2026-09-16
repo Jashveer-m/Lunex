@@ -58,6 +58,32 @@ func TestParseDate(t *testing.T) {
 	}
 }
 
+// The calendar day is the UTC one whatever zone the clock is read in. On a
+// server in IST, 01:00 on Friday 11 September is still Thursday 10 September in
+// UTC -- the date the chat prompt states -- and before the fix "tomorrow"
+// resolved against the local Friday and landed a day late.
+func TestParseDateUsesTheUTCDayWhateverTheServerZone(t *testing.T) {
+	ist := time.FixedZone("IST", 5*60*60+30*60)
+	now := time.Date(2026, time.September, 11, 1, 0, 0, 0, ist)
+	if now.UTC().Day() != 10 {
+		t.Fatalf("test clock is wrong: %v", now.UTC())
+	}
+	for in, want := range map[string]string{
+		"today":       "2026-09-10",
+		"tomorrow":    "2026-09-11",
+		"next friday": "2026-09-11",
+		"in 3 days":   "2026-09-13",
+	} {
+		got, err := ParseDate(in, now)
+		if err != nil {
+			t.Fatalf("ParseDate(%q): %v", in, err)
+		}
+		if s := got.Format(time.DateOnly); s != want {
+			t.Errorf("ParseDate(%q) at %v = %s, want %s", in, now, s, want)
+		}
+	}
+}
+
 // Anything it cannot read is an error, never a guess -- including a date that
 // time.Date would quietly roll over into the next month.
 func TestParseDateRefusesToGuess(t *testing.T) {

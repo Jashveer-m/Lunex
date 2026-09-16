@@ -153,7 +153,7 @@ func TestChatKnobsAreBounded(t *testing.T) {
 // than after it, but on the same context and out of the same budget.
 //
 // The default configuration has to satisfy the rule, which is the other half
-// of what this pins: it is why DefaultChatTimeout is six minutes.
+// of what this pins: it is why DefaultChatTimeout is eighteen minutes.
 func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
 	t.Setenv("JWT_SECRET", validSecret)

@@ -54,7 +54,7 @@ type Options struct {
 const (
 	DefaultExtractionTemperature = 0.1
 	DefaultExtractionMaxTokens   = 512
-	DefaultExtractionTimeout     = 60 * time.Second
+	DefaultExtractionTimeout     = 180 * time.Second
 )
 
 // Deps are everything the service needs. Provider may be nil: a graph with no
@@ -153,9 +153,17 @@ func (s *Service) SyncNode(ctx context.Context, userID uuid.UUID, refTable strin
 // rather than returned to the user: a failure to record a relationship must
 // never turn a good answer into a 500. See chat.Service.SendMessage.
 func (s *Service) ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]Edge, error) {
+	return s.Extract(ctx, userID, conversationID, Turn{UserMessage: userMessage, AssistantMessage: assistantMessage})
+}
+
+// Extract is ExtractFromTurn over a whole Turn: the exchange, the changes in it
+// that have not happened, and -- when it is read because one just did -- the
+// record that change produced. See Turn.
+func (s *Service) Extract(ctx context.Context, userID, conversationID uuid.UUID, turn Turn) ([]Edge, error) {
 	if s.provider == nil {
 		return nil, nil
 	}
+	userMessage, assistantMessage := turn.UserMessage, turn.AssistantMessage
 	if !WorthExtracting(userMessage, assistantMessage) {
 		s.log.Debug("relationship extraction skipped: turn is too short",
 			"user_id", userID, "conversation_id", conversationID)
@@ -169,18 +177,36 @@ func (s *Service) ExtractFromTurn(ctx context.Context, userID, conversationID uu
 	if err != nil {
 		return nil, err
 	}
+	candidates = s.confirmed(candidates, turn)
 	if len(candidates) == 0 {
 		return nil, nil
+	}
+
+	var anchor *Node
+	if turn.Anchor != nil {
+		nodeType, ok := TypeForRefTable(turn.Anchor.RefTable)
+		if !ok {
+			return nil, fmt.Errorf("anchor: unknown source table %q", turn.Anchor.RefTable)
+		}
+		// Ensure rather than look up: the node is normally already there,
+		// synced when the approval wrote the row, and this is the same
+		// idempotent upsert -- so a sync that failed is repaired here rather
+		// than costing the relationship.
+		n, err := s.store.EnsureRefNode(ctx, userID, turn.Anchor.RefTable, turn.Anchor.RefID, nodeType, NormalizeLabel(turn.Anchor.Label))
+		if err != nil {
+			return nil, fmt.Errorf("anchor: %w", err)
+		}
+		anchor = &n
 	}
 
 	source := conversationID
 	stored := make([]Edge, 0, len(candidates))
 	for _, c := range candidates {
-		from, err := s.resolve(ctx, userID, c.From, c.FromType)
+		from, err := s.resolveEnd(ctx, userID, c.From, c.FromType, turn.Anchor, anchor)
 		if err != nil {
 			return stored, err
 		}
-		to, err := s.resolve(ctx, userID, c.To, c.ToType)
+		to, err := s.resolveEnd(ctx, userID, c.To, c.ToType, turn.Anchor, anchor)
 		if err != nil {
 			return stored, err
 		}
@@ -211,6 +237,44 @@ func (s *Service) ExtractFromTurn(ctx context.Context, userID, conversationID uu
 			"proposed", len(candidates), "stored", len(stored), "edges", summarize(candidates))
 	}
 	return stored, nil
+}
+
+// confirmed keeps the candidates that are about confirmed reality.
+//
+// Reading a turn as it happened, a relationship with an end named in a change
+// that has not been made is dropped: the proposal is not a fact, and if it is
+// approved the relationship is extracted again against the real record.
+//
+// Reading a turn because an approved change has just been made, only the
+// relationships touching that change's record are kept -- exactly one end named
+// in it. The others were already read from the turn when it happened, and the
+// point of this pass is the one connection the turn could not make then.
+func (s *Service) confirmed(candidates []Candidate, turn Turn) []Candidate {
+	kept := candidates[:0]
+	for _, c := range candidates {
+		if turn.Anchor != nil {
+			if namesAnchor(c.From, turn.Anchor) == namesAnchor(c.To, turn.Anchor) {
+				s.log.Debug("relationship dropped: it does not connect the approved record to anything",
+					"from", c.From, "relationship", c.Relationship, "to", c.To, "anchor", turn.Anchor.Label)
+				continue
+			}
+		} else if namesUnconfirmed(c.From, turn.Unconfirmed) || namesUnconfirmed(c.To, turn.Unconfirmed) {
+			s.log.Debug("relationship dropped: it is about a change that has not been made",
+				"from", c.From, "relationship", c.Relationship, "to", c.To)
+			continue
+		}
+		kept = append(kept, c)
+	}
+	return kept
+}
+
+// resolveEnd is resolve, except that an end naming the anchored record is that
+// record's node.
+func (s *Service) resolveEnd(ctx context.Context, userID uuid.UUID, label, nodeType string, a *Anchor, anchor *Node) (Node, error) {
+	if anchor != nil && namesAnchor(label, a) {
+		return *anchor, nil
+	}
+	return s.resolve(ctx, userID, label, nodeType)
 }
 
 // propose runs the model and turns its reply into candidate relationships that

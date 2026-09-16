@@ -89,12 +89,16 @@ func TestARememberedFactGroundsALaterAnswer(t *testing.T) {
 		t.Fatalf("SendMessage: %v", err)
 	}
 
-	// The memory reached the model, labelled and scored.
+	// The memory reached the model, labelled -- and without its score, which
+	// the model would otherwise repeat to the user. The score is on the source.
 	prompt := ai.PromptText(h.provider.LastPrompt())
-	for _, want := range []string{"prefers studying in the morning", "[S1] memory:", "similarity 0.74"} {
+	for _, want := range []string{"prefers studying in the morning", "[S1] memory:"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt is missing %q:\n%s", want, prompt)
 		}
+	}
+	if strings.Contains(prompt, "similarity 0.74") {
+		t.Fatalf("prompt leaks the retrieval score:\n%s", prompt)
 	}
 
 	if len(sink.Retrieved) != 1 {

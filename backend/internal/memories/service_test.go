@@ -139,15 +139,15 @@ func TestExtractionQualityOverExampleConversations(t *testing.T) {
 			user:      realQuestion,
 			assistant: realAnswer,
 			reply: `[
-				{"type":"semantic","content":"The user knows one thing.","importance":0.9,"confidence":0.9},
-				{"type":"semantic","content":"The user knows two things.","importance":0.9,"confidence":0.9},
-				{"type":"semantic","content":"The user knows three things.","importance":0.9,"confidence":0.9},
-				{"type":"semantic","content":"The user knows four things.","importance":0.9,"confidence":0.9}
+				{"type":"semantic","content":"The user knows one thing about the scheduler.","importance":0.9,"confidence":0.9},
+				{"type":"semantic","content":"The user knows two things about the scheduler.","importance":0.9,"confidence":0.9},
+				{"type":"semantic","content":"The user knows three things about the scheduler.","importance":0.9,"confidence":0.9},
+				{"type":"semantic","content":"The user knows four things about the scheduler.","importance":0.9,"confidence":0.9}
 			]`,
 			want: []Candidate{
-				{Type: TypeSemantic, Content: "The user knows one thing.", Importance: 0.9, Confidence: 0.9},
-				{Type: TypeSemantic, Content: "The user knows two things.", Importance: 0.9, Confidence: 0.9},
-				{Type: TypeSemantic, Content: "The user knows three things.", Importance: 0.9, Confidence: 0.9},
+				{Type: TypeSemantic, Content: "The user knows one thing about the scheduler.", Importance: 0.9, Confidence: 0.9},
+				{Type: TypeSemantic, Content: "The user knows two things about the scheduler.", Importance: 0.9, Confidence: 0.9},
+				{Type: TypeSemantic, Content: "The user knows three things about the scheduler.", Importance: 0.9, Confidence: 0.9},
 			},
 			wantCalls: 1,
 		},
@@ -269,7 +269,7 @@ func TestExtractionIsRunAsAClassifier(t *testing.T) {
 // row. This is what keeps a preference the user mentions every week from
 // filling the retrieval budget with copies of itself.
 func TestAKnownFactIsNotStoredTwice(t *testing.T) {
-	const fact = "The user prefers studying in the morning before class."
+	const fact = "The user keeps putting off the scheduler assignment."
 	h := newHarness(t, jsonProvider(`[{"type":"preference","content":"`+fact+`","confidence":0.9}]`))
 	h.store.seed(h.user, TypePreference, fact)
 
@@ -288,7 +288,7 @@ func TestAKnownFactIsNotStoredTwice(t *testing.T) {
 // Another user's identical memory is not a duplicate of this user's: the
 // duplicate check is scoped like everything else.
 func TestTheDuplicateCheckIsScopedToTheOwner(t *testing.T) {
-	const fact = "The user prefers studying in the morning before class."
+	const fact = "The user keeps putting off the scheduler assignment."
 	h := newHarness(t, jsonProvider(`[{"type":"preference","content":"`+fact+`","confidence":0.9}]`))
 	stranger := uuid.New()
 	h.store.seed(stranger, TypePreference, fact)
@@ -324,7 +324,7 @@ func TestExtractionFailuresStoreNothing(t *testing.T) {
 
 	t.Run("the stream is cut off partway", func(t *testing.T) {
 		h := newHarness(t, &ai.Mock{
-			Reply:     `[{"type":"semantic","content":"The user knows Go.","confidence":0.9}]`,
+			Reply:     `[{"type":"semantic","content":"The user is halfway through the operating systems course.","confidence":0.9}]`,
 			StreamErr: ai.ErrUnavailable,
 		})
 		_, err := h.svc.ExtractFromTurn(context.Background(), h.user, h.conv, realQuestion, realAnswer)
@@ -337,7 +337,7 @@ func TestExtractionFailuresStoreNothing(t *testing.T) {
 	})
 
 	t.Run("the embedding service is down", func(t *testing.T) {
-		h := newHarness(t, jsonProvider(`[{"type":"semantic","content":"The user knows Go.","confidence":0.9}]`))
+		h := newHarness(t, jsonProvider(`[{"type":"semantic","content":"The user is halfway through the operating systems course.","confidence":0.9}]`))
 		h.embedder.err = embeddings.ErrUnavailable
 		_, err := h.svc.ExtractFromTurn(context.Background(), h.user, h.conv, realQuestion, realAnswer)
 		if !errors.Is(err, ErrEmbedding) || !errors.Is(err, embeddings.ErrUnavailable) {
@@ -349,7 +349,7 @@ func TestExtractionFailuresStoreNothing(t *testing.T) {
 	})
 
 	t.Run("the write fails", func(t *testing.T) {
-		h := newHarness(t, jsonProvider(`[{"type":"semantic","content":"The user knows Go.","confidence":0.9}]`))
+		h := newHarness(t, jsonProvider(`[{"type":"semantic","content":"The user is halfway through the operating systems course.","confidence":0.9}]`))
 		h.store.createErr = errors.New("connection reset")
 		stored, err := h.svc.ExtractFromTurn(context.Background(), h.user, h.conv, realQuestion, realAnswer)
 		if err == nil {
@@ -579,7 +579,7 @@ func TestListRejectsAnUnknownSortOrType(t *testing.T) {
 // store on every call. This is the same property the Phase 2/3/4 modules pin,
 // and the reason the fakes key by owner.
 func TestEveryStoreCallCarriesTheCallersID(t *testing.T) {
-	h := newHarness(t, jsonProvider(`[{"type":"semantic","content":"The user knows Go.","confidence":0.9}]`))
+	h := newHarness(t, jsonProvider(`[{"type":"semantic","content":"The user is halfway through the operating systems course.","confidence":0.9}]`))
 	ctx := context.Background()
 
 	if _, err := h.svc.ExtractFromTurn(ctx, h.user, h.conv, realQuestion, realAnswer); err != nil {

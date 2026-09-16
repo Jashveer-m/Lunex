@@ -78,16 +78,16 @@ const extractionSystemPrompt = `You extract durable facts about a user from one 
 
 Read the exchange and list what is worth remembering about the user in the long term. Return between 0 and 3 facts.
 
-Remember what the user says about themselves: what they know or are learning, how they like to work, what they are working on, what they are trying to achieve, and what they have done.
+Remember what the user says about themselves, in any part of their life, not only their work: what they like, dislike, prefer or avoid (food and diet, hobbies, routines, how they like to work), how they live (health, family, where they live), what they know or are learning, what they are working on, what they are trying to achieve, and what they have done. Something the user says they love, hate, enjoy or regularly do is not small talk.
 
 The facts come from what the user said. The assistant's reply is there for context only -- an assistant saying it could not find something says nothing about whether the user stated a fact worth keeping.
 
-Ignore the rest: the question they asked, what the assistant said, anything the assistant looked up in their documents or tasks, small talk, and anything you would be guessing at rather than reading. If the exchange has none of the things worth remembering, return an empty list.
+Ignore the rest: the question they asked, what the assistant said, anything the assistant looked up in their documents or tasks, small talk, and anything you would be guessing at rather than reading. What a document says is not something the user knows or did: never write it as a fact about the user. A request for the assistant to do something is not something the user has done. If the exchange has none of the things worth remembering, return an empty list.
 
 Write each fact as one short sentence in the third person, starting with "The user", and make it stand on its own: it will be read months later with none of this conversation around it.
 
 Give each fact:
-- "type": one of "episodic" (something that happened), "semantic" (a standing fact about the user), "preference" (how they like to work), "project" (tied to a piece of ongoing work), "goal" (tied to something they are trying to achieve)
+- "type": one of "episodic" (something that happened), "semantic" (a standing fact about the user), "preference" (something they like, dislike, prefer or avoid -- in food, lifestyle, hobbies or work), "project" (tied to a piece of ongoing work), "goal" (tied to something they are trying to achieve)
 - "content": the sentence
 - "importance": 0.0 to 1.0, how much this is worth keeping
 - "confidence": 0.0 to 1.0, how sure you are that you read it from the exchange rather than inferred it
@@ -95,11 +95,11 @@ Give each fact:
 Reply with a JSON array and nothing else.
 
 Example exchange:
-User said: I switched my thesis topic to distributed consensus last week, and I am hopeless at getting started before lunch.
-Assistant replied: Noted. Your reading list still points at the old topic, so that will need updating.
+User said: I switched my thesis topic to distributed consensus last week, and I am hopeless at getting started before lunch. Also, I can't stand spicy food, so skip the curry place.
+Assistant replied: I could not find anything about your thesis or your eating habits in your documents or tasks. For spicy-free options, Italian or Japanese places are a safe bet.
 
 Example reply:
-[{"type":"project","content":"The user's thesis topic is distributed consensus.","importance":0.9,"confidence":0.95},{"type":"preference","content":"The user finds it hard to start work before lunch.","importance":0.6,"confidence":0.85}]
+[{"type":"project","content":"The user's thesis topic is distributed consensus.","importance":0.9,"confidence":0.95},{"type":"preference","content":"The user finds it hard to start work before lunch.","importance":0.6,"confidence":0.85},{"type":"preference","content":"The user dislikes spicy food.","importance":0.7,"confidence":0.9}]
 
 If there is nothing durable, the reply is exactly []. If you cannot produce JSON, write one fact per line as: type | importance | confidence | sentence`
 
@@ -108,14 +108,35 @@ If there is nothing durable, the reply is exactly []. If you cannot produce JSON
 // The exchange is labelled and fenced rather than replayed as real user and
 // assistant messages: this call is about the turn, not a continuation of it,
 // and a model handed a bare user message tends to answer it again.
+//
+// The assistant's reply comes first and the user's message last, nearest the
+// instruction. Measured on llama3.2:3b: "I'm vegetarian, so keep that in mind"
+// answered by "I could not find anything about your dietary preferences" gave
+// [] in every run with the user's message first -- the model took the reply's
+// "found nothing" as its own answer -- and the fact in every run with it last.
 func ExtractionPrompt(userMessage, assistantMessage string) []ai.Message {
+	return extractionPromptFor(Turn{UserMessage: userMessage, AssistantMessage: assistantMessage})
+}
+
+// extractionPromptFor is ExtractionPrompt for a whole Turn. When the turn
+// involved changes that have not happened, they are named after the exchange as
+// things that are not facts -- the request, not a record of something done.
+// The prompt is the request; RestatesUnconfirmed is the guarantee.
+func extractionPromptFor(turn Turn) []ai.Message {
+	body := "EXCHANGE\n\nAssistant replied:\n" +
+		truncate(strings.TrimSpace(turn.AssistantMessage), MaxExchangeChars) +
+		"\n\nUser said:\n" +
+		truncate(strings.TrimSpace(turn.UserMessage), MaxExchangeChars)
+	if len(turn.Unconfirmed) > 0 {
+		body += "\n\nNOT FACTS\n\nThe user asked for these changes and they have NOT happened -- they are only proposed, or were rejected:"
+		for _, c := range turn.Unconfirmed {
+			body += "\n- " + truncate(strings.TrimSpace(c), MaxContentLen)
+		}
+		body += "\nA request is not something the user did, has or is. Write no fact about these changes."
+	}
 	return []ai.Message{
 		{Role: ai.RoleSystem, Content: extractionSystemPrompt},
-		{Role: ai.RoleUser, Content: "EXCHANGE\n\nUser said:\n" +
-			truncate(strings.TrimSpace(userMessage), MaxExchangeChars) +
-			"\n\nAssistant replied:\n" +
-			truncate(strings.TrimSpace(assistantMessage), MaxExchangeChars) +
-			"\n\nReturn the JSON array now."},
+		{Role: ai.RoleUser, Content: body + "\n\nReturn the JSON array now."},
 	}
 }
 

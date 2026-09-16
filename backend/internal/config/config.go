@@ -136,7 +136,13 @@ type Config struct {
 
 // DefaultChatTimeout is the budget for one whole turn; see Config.ChatTimeout
 // for why it grew from three minutes to six.
-const DefaultChatTimeout = 6 * time.Minute
+//
+// It is eighteen now, because the three calls in the turn's tail defaulted to
+// 60s each and llama3.2:3b on the development machine measurably needs more
+// than that (one extraction was measured at 79s). They default to 180s, and
+// MaxExtractionShare needs the turn to be at least twice their sum: 3 x 180s x
+// 2 = 18m, which is also what scripts/e2e.sh recommends.
+const DefaultChatTimeout = 18 * time.Minute
 
 // MaxExtractionShare is how much of ChatTimeout the model calls that are not
 // the answer -- the two extractions after it and, since Phase 7, the routing

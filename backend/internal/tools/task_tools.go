@@ -57,7 +57,8 @@ func searchTasksTool(s Services) Tool {
 		Permission:  Read,
 		Params: []Param{
 			{Name: "query", Type: "string", Description: "the word or phrase to look for"},
-			{Name: "status", Type: "string", Description: "only tasks with this status", Enum: tasks.Statuses},
+			{Name: "status", Type: "string", Description: "only tasks with this status, if the user asked for one", Enum: tasks.Statuses,
+				Filter: true, Synonyms: taskStatusSynonyms},
 		},
 		Output: object(map[string]Schema{
 			"count": integer("how many tasks are listed"),

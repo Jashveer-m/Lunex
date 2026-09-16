@@ -610,7 +610,8 @@ a turn is added, not only when the title changes.
 ### `GET /api/v1/conversations/{id}`
 
 The conversation plus its messages, oldest first, each with the sources
-recorded for it. A conversation longer than 500 messages returns its most
+recorded for it. `messages` is always present — `[]` for a conversation with
+no messages yet. (The list endpoint is the one that leaves it out.) A conversation longer than 500 messages returns its most
 recent 500.
 
 ```json
@@ -1259,6 +1260,13 @@ was accepted and recorded — so read `status`.
 | Proposed, and the tool failed (the task was deleted meanwhile, say) | `200`, `"status": "failed"` |
 | Already approved, rejected, executed or failed — or a read | `409 action_not_pending`, naming its state |
 | Somebody else's, or no such action | `404 not_found` |
+
+When an approved change executes, the conversation turn that proposed it is
+read again for relationships, anchored to the record just created or changed,
+so edges about it attach to that record's own graph node. This happens in the
+background after the response: those edges appear in `/knowledge-graph` a
+model call later, not in this response. The turn itself stores no memory or
+edge about a change that has not been carried out.
 
 ### `POST /api/v1/actions/{id}/reject`
 

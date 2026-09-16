@@ -60,7 +60,7 @@ type Options struct {
 const (
 	DefaultExtractionTemperature = 0.1
 	DefaultExtractionMaxTokens   = 512
-	DefaultExtractionTimeout     = 60 * time.Second
+	DefaultExtractionTimeout     = 180 * time.Second
 )
 
 // Deps are everything the service needs.
@@ -120,7 +120,14 @@ func NewService(d Deps) *Service {
 // WorthExtracting gates it, why Options.Timeout bounds it, and why it runs
 // after the last token rather than before the first.
 func (s *Service) ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]Memory, error) {
-	if !WorthExtracting(userMessage, assistantMessage) {
+	return s.Extract(ctx, userID, conversationID, Turn{UserMessage: userMessage, AssistantMessage: assistantMessage})
+}
+
+// Extract is ExtractFromTurn with what the turn must not be read as: the
+// changes it only proposed and the documents it retrieved. See Turn. The chat
+// orchestrator calls this one.
+func (s *Service) Extract(ctx context.Context, userID, conversationID uuid.UUID, turn Turn) ([]Memory, error) {
+	if !WorthExtracting(turn.UserMessage, turn.AssistantMessage) {
 		s.log.Debug("memory extraction skipped: turn is too short",
 			"user_id", userID, "conversation_id", conversationID)
 		return nil, nil
@@ -129,7 +136,7 @@ func (s *Service) ExtractFromTurn(ctx context.Context, userID, conversationID uu
 	ctx, cancel := context.WithTimeout(ctx, s.opts.Timeout)
 	defer cancel()
 
-	candidates, err := s.propose(ctx, userMessage, assistantMessage)
+	candidates, err := s.propose(ctx, turn)
 	if err != nil {
 		return nil, err
 	}
@@ -181,12 +188,12 @@ func (s *Service) ExtractFromTurn(ctx context.Context, userID, conversationID uu
 }
 
 // propose runs the model and turns its reply into candidate facts.
-func (s *Service) propose(ctx context.Context, userMessage, assistantMessage string) ([]Candidate, error) {
+func (s *Service) propose(ctx context.Context, turn Turn) ([]Candidate, error) {
 	format := ""
 	if s.opts.JSONMode {
 		format = ai.FormatJSON
 	}
-	stream, err := s.provider.Chat(ctx, ExtractionPrompt(userMessage, assistantMessage), ai.Options{
+	stream, err := s.provider.Chat(ctx, extractionPromptFor(turn), ai.Options{
 		Model:       s.opts.Model,
 		Temperature: s.opts.Temperature,
 		MaxTokens:   s.opts.MaxTokens,
@@ -207,6 +214,7 @@ func (s *Service) propose(ctx context.Context, userMessage, assistantMessage str
 
 	candidates := ParseExtraction(reply)
 	if len(candidates) == 0 {
+		s.log.Debug("memory extraction kept nothing: the model proposed no facts", "reply", truncate(reply, 200))
 		return nil, nil
 	}
 
@@ -219,6 +227,21 @@ func (s *Service) propose(ctx context.Context, userMessage, assistantMessage str
 		}
 		if !AboutTheUser(c.Content) {
 			s.log.Debug("memory dropped: not a fact about the user", "content", c.Content)
+			continue
+		}
+		if !SaidByTheUser(c.Content, turn.UserMessage) {
+			s.log.Debug("memory dropped: nothing in it comes from what the user said", "content", c.Content)
+			continue
+		}
+		// The two checks below are the enforcement of what the prompt asks: a
+		// change that has not happened and a document's content are not facts
+		// about the user, however the sentence is phrased. See Turn.
+		if RestatesUnconfirmed(c.Content, turn.Unconfirmed) {
+			s.log.Debug("memory dropped: it is about a change that has not been made", "content", c.Content)
+			continue
+		}
+		if RestatesRetrieved(c.Content, turn.UserMessage, turn.Retrieved) {
+			s.log.Debug("memory dropped: it restates a retrieved document", "content", c.Content)
 			continue
 		}
 		kept = append(kept, c)

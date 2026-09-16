@@ -42,8 +42,12 @@ type (
 	// are independently switchable -- an operator who wants the assistant to
 	// use what it already knows without learning anything new wires the first
 	// and not the second (MEMORY_EXTRACTION=false).
+	//
+	// It is handed a memories.Turn rather than the two messages, because the
+	// messages alone are not enough to tell a fact from a request or from a
+	// document the answer quoted; see memories.Turn.
 	MemoryExtractor interface {
-		ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]memories.Memory, error)
+		Extract(ctx context.Context, userID, conversationID uuid.UUID, turn memories.Turn) ([]memories.Memory, error)
 	}
 	// GraphSearcher is Phase 6's 1-hop lookup: given the text of a question, it
 	// answers with the neighbourhoods of the nodes that text names. The
@@ -59,7 +63,7 @@ type (
 	// use the graph without growing it wires the first and not the second
 	// (GRAPH_EXTRACTION=false).
 	GraphExtractor interface {
-		ExtractFromTurn(ctx context.Context, userID, conversationID uuid.UUID, userMessage, assistantMessage string) ([]graph.Edge, error)
+		Extract(ctx context.Context, userID, conversationID uuid.UUID, turn graph.Turn) ([]graph.Edge, error)
 	}
 	TaskLister interface {
 		List(ctx context.Context, userID uuid.UUID, f tasks.Filter) ([]tasks.Task, error)
@@ -79,7 +83,7 @@ type (
 // Documents and memories are matched semantically. Tasks, goals and notes are
 // not -- they are selected by a plain heuristic (in progress, due soonest,
 // recently touched), because they have no embeddings yet. That difference is
-// visible to the model: a chunk or a memory arrives with a similarity score, an
+// visible to the model: a chunk or a memory arrives ranked by similarity, an
 // item arrives as background the question may or may not be about, and the
 // system prompt forbids citing anything that does not answer the question.
 //

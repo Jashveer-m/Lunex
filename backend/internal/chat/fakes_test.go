@@ -320,14 +320,18 @@ type extraction struct {
 	question  string
 	answer    string
 	ctxWasSet bool
+	// What the turn told the extractor not to read as fact.
+	unconfirmed []string
+	retrieved   []string
+	anchor      *graph.Anchor
 }
 
-func (f *fakeExtractor) ExtractFromTurn(ctx context.Context, userID, convID uuid.UUID, question, answer string) ([]memories.Memory, error) {
+func (f *fakeExtractor) Extract(ctx context.Context, userID, convID uuid.UUID, turn memories.Turn) ([]memories.Memory, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, extraction{
-		userID: userID, convID: convID, question: question, answer: answer,
-		ctxWasSet: ctx != nil,
+		userID: userID, convID: convID, question: turn.UserMessage, answer: turn.AssistantMessage,
+		ctxWasSet: ctx != nil, unconfirmed: turn.Unconfirmed, retrieved: turn.Retrieved,
 	})
 	if f.err != nil {
 		return nil, f.err
@@ -388,12 +392,12 @@ type fakeLinker struct {
 	stored []graph.Edge
 }
 
-func (f *fakeLinker) ExtractFromTurn(ctx context.Context, userID, convID uuid.UUID, question, answer string) ([]graph.Edge, error) {
+func (f *fakeLinker) Extract(ctx context.Context, userID, convID uuid.UUID, turn graph.Turn) ([]graph.Edge, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, extraction{
-		userID: userID, convID: convID, question: question, answer: answer,
-		ctxWasSet: ctx != nil,
+		userID: userID, convID: convID, question: turn.UserMessage, answer: turn.AssistantMessage,
+		ctxWasSet: ctx != nil, unconfirmed: turn.Unconfirmed, anchor: turn.Anchor,
 	})
 	if f.err != nil {
 		return nil, f.err

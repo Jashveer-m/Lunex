@@ -16,6 +16,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
+	"github.com/jashveer/lifeos/backend/internal/tools"
 )
 
 // Store is the slice of the repository the service needs. As everywhere else
@@ -325,12 +326,32 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 		"sources_retrieved", len(sources), "sources_cited", countCited(sources),
 		"answer_chars", len(text), "tool", step.toolName(), "actions", len(turnActions))
 
+	// What the extractors must not read as fact: the changes this conversation
+	// asked for that have not happened, and the documents the answer drew on.
+	unconfirmed := step.unconfirmed()
 	return Turn{
 		User: written[0], Assistant: written[1], Model: s.model(),
-		Actions:    turnActions,
-		Remembered: s.remember(ctx, userID, convID, content, text),
-		Linked:     s.link(ctx, userID, convID, content, text),
+		Actions: turnActions,
+		Remembered: s.remember(ctx, userID, convID, memories.Turn{
+			UserMessage: content, AssistantMessage: text,
+			Unconfirmed: unconfirmed, Retrieved: documentText(sources),
+		}),
+		Linked: s.link(ctx, userID, convID, graph.Turn{
+			UserMessage: content, AssistantMessage: text, Unconfirmed: unconfirmed,
+		}),
 	}, nil
+}
+
+// documentText is the text of every document passage among the sources,
+// whether retrieval or a read tool found it.
+func documentText(sources []Source) []string {
+	var out []string
+	for _, s := range sources {
+		if s.Type == SourceDocument && s.Excerpt != "" {
+			out = append(out, s.Excerpt)
+		}
+	}
+	return out
 }
 
 // remember hands the finished exchange to the memory extractor.
@@ -353,11 +374,11 @@ func (s *Service) SendMessage(ctx context.Context, userID, convID uuid.UUID, con
 // And it is given the same context as the turn, so a client that hangs up
 // cancels it. The exchange is already saved; extracting facts for a request
 // nobody is listening to can wait for the next one.
-func (s *Service) remember(ctx context.Context, userID, convID uuid.UUID, question, answer string) []memories.Memory {
+func (s *Service) remember(ctx context.Context, userID, convID uuid.UUID, turn memories.Turn) []memories.Memory {
 	if s.extractor == nil {
 		return nil
 	}
-	stored, err := s.extractor.ExtractFromTurn(ctx, userID, convID, question, answer)
+	stored, err := s.extractor.Extract(ctx, userID, convID, turn)
 	if err != nil {
 		s.log.Warn("memory extraction failed",
 			"error", err, "user_id", userID, "conversation_id", convID,
@@ -377,17 +398,95 @@ func (s *Service) remember(ctx context.Context, userID, convID uuid.UUID, questi
 // and make the turn's tail latency harder to reason about for no gain. On a
 // deployment with two model servers -- or one hosted provider -- that
 // arithmetic changes, and this is the function that would change with it.
-func (s *Service) link(ctx context.Context, userID, convID uuid.UUID, question, answer string) []graph.Edge {
+func (s *Service) link(ctx context.Context, userID, convID uuid.UUID, turn graph.Turn) []graph.Edge {
 	if s.linker == nil {
 		return nil
 	}
-	stored, err := s.linker.ExtractFromTurn(ctx, userID, convID, question, answer)
+	stored, err := s.linker.Extract(ctx, userID, convID, turn)
 	if err != nil {
 		s.log.Warn("relationship extraction failed",
 			"error", err, "user_id", userID, "conversation_id", convID,
 			"stored_before_failure", len(stored))
 	}
 	return stored
+}
+
+// ActionExecuted is the action engine's ExecutedHook: an approved change to
+// the user's data has just been made, so the relationships the turn that
+// proposed it could not record are read now, against the record it produced.
+//
+// When the turn happened, the change was only a proposal, and link dropped
+// every relationship with an end named in it rather than invent a node for a
+// task that did not exist. This is the other half: the same user message, an
+// answer that says what was actually done, and an anchor that makes an end
+// naming the record resolve to the record's own node. Approving "Renew my
+// passport" now connects the task node the approval created, rather than
+// leaving it isolated beside an extracted "passport renewal" project.
+//
+// Memories get no second pass. The change is recorded as the task, goal or
+// note itself, which retrieval already reads; a memory restating it would be a
+// second copy that does not follow the record when it is edited or deleted.
+//
+// It runs in the background after the approval has answered, and it can fail
+// only into the log.
+func (s *Service) ActionExecuted(ctx context.Context, userID uuid.UUID, a actions.Action, summary string, result tools.Result) {
+	if s.linker == nil || a.ConversationID == nil {
+		return
+	}
+	anchor := anchorFor(result)
+	if anchor == nil {
+		return
+	}
+	convID := *a.ConversationID
+	question, ok, err := s.proposingMessage(ctx, userID, convID, a)
+	if err != nil {
+		s.log.Warn("relationship extraction after approval: could not load the conversation",
+			"error", err, "user_id", userID, "action_id", a.ID)
+		return
+	}
+	if !ok {
+		s.log.Debug("relationship extraction after approval skipped: the proposing message is gone",
+			"user_id", userID, "action_id", a.ID)
+		return
+	}
+	s.link(ctx, userID, convID, graph.Turn{
+		UserMessage:      question,
+		AssistantMessage: "The user approved this change and it has been made: " + summary,
+		Anchor:           anchor,
+	})
+}
+
+// anchorFor is the record an executed write produced. Every write tool creates
+// or changes exactly one.
+func anchorFor(r tools.Result) *graph.Anchor {
+	switch {
+	case len(r.Tasks) > 0:
+		return &graph.Anchor{RefTable: "tasks", RefID: r.Tasks[0].ID, Label: r.Tasks[0].Title}
+	case len(r.Goals) > 0:
+		return &graph.Anchor{RefTable: "goals", RefID: r.Goals[0].ID, Label: r.Goals[0].Title}
+	case len(r.Notes) > 0:
+		return &graph.Anchor{RefTable: "notes", RefID: r.Notes[0].ID, Label: r.Notes[0].Title}
+	}
+	return nil
+}
+
+// proposingMessage finds the user message whose turn proposed an action.
+//
+// The action is inserted in the same transaction as the turn's messages, after
+// them, and every one of those rows takes clock_timestamp() -- so the proposing
+// message is the last user message at or before the action's timestamp. The
+// next turn's message is always after it.
+func (s *Service) proposingMessage(ctx context.Context, userID, convID uuid.UUID, a actions.Action) (string, bool, error) {
+	msgs, err := s.store.Messages(ctx, userID, convID, MaxMessagesPerRead)
+	if err != nil {
+		return "", false, err
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if m := msgs[i]; m.Role == RoleUser && !m.CreatedAt.After(a.CreatedAt) {
+			return m.Content, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // model names what actually generated the answer: the per-service override if

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -32,7 +33,17 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// LOG_LEVEL is read here rather than in config.Load because the logger has
+	// to exist before configuration can fail and be reported. debug is what
+	// shows why an extraction dropped a memory or an edge.
+	level := slog.LevelInfo
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		if err := level.UnmarshalText([]byte(v)); err != nil {
+			slog.Error("fatal", "error", "LOG_LEVEL: want debug, info, warn or error, got "+strconv.Quote(v))
+			os.Exit(1)
+		}
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
 	if err := run(logger); err != nil {
@@ -227,6 +238,12 @@ func run(logger *slog.Logger) error {
 			MemoryMinSimilarity: cfg.MemoryMinSimilarity,
 		},
 	})
+
+	// An approved change is what the relationship extractor could not see when
+	// the turn that proposed it ran; the chat service reads that turn again,
+	// anchored to the record the approval produced. A no-op when graph
+	// extraction is switched off.
+	actionSvc.OnExecuted(chatSvc.ActionExecuted)
 
 	handler := api.NewRouter(api.Deps{
 		Auth:        auth.NewHandler(service, logger),

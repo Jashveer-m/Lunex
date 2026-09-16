@@ -93,6 +93,12 @@ Give each entity a type, one of:
 
 Give each relationship a type, exactly one of: RELATED_TO, REQUIRES, DEPENDS_ON, WORKS_ON, KNOWS, INTERESTED_IN, STUDIES, COMPLETED, GOAL_OF.
 
+A relationship reads as a sentence from "from" to "to", and the direction matters:
+- REQUIRES: the work that needs something, then what it needs -- "the recipe app" REQUIRES "TypeScript", never "TypeScript" REQUIRES "the recipe app"
+- DEPENDS_ON: the blocked work, then the work it waits for
+- WORKS_ON, STUDIES, KNOWS, INTERESTED_IN, COMPLETED: the person first, then the thing
+- GOAL_OF: the goal first, then the person or project it belongs to
+
 Only list a connection the exchange actually states. The user asking a question about something does not connect them to it. Do not connect two things merely because they were mentioned in the same sentence. If the exchange states no connection, return an empty list.
 
 Give each relationship:
@@ -253,14 +259,14 @@ func ParseExtraction(reply string) []Candidate {
 		}
 		seen[key] = struct{}{}
 
-		out = append(out, Candidate{
+		out = append(out, orient(Candidate{
 			From:         from,
 			FromType:     NormalizeNodeType(w.fromType(), defaultFromType(rel)),
 			To:           to,
 			ToType:       NormalizeNodeType(w.toType(), defaultToType(rel)),
 			Relationship: rel,
 			Confidence:   clampScore(w.Confidence),
-		})
+		}))
 		if len(out) == MaxRelationshipsPerTurn {
 			break
 		}
@@ -418,6 +424,37 @@ func NormalizeNodeType(t, fallback string) string {
 		return NodeSkill
 	}
 	return fallback
+}
+
+// orient turns a relationship the model wrote backwards the right way round.
+//
+// Measured: llama3.2:3b wrote "TypeScript -REQUIRES-> the recipe app" for "my
+// recipe app needs TypeScript". Every relationship but RELATED_TO and
+// DEPENDS_ON has a direction fixed by what its ends are, and when the ends'
+// types say the arrow points the wrong way -- a skill requiring a project, a
+// skill studying a person -- the two ends are swapped. When the types do not
+// contradict the direction, nothing is touched: a type the model left out was
+// defaulted from the relationship itself, so it can never trigger a swap.
+//
+// The user is a person whatever type the model gave them.
+func orient(c Candidate) Candidate {
+	person := func(label, nodeType string) bool { return IsSelf(label) || nodeType == NodePerson }
+	backwards := false
+	switch c.Relationship {
+	case RelWorksOn, RelStudies, RelInterestedIn, RelCompleted:
+		backwards = !person(c.From, c.FromType) && person(c.To, c.ToType)
+	case RelKnows:
+		backwards = c.FromType == NodeSkill && person(c.To, c.ToType)
+	case RelRequires:
+		backwards = c.FromType == NodeSkill && c.ToType == NodeProject
+	case RelGoalOf:
+		backwards = person(c.From, c.FromType) && !person(c.To, c.ToType)
+	}
+	if backwards {
+		c.From, c.To = c.To, c.From
+		c.FromType, c.ToType = c.ToType, c.FromType
+	}
+	return c
 }
 
 // defaultFromType and defaultToType are what an unrecognised entity type falls

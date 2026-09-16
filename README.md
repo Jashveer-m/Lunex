@@ -307,6 +307,7 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `JWT_SECRET` | yes | — | ≥ 32 bytes; the process refuses to start otherwise |
 | `PORT` | no | `8080` | |
+| `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn` or `error`. `debug` logs why an extraction dropped a memory or a relationship |
 | `JWT_ISSUER` | no | `lifeos` | Validated on every access token; unchanged from Phase 1 so existing tokens keep verifying |
 | `ACCESS_TOKEN_TTL` | no | `15m` | Go duration |
 | `REFRESH_TOKEN_TTL` | no | `720h` | 30 days |
@@ -318,26 +319,26 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 | `MAX_UPLOAD_BYTES` | no | `10485760` | 10 MB; rejected before the file is read |
 | `DOCUMENT_PROCESS_TIMEOUT` | no | `2m` | Budget for one synchronous upload; also sets the server's read/write timeout |
 | `CHAT_MODEL` | no | `llama3.2:3b` | The Ollama chat model |
-| `CHAT_TIMEOUT` | no | `6m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions, which run inside it. The process refuses to start if the two extraction timeouts and `AGENT_TIMEOUT` exceed half of this |
+| `CHAT_TIMEOUT` | no | `18m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions, which run inside it. The process refuses to start if the two extraction timeouts and `AGENT_TIMEOUT` exceed half of this |
 | `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
 | `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
 | `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
 | `MEMORY_EXTRACTION` | no | `true` | The writing half. `false` keeps retrieval and stops the assistant learning anything new |
 | `MEMORY_MODEL` | no | `CHAT_MODEL` | Which model extracts. A smaller one is reasonable: it classifies, it does not converse |
-| `MEMORY_EXTRACT_TIMEOUT` | no | `60s` | Bounds one extraction; the latency memory adds to the end of a turn |
+| `MEMORY_EXTRACT_TIMEOUT` | no | `180s` | Bounds one extraction; the latency memory adds to the end of a turn |
 | `MEMORY_TEMPERATURE` | no | `0.1` | 0–2. Near zero: extraction is a reading task |
 | `MEMORY_MAX_TOKENS` | no | `512` | Extraction reply cap |
 | `MEMORY_MIN_SIMILARITY` | no | `0.6` | 0–1. Retrieval floor for memories, tuned separately from the document one and higher |
 | `MEMORY_JSON_MODE` | no | `false` | Constrain extraction to JSON. Off: it makes llama3.2:3b answer `{}` and pad whitespace |
 | `GRAPH_EXTRACTION` | no | `true` | The writing half of the graph. `false` keeps node sync and the 1-hop lookup, and stops the assistant inferring new relationships |
 | `GRAPH_MODEL` | no | `CHAT_MODEL` | Which model extracts relationships |
-| `GRAPH_EXTRACT_TIMEOUT` | no | `60s` | Bounds one relationship extraction; the second piece of latency at the end of a turn |
+| `GRAPH_EXTRACT_TIMEOUT` | no | `180s` | Bounds one relationship extraction; the second piece of latency at the end of a turn |
 | `GRAPH_TEMPERATURE` | no | `0.1` | 0–2. Near zero: extraction is a reading task |
 | `GRAPH_MAX_TOKENS` | no | `512` | Extraction reply cap |
 | `GRAPH_JSON_MODE` | no | `false` | As `MEMORY_JSON_MODE`, and off for the same measured reason |
 | `AGENT_TOOLS` | no | `true` | The assistant's tools: routing, searches and proposals. `false` is the Phase 6 assistant; the approval endpoints stay, so existing proposals can still be decided |
 | `AGENT_MODEL` | no | `CHAT_MODEL` | Which model makes the routing decision |
-| `AGENT_TIMEOUT` | no | `60s` | Bounds one routing decision. Spent *before* the first token, and counted inside `CHAT_TIMEOUT` |
+| `AGENT_TIMEOUT` | no | `180s` | Bounds one routing decision. Spent *before* the first token, and counted inside `CHAT_TIMEOUT` |
 | `AGENT_TEMPERATURE` | no | `0.1` | 0–2. Near zero: it is a classification |
 | `AGENT_MAX_TOKENS` | no | `200` | Routing reply cap; a decision is one short JSON object |
 

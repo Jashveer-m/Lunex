@@ -56,8 +56,11 @@ type conversationResponse struct {
 	MessageCount int    `json:"message_count"`
 	CreatedAt    string `json:"created_at"`
 	UpdatedAt    string `json:"updated_at"`
-	// Messages is present on the single-conversation read only.
-	Messages []messageResponse `json:"messages,omitempty"`
+	// Messages is present on the single-conversation read only, and there it
+	// is always present -- `[]` for a conversation with no messages yet. It is
+	// a pointer so that omitempty can tell "not this endpoint" (nil) from
+	// "none" (an empty slice), which on a plain slice it cannot.
+	Messages *[]messageResponse `json:"messages,omitempty"`
 }
 
 type messageResponse struct {
@@ -172,10 +175,11 @@ func toResponse(c Conversation, withMessages bool) conversationResponse {
 		UpdatedAt:    c.UpdatedAt.UTC().Format(httpx.TimeFormat),
 	}
 	if withMessages {
-		out.Messages = make([]messageResponse, 0, len(c.Messages))
+		msgs := make([]messageResponse, 0, len(c.Messages))
 		for _, m := range c.Messages {
-			out.Messages = append(out.Messages, toMessageResponse(m))
+			msgs = append(msgs, toMessageResponse(m))
 		}
+		out.Messages = &msgs
 	}
 	return out
 }

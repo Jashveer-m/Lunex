@@ -94,12 +94,17 @@ func TestAnswerIsGroundedInARetrievedDocument(t *testing.T) {
 		t.Fatalf("SendMessage: %v", err)
 	}
 
-	// The chunk reached the model, with its label and its score.
+	// The chunk reached the model with its label -- and without its score,
+	// which the model would otherwise repeat to the user. The score is on the
+	// source, checked below.
 	prompt := ai.PromptText(h.provider.LastPrompt())
-	for _, want := range []string{"aurora borealis", "[S1]", "field-notes.md", "similarity 0.78"} {
+	for _, want := range []string{"aurora borealis", "[S1]", "field-notes.md"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt is missing %q:\n%s", want, prompt)
 		}
+	}
+	if strings.Contains(prompt, "similarity 0.78") {
+		t.Fatalf("prompt leaks the retrieval score:\n%s", prompt)
 	}
 
 	// The sources were announced before any token, and recorded on the message.

@@ -69,7 +69,7 @@ func TestContextBlockRendersOneHeaderPerSource(t *testing.T) {
 		{Label: "S2", Type: SourceTask, Title: "Ship it", Excerpt: "priority high"},
 	})
 	for _, want := range []string{
-		`[S1] document: "notes.md" (chunk 3, similarity 0.61)`,
+		`[S1] document: "notes.md" (chunk 3)`,
 		"body text",
 		`[S2] task: "Ship it"`,
 		"priority high",
@@ -77,6 +77,11 @@ func TestContextBlockRendersOneHeaderPerSource(t *testing.T) {
 		if !strings.Contains(block, want) {
 			t.Fatalf("block is missing %q:\n%s", want, block)
 		}
+	}
+	// The score is metadata for the client, not text for the model: shown it,
+	// the model recited "a similarity of 0.61" to the user.
+	if strings.Contains(block, "similarity") || strings.Contains(block, "0.61") {
+		t.Fatalf("block leaks the retrieval score to the model:\n%s", block)
 	}
 }
 

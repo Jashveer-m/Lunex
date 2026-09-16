@@ -46,7 +46,8 @@ func searchNotesTool(s Services) Tool {
 		Permission:  Read,
 		Params: []Param{
 			{Name: "query", Type: "string", Description: "the word or phrase to look for"},
-			{Name: "tag", Type: "string", Description: "only notes with this tag"},
+			{Name: "tag", Type: "string", Description: "only notes with this tag, if the user named one", Filter: true,
+				Cues: []string{"tag", "tags", "tagged"}},
 		},
 		Output: object(map[string]Schema{
 			"count": integer("how many notes are listed"),

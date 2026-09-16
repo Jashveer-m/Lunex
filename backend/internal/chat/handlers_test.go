@@ -282,8 +282,24 @@ func TestConversationEndpoints(t *testing.T) {
 		t.Fatalf("created = %v", created)
 	}
 
+	// Before any turn the read still carries `messages`, as `[]`: docs/api.md
+	// says the field is always present, and a client that trusted that broke
+	// when an empty conversation came back without it.
+	empty, err := srv.Client().Get(srv.URL + "/" + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := decodeJSON(t, empty)
+	if msgs, ok := fresh["messages"].([]any); !ok || len(msgs) != 0 {
+		t.Fatalf("an empty conversation read as %v, want messages: []", fresh)
+	}
+
 	// A turn, so the read has something to return.
-	post(t, srv, "/"+id+"/messages", map[string]any{"content": "A question?"}, false).Body.Close()
+	// Read to the end, so the turn is persisted before the read below rather
+	// than cancelled by the client hanging up on the stream.
+	turn := post(t, srv, "/"+id+"/messages", map[string]any{"content": "A question?"}, false)
+	_, _ = io.Copy(io.Discard, turn.Body)
+	turn.Body.Close()
 
 	get, err := srv.Client().Get(srv.URL + "/" + id)
 	if err != nil {
@@ -307,6 +323,12 @@ func TestConversationEndpoints(t *testing.T) {
 	listed := decodeJSON(t, list)
 	if count, _ := listed["count"].(float64); count != 2 {
 		t.Fatalf("listed %v conversations, want 2", count)
+	}
+	// The list is the one read that leaves messages out.
+	for _, c := range listed["conversations"].([]any) {
+		if _, has := c.(map[string]any)["messages"]; has {
+			t.Fatalf("a listed conversation carries messages: %v", c)
+		}
 	}
 
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/"+id, nil)

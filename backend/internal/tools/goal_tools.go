@@ -51,7 +51,8 @@ func searchGoalsTool(s Services) Tool {
 		Permission:  Read,
 		Params: []Param{
 			{Name: "query", Type: "string", Description: "the word or phrase to look for"},
-			{Name: "status", Type: "string", Description: "only goals with this status", Enum: goals.Statuses},
+			{Name: "status", Type: "string", Description: "only goals with this status, if the user asked for one", Enum: goals.Statuses,
+				Filter: true, Synonyms: goalStatusSynonyms},
 		},
 		Output: object(map[string]Schema{
 			"count": integer("how many goals are listed"),

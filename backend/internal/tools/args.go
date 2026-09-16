@@ -41,6 +41,14 @@ var placeholders = map[string]struct{}{
 	"unknown": {}, "not specified": {}, "unspecified": {},
 }
 
+// isPlaceholder reports whether s is a placeholder, including one written as a
+// template slot -- "<unknown>", "[none]" -- which is how llama3.2:3b echoes the
+// `<tool name>` in the routing prompt's reply format.
+func isPlaceholder(s string) bool {
+	_, empty := placeholders[strings.ToLower(strings.TrimSpace(strings.Trim(s, "<>[]{}")))]
+	return empty
+}
+
 // String returns the first of the named arguments that holds a value, as a
 // trimmed string. Numbers and booleans are rendered rather than dropped.
 func (a Args) String(names ...string) string {
@@ -61,7 +69,7 @@ func (a Args) String(names ...string) string {
 			continue
 		}
 		s = strings.TrimSpace(s)
-		if _, empty := placeholders[strings.ToLower(s)]; empty {
+		if isPlaceholder(s) {
 			continue
 		}
 		return s
@@ -93,7 +101,7 @@ func (a Args) Strings(names ...string) []string {
 		kept := out[:0]
 		for _, s := range out {
 			s = strings.TrimSpace(s)
-			if _, empty := placeholders[strings.ToLower(s)]; !empty {
+			if !isPlaceholder(s) {
 				kept = append(kept, s)
 			}
 		}

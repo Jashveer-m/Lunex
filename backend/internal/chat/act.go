@@ -2,8 +2,10 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -241,7 +243,8 @@ func (t toolStep) actionsBlock(sources []Source) string {
 		// happen once you approve it" in every sample.
 		line := "You prepared a change that has not been made yet. Reply by telling the user, in your own words, " +
 			"that you have prepared it, what it will do (" + strings.TrimSuffix(t.call.Summary, ".") + "), " +
-			"and that it will only happen once they approve it with the controls shown with your reply. Never say that it is done."
+			"and that it will only happen once they press Approve on the card shown with your reply (or Reject to cancel it). " +
+			"Never say that it is done, and never ask the user to type or reply anything to approve it: typing in the chat does nothing."
 		if t.reused != nil {
 			line += " (The same change was already proposed earlier in this conversation and is still waiting; it was not proposed twice.)"
 		}
@@ -268,7 +271,7 @@ func (t toolStep) actionsBlock(sources []Source) string {
 func statusInWords(a actions.Action) string {
 	switch a.Status {
 	case actions.StatusProposed:
-		return "still waiting for the user to approve or reject it."
+		return "still waiting for the user to approve or reject it with the Approve or Reject button on its card."
 	case actions.StatusApproved:
 		return "the user approved it, and whether it completed is not known."
 	case actions.StatusRejected:
@@ -300,6 +303,58 @@ func (t toolStep) turnActions(recorded []actions.Action) []TurnAction {
 		out = append(out, TurnAction{Action: *t.reused, Summary: t.call.Summary})
 	}
 	return out
+}
+
+// unconfirmed is the text of every change this conversation has asked for that
+// has not been made: the one this turn proposed (or found already waiting),
+// and each earlier proposal that is still waiting, was rejected, or failed.
+// An executed one is not in it -- that change is reality. It is what the
+// extractors are told not to read as fact; see memories.Turn.
+func (t toolStep) unconfirmed() []string {
+	var out []string
+	if t.call != nil && t.call.Permission == tools.Write {
+		out = append(out, changeText(t.call.Input))
+	}
+	for _, a := range t.recent {
+		if a.Status != actions.StatusExecuted {
+			out = append(out, changeText(a.Input))
+		}
+	}
+	return out
+}
+
+// changeText is what a change is about, read off its canonical input: the
+// title, content and the rest of the free text it carries -- not the ids and
+// dates, and not the closed-set values (a status of "completed", a priority of
+// "high"), which say how the change is made rather than what it is about and
+// would otherwise match any fact that uses the word.
+func changeText(input []byte) string {
+	var fields map[string]any
+	if json.Unmarshal(input, &fields) != nil {
+		return ""
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		if k == "deadline" || k == "status" || k == "priority" || k == "type" || strings.HasSuffix(k, "_id") {
+			continue
+		}
+		switch v := fields[k].(type) {
+		case string:
+			parts = append(parts, v)
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					parts = append(parts, s)
+				}
+			}
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 // toolName is the tool the turn used, for the log.

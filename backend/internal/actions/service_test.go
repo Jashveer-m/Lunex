@@ -242,3 +242,51 @@ func TestRecentIsThisConversationsWrites(t *testing.T) {
 		t.Fatalf("recent = %+v", got)
 	}
 }
+
+// A write that ran is announced to the hook -- with its summary and the records
+// it produced, on a context the request cannot cancel -- and nothing else is:
+// not a rejection, and not an approval whose tool failed. The hook is how the
+// knowledge graph learns about the task only once it exists.
+func TestOnlyAnExecutedWriteReachesTheExecutedHook(t *testing.T) {
+	type call struct {
+		action  Action
+		summary string
+		result  tools.Result
+		live    bool
+	}
+	e := newEngine()
+	calls := make(chan call, 4)
+	e.svc.OnExecuted(func(ctx context.Context, userID uuid.UUID, a Action, summary string, r tools.Result) {
+		calls <- call{a, summary, r, ctx.Err() == nil}
+	})
+
+	approved := e.propose(e.user, "Renew the passport")
+	req, cancel := context.WithCancel(context.Background())
+	if _, err := e.svc.Approve(req, e.user, approved.ID); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	got := <-calls
+	if got.action.ID != approved.ID || got.action.Status != StatusExecuted || !got.live ||
+		!strings.Contains(got.summary, "Renew the passport") ||
+		len(got.result.Tasks) != 1 || got.result.Tasks[0].Title != "Renew the passport" {
+		t.Fatalf("hook got %+v", got)
+	}
+
+	rejected := e.propose(e.user, "Book a flight to Delhi")
+	if _, err := e.svc.Reject(context.Background(), e.user, rejected.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.tasks.err = errors.New("database down")
+	failed := e.propose(e.user, "Water the plants")
+	if _, err := e.svc.Approve(context.Background(), e.user, failed.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case extra := <-calls:
+		t.Fatalf("the hook ran for %+v", extra.action)
+	default:
+		// Approve returns after the goroutine would have been started, and
+		// neither of these starts one.
+	}
+}

@@ -32,6 +32,7 @@
 | Tool registry: the approval gate, canonical inputs, reference resolution, dates (fakes) | `internal/tools/*_test.go` | no |
 | Routing: the gate, the prompt, the parser, the router's failure modes (MockProvider) | `internal/agents/agents_test.go` | no |
 | Routing quality against a real model (opt-in: `LUNEX_ROUTING_EVAL=1`) | `internal/agents/ollama_eval_test.go` | no, but Ollama |
+| Memory extraction against a real model: non-work preferences, proposals, restated documents (opt-in: `LUNEX_MEMORY_EVAL=1`) | `internal/memories/ollama_eval_test.go` | no, but Ollama |
 | Action engine: approve/reject, single use, sanitized failures, strict bodies (in-memory store) | `internal/actions/*_test.go` | no |
 | Orchestrator: proposals, reads as sources, the ACTIONS section, rule 8 (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
 | Phase 6 SQL: graph constraints, upserts, 1-hop queries, the delete trigger | `internal/db/phase6_integration_test.go` | **yes** |
@@ -76,12 +77,16 @@ where pgvector is not installed:
 brew install pgvector        # or: apt install postgresql-16-pgvector
 ```
 
-None of the Go tests need Ollama, except one that asks for it by name:
+None of the Go tests need Ollama, except two that ask for it by name. The first,
 `LUNEX_ROUTING_EVAL=1 go test ./internal/agents -run Ollama -v -timeout 30m`
 runs the production routing gate, prompt and parser against a real model over
 24 messages and fails on a write proposed for a message that asked for none, or
 on accuracy under 85%. It is the reproducible form of the measurement in
-`docs/decisions.md`. The document tests use a deterministic
+`docs/decisions.md`. The second,
+`LUNEX_MEMORY_EVAL=1 go test ./internal/memories -run Ollama -v -timeout 60m`,
+runs the memory extraction prompt, parser and filters over non-work
+preferences, a proposed change and a restated document, each
+`LUNEX_MEMORY_EVAL_RUNS` times (default 3). The document tests use a deterministic
 bag-of-words embedder (`internal/api/embedder_test.go`) and the chat and memory
 tests use `ai.Mock`, so that what they measure is the routing, the SQL scoping
 and the pipeline's own logic — not whether a model understood a sentence.

@@ -107,7 +107,7 @@ Be concise and direct. Do not repeat these rules back to the user.`
 const readOnlyRule = `8. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
 
 // proposalRule is rule 8 for an assistant that can use tools.
-const proposalRule = `8. You never change the user's data yourself. When the user asks for a task, goal or note to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. Replying in the chat does not approve it, even if the user says so. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
+const proposalRule = `8. You never change the user's data yourself. When the user asks for a task, goal or note to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
 
 // systemPromptFor is the system prompt with the rule 8 that matches what the
 // assistant can actually do.
@@ -181,16 +181,17 @@ func contextBlock(sources []Source) string {
 
 // header is the one line that identifies a source to the model, and the only
 // place its label is spelled.
+//
+// The retrieval score is deliberately not in it. It used to be -- "(chunk 3,
+// similarity 0.61)" -- on the theory that it told the model how strong a match
+// was, and llama3.2:3b repeated it to the user ("with a similarity of 0.79"),
+// which is an internal number presented as part of the answer. The score stays
+// on the Source, where the client shows it as metadata; the model gets the
+// sources in relevance order, which is the part of the score it can use.
 func (s Source) header() string {
 	head := "[" + s.Label + "] " + s.Type + ": " + strconv.Quote(s.Title)
-	switch {
-	case s.ChunkIndex != nil && s.Similarity != nil:
-		head += fmt.Sprintf(" (chunk %d, similarity %.2f)", *s.ChunkIndex, *s.Similarity)
-	case s.Similarity != nil:
-		// A memory: no chunk to name, but the score is worth showing for the
-		// same reason a document's is -- it tells the model how sure the match
-		// was, rather than presenting everything retrieved as equally relevant.
-		head += fmt.Sprintf(" (similarity %.2f)", *s.Similarity)
+	if s.ChunkIndex != nil {
+		head += fmt.Sprintf(" (chunk %d)", *s.ChunkIndex)
 	}
 	return head
 }

@@ -275,3 +275,90 @@ func TestTheGateSkipsConversationAndKeepsRequests(t *testing.T) {
 		}
 	}
 }
+
+// A filter value has to come from the message. Measured: llama3.2:3b routed
+// questions about seedlings to search_notes with `tag: "<unknown>"` and with
+// `tag: "greenhouse"` -- neither said by the user -- and the searches ran with
+// them and found nothing. The router leaves an ungrounded filter out, keeps the
+// rest of the call, and keeps a filter the user did give.
+func TestTheRouterDropsFilterValuesTheMessageDoesNotGive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		message, reply string
+		tool, param    string
+		want           string // "" means the argument must be gone
+	}{
+		"an invented tag": {
+			"What do my notes say about watering the seedlings?",
+			`{"tool": "search_notes", "arguments": {"query": "seedlings", "tag": "greenhouse"}}`,
+			tools.SearchNotes, "tag", ""},
+		"a placeholder tag": {
+			"What do my notes say about watering the seedlings?",
+			`{"tool": "search_notes", "arguments": {"query": "seedlings", "tag": "<unknown>"}}`,
+			tools.SearchNotes, "tag", ""},
+		"a topic word is not a tag": {
+			"Search my greenhouse notes for seedlings",
+			`{"tool": "search_notes", "arguments": {"query": "seedlings", "tag": "greenhouse"}}`,
+			tools.SearchNotes, "tag", ""},
+		"a tag the user named": {
+			"Search my notes tagged greenhouse for seedlings",
+			`{"tool": "search_notes", "arguments": {"query": "seedlings", "tag": "greenhouse"}}`,
+			tools.SearchNotes, "tag", "greenhouse"},
+		"a hashtag": {
+			"anything in #greenhouse about seedlings?",
+			`{"tool": "search_notes", "arguments": {"query": "seedlings", "tag": "greenhouse"}}`,
+			tools.SearchNotes, "tag", "greenhouse"},
+		"an invented status": {
+			"Which of my tasks mention the antenna?",
+			`{"tool": "search_tasks", "arguments": {"query": "antenna", "status": "pending"}}`,
+			tools.SearchTasks, "status", ""},
+		"a status named by a synonym": {
+			"Which tasks have I finished this week?",
+			`{"tool": "search_tasks", "arguments": {"status": "completed"}}`,
+			tools.SearchTasks, "status", "completed"},
+		"a goal status named as written": {
+			"Show my active goals",
+			`{"tool": "search_goals", "arguments": {"status": "active"}}`,
+			tools.SearchGoals, "status", "active"},
+		"an invented goal status": {
+			"What goals do I have about running?",
+			`{"tool": "search_goals", "arguments": {"query": "running", "status": "abandoned"}}`,
+			tools.SearchGoals, "status", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := NewRouter(&ai.Mock{Reply: tc.reply}, standard(), quiet(), Options{})
+			d, err := r.Decide(context.Background(), General, tc.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Tool != tc.tool {
+				t.Fatalf("decision = %+v, want %s kept", d, tc.tool)
+			}
+			_, present := d.Args[tc.param]
+			switch {
+			case tc.want == "" && present:
+				t.Fatalf("%s = %v survived; the message does not give it", tc.param, d.Args[tc.param])
+			case tc.want != "" && d.Args.String(tc.param) != tc.want:
+				t.Fatalf("%s = %v, want %q kept", tc.param, d.Args[tc.param], tc.want)
+			}
+			// The rest of the call is kept: the question is still answered.
+			if q, ok := d.Args["query"]; ok && q == "" {
+				t.Fatalf("query lost: %+v", d.Args)
+			}
+		})
+	}
+}
+
+// Filters are the only arguments checked. A create_task's title is the model's
+// own wording and a priority is a judgement; both are shown to the user in the
+// proposal before anything happens.
+func TestTheRouterDoesNotGroundWriteArguments(t *testing.T) {
+	r := NewRouter(&ai.Mock{Reply: `{"tool": "create_task", "arguments": {"title": "Renew passport", "priority": "high"}}`},
+		standard(), quiet(), Options{})
+	d, err := r.Decide(context.Background(), General, "Add a task to renew my passport, it's urgent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Args.String("title") != "Renew passport" || d.Args.String("priority") != "high" {
+		t.Fatalf("decision = %+v, want the write's arguments untouched", d)
+	}
+}
