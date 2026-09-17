@@ -78,6 +78,9 @@ type Options struct {
 
 // Deps are everything the orchestrator needs.
 //
+// Calendar is optional on the same terms as the four below: a nil one is an
+// assistant that retrieves what Phase 7 did, with no calendar in its context.
+//
 // Four of them are optional and independently so: a nil Memories is an
 // assistant that retrieves exactly what Phase 4 did, a nil MemoryExtractor is
 // one that uses what it already knows without learning anything new, and Graph
@@ -100,6 +103,7 @@ type Deps struct {
 	Tasks           TaskLister
 	Goals           GoalLister
 	Notes           NoteLister
+	Calendar        EventLister
 	Router          ToolRouter
 	Tools           ToolRunner
 	Actions         ActionLog
@@ -122,6 +126,7 @@ type Service struct {
 	tasks     TaskLister
 	goals     GoalLister
 	notes     NoteLister
+	calendar  EventLister
 	router    ToolRouter
 	tools     ToolRunner
 	actions   ActionLog
@@ -152,7 +157,7 @@ func NewService(d Deps) *Service {
 		store: d.Store, provider: d.Provider,
 		docs: d.Documents, memories: d.Memories, extractor: d.MemoryExtractor,
 		graph: d.Graph, linker: d.GraphExtractor,
-		tasks: d.Tasks, goals: d.Goals, notes: d.Notes,
+		tasks: d.Tasks, goals: d.Goals, notes: d.Notes, calendar: d.Calendar,
 		router: d.Router, tools: d.Tools, actions: d.Actions, agent: agent,
 		log: log, opts: opts, now: time.Now,
 	}
@@ -466,6 +471,8 @@ func anchorFor(r tools.Result) *graph.Anchor {
 		return &graph.Anchor{RefTable: "goals", RefID: r.Goals[0].ID, Label: r.Goals[0].Title}
 	case len(r.Notes) > 0:
 		return &graph.Anchor{RefTable: "notes", RefID: r.Notes[0].ID, Label: r.Notes[0].Title}
+	case len(r.Events) > 0:
+		return &graph.Anchor{RefTable: "calendar_events", RefID: r.Events[0].ID, Label: r.Events[0].Title}
 	}
 	return nil
 }

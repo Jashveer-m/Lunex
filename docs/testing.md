@@ -11,6 +11,7 @@
 | Three-state PATCH fields | `internal/optional/optional_test.go` | no |
 | Shared field rules | `internal/validate/validate_test.go` | no |
 | Task / goal / note validation and use cases (fakes) | `internal/{tasks,goals,notes}/*_test.go` | no |
+| Calendar validation, the required window, interval rules, link ownership, node sync (fakes) | `internal/calendar/*_test.go` | no |
 | Chunking, text extraction, filename and query rules | `internal/documents/{chunk,extract,validate}_test.go` | no |
 | Document pipeline use cases (fake store + fake embedder) | `internal/documents/service_test.go` | no |
 | Ollama client: batching, widths, outages | `internal/embeddings/ollama_test.go` | no |
@@ -34,11 +35,15 @@
 | Routing quality against a real model (opt-in: `LUNEX_ROUTING_EVAL=1`) | `internal/agents/ollama_eval_test.go` | no, but Ollama |
 | Memory extraction against a real model: non-work preferences, proposals, restated documents (opt-in: `LUNEX_MEMORY_EVAL=1`) | `internal/memories/ollama_eval_test.go` | no, but Ollama |
 | Action engine: approve/reject, single use, sanitized failures, strict bodies (in-memory store) | `internal/actions/*_test.go` | no |
-| Orchestrator: proposals, reads as sources, the ACTIONS section, rule 8 (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
+| Orchestrator: proposals, reads as sources, the ACTIONS section, rule 9 (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
+| Orchestrator: the calendar heuristic, event sources, proposing an event (fakes + MockProvider) | `internal/chat/calendar_test.go` | no |
+| Moments and windows: times of day, named stretches, what is not a date | `internal/tools/moments_test.go` | no |
 | Phase 6 SQL: graph constraints, upserts, 1-hop queries, the delete trigger | `internal/db/phase6_integration_test.go` | **yes** |
 | Phase 7 SQL: the approval gate, constraints, turn atomicity, cascades, the `q` filter | `internal/db/phase7_integration_test.go` | **yes** |
+| Phase 8 SQL: the overlap query, the interval CHECK, the two cascades, the event node | `internal/db/phase8_integration_test.go` | **yes** |
 | Cross-user isolation over the whole stack, documents included | `internal/api/isolation_test.go` | **yes** |
 | Phase 7 over HTTP: propose → approve/reject, concurrency, isolation | `internal/api/actions_isolation_test.go` | **yes** |
+| Phase 8 over HTTP: calendar isolation, foreign links, the required range, overlap, node sync | `internal/api/calendar_isolation_test.go` | **yes** |
 | The whole pipeline and the assistant against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
 
 ## Running
@@ -234,6 +239,25 @@ as done. What a 3B model writes is wording; that nothing was created is asserted
 against the database.
 
 `E2E_ONLY=actions ./scripts/e2e.sh` runs only the preflight, registration and
+this check.
+
+Since Phase 8 it ends with the same rule applied to the calendar, which is that
+phase's brief in one sequence:
+
+- **schedule something** — "Add a dentist appointment to my calendar on
+  2026-11-19 at 3pm." must produce one `action` frame naming
+  `create_calendar_event`, proposed, with a start on that day — and
+  `GET /calendar` for that day must still be empty;
+- **approve it** — the event must then be on the calendar, starting at exactly
+  the time the proposal showed, and a second approval must be `409` without
+  making a second event;
+- **its node** — `GET /knowledge-graph?type=event` must hold one node mirroring
+  it, like every other row the graph mirrors;
+- **read it back** — "What is on my calendar on 2026-11-19?" must run
+  `search_calendar` over that day, surface the event as a `tool` source, and
+  change nothing.
+
+`E2E_ONLY=calendar ./scripts/e2e.sh` runs only the preflight, registration and
 this check.
 
 The script builds the API and runs the binary directly, and refuses to start if

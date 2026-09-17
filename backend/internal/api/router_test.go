@@ -16,6 +16,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
@@ -78,6 +79,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	taskSvc := tasks.NewService(tasks.NewRepository(pool), tasks.WithNodeSync(graphSvc))
 	goalSvc := goals.NewService(goals.NewRepository(pool), goals.WithNodeSync(graphSvc))
 	noteSvc := notes.NewService(notes.NewRepository(pool), notes.WithNodeSync(graphSvc))
+	calendarSvc := calendar.NewService(calendar.NewRepository(pool), calendar.WithNodeSync(graphSvc))
 	// The assistant runs against a mock model for the same reason the document
 	// tests run against a deterministic embedder: what these tests measure is
 	// the routing and the SQL scoping, not whether a model understood a
@@ -95,7 +97,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	// every write tool has to pass through.
 	actionRepo := actions.NewRepository(pool)
 	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
-		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc, Calendar: calendarSvc,
 		DocumentMinSimilarity: 0.5,
 	})...)
 	if err != nil {
@@ -106,7 +108,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Store: chat.NewRepository(pool), Provider: provider,
 		Documents: docSvc, Memories: memorySvc, MemoryExtractor: memorySvc,
 		Graph: graphSvc, GraphExtractor: graphSvc,
-		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc,
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Calendar: calendarSvc,
 		Router: agents.NewRouter(provider, registry, discard, agents.Options{}),
 		Tools:  registry, Actions: actionSvc,
 		Logger: discard,
@@ -128,6 +130,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Tasks:       tasks.NewHandler(taskSvc, discard),
 		Goals:       goals.NewHandler(goalSvc, discard),
 		Notes:       notes.NewHandler(noteSvc, discard),
+		Calendar:    calendar.NewHandler(calendarSvc, discard),
 		Documents:   documents.NewHandler(docSvc, discard, 0),
 		Chat:        chat.NewHandler(chatSvc, discard),
 		Memories:    memories.NewHandler(memorySvc, discard),
@@ -256,7 +259,7 @@ func TestUnknownRouteIs404(t *testing.T) {
 	}
 }
 
-// Every Phase 2-7 route sits behind RequireAuth. This is the cheap half of the
+// Every Phase 2-8 route sits behind RequireAuth. This is the cheap half of the
 // isolation story: without a token there is no user id on the context, so a
 // handler never runs at all. The other half — one user reaching another
 // user's rows — is in isolation_test.go, against real SQL.
@@ -277,6 +280,11 @@ func TestResourceRoutesRequireAuth(t *testing.T) {
 		{http.MethodDelete, "/api/v1/goals/" + id},
 		{http.MethodPost, "/api/v1/goals/" + id + "/milestones"},
 		{http.MethodPatch, "/api/v1/goals/" + id + "/milestones/" + id},
+		{http.MethodGet, "/api/v1/calendar"},
+		{http.MethodPost, "/api/v1/calendar"},
+		{http.MethodGet, "/api/v1/calendar/" + id},
+		{http.MethodPatch, "/api/v1/calendar/" + id},
+		{http.MethodDelete, "/api/v1/calendar/" + id},
 		{http.MethodGet, "/api/v1/notes"},
 		{http.MethodPost, "/api/v1/notes"},
 		{http.MethodGet, "/api/v1/notes/" + id},

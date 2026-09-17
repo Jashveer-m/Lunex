@@ -135,7 +135,7 @@ export type LunexDocument = {
 
 // --- chat ------------------------------------------------------------------
 
-export type SourceType = 'document' | 'memory' | 'graph' | 'task' | 'goal' | 'note'
+export type SourceType = 'document' | 'memory' | 'graph' | 'task' | 'goal' | 'note' | 'event'
 
 export type Source = {
   type: SourceType

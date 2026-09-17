@@ -24,8 +24,15 @@
 # another and reject it, and confirm nothing was created; and ask it to find a
 # task, which must run the search without asking anybody.
 #
+# Then the calendar check, which is the same rule for Phase 8: ask the
+# assistant to schedule something and confirm it was proposed and the calendar
+# is still empty; approve it and confirm the event is in GET /calendar with the
+# time that was proposed; confirm its graph node appeared; and ask what is on
+# that day, which must run search_calendar and cite the event.
+#
 # E2E_ONLY=actions runs the preflight, registration and the action check and
 # nothing else -- a few minutes rather than most of an hour on a slow machine.
+# E2E_ONLY=calendar does the same for the calendar check.
 #
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
 # generation, real extraction.
@@ -227,8 +234,8 @@ ask() {
     > "$3"
 }
 
-# E2E_ONLY=actions skips straight to the Phase 7 check.
-if [ "${E2E_ONLY:-}" != "actions" ]; then
+# E2E_ONLY=actions and E2E_ONLY=calendar skip straight to their own check.
+if [ -z "${E2E_ONLY:-}" ]; then
 
 step "Uploading a text file"
 FILE="$(mktemp -d)/field-notes.txt"
@@ -690,22 +697,25 @@ fi # E2E_ONLY
 # matches them: the counts below are `?q=` searches for them, and mean exactly
 # what they say.
 
+# claims_done <answer> -- warn when the model says a proposal was carried out.
+# It is a warning rather than a failure: what a 3B model writes is a matter of
+# wording, and the property that matters -- nothing was created -- is asserted
+# separately against the database. But it is exactly the lie rule 9 exists to
+# prevent, so a run that shows it says so. Both the action check and the
+# calendar check use it, so it is defined outside them.
+claims_done() {
+  if echo "$1" | grep -qiE "(I('ve| have) (created|added|scheduled|set up|booked)|has been (created|added|scheduled|booked)|is now (done|created|added|scheduled)|(it|that) is done|I created|I added|I scheduled|I booked)"; then
+    printf '  \033[33mwarn\033[0m the answer describes the proposal as done: %s\n' "$(echo "$1" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
+if [ "${E2E_ONLY:-}" != "calendar" ]; then
+
 # task_count <q> -- how many of the user's tasks match a search.
 task_count() {
   local body
   body=$(curl -s "${API}/api/v1/tasks?q=$1" -H "${AUTH}")
   expect "listing tasks matching $1" "${body}" 'd["count"]'
-}
-
-# claims_done <answer> -- warn when the model says a proposal was carried out.
-# It is a warning rather than a failure: what a 3B model writes is a matter of
-# wording, and the property that matters -- nothing was created -- is asserted
-# separately against the database. But it is exactly the lie rule 8 exists to
-# prevent, so a run that shows it says so.
-claims_done() {
-  if echo "$1" | grep -qiE "(I('ve| have) (created|added|scheduled|set up)|has been (created|added)|is now (done|created|added)|(it|that) is done|I created|I added)"; then
-    printf '  \033[33mwarn\033[0m the answer describes the proposal as done: %s\n' "$(echo "$1" | tr '\n' ' ' | head -c 200)"
-  fi
 }
 
 step "Asking the assistant to create a task"
@@ -821,8 +831,116 @@ for a in d["actions"]:
 ' || fail "the action log is not what happened: ${LOGGED}"
 ok "one executed create, one rejected create, one executed read, nothing pending"
 
-if [ "${E2E_ONLY:-}" = "actions" ]; then
-  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n'
-else
-  printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject\n'
-fi
+fi # E2E_ONLY != calendar
+
+# --- Phase 8: the calendar -------------------------------------------------------
+#
+# The brief's end-to-end check: ask the assistant to schedule something and
+# confirm it was proposed rather than added, approve it, and confirm it is on
+# the calendar the API returns. Then the read half: ask what is on that day and
+# confirm search_calendar ran and the answer cites the event.
+#
+# The date is fixed and far enough out that no earlier step could have put
+# anything on it, so the counts below mean exactly what they say.
+
+if [ "${E2E_ONLY:-}" != "actions" ]; then
+
+CAL_DAY="2026-11-19"   # a Thursday
+CAL_WINDOW="start=${CAL_DAY}&end=2026-11-20"
+
+# event_count -- how many events the user has on CAL_DAY.
+event_count() {
+  local body
+  body=$(curl -s "${API}/api/v1/calendar?${CAL_WINDOW}" -H "${AUTH}")
+  expect "listing the calendar for ${CAL_DAY}" "${body}" 'd["count"]'
+}
+
+step "Asking the assistant to schedule something"
+CAL_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+[ -n "${CAL_CONV}" ] || fail "conversation was not created"
+[ "$(event_count)" = "0" ] || fail "something is already on ${CAL_DAY}"
+
+SCHEDULE="$(mktemp)"
+ask "${CAL_CONV}" "Add a dentist appointment to my calendar on ${CAL_DAY} at 3pm." "${SCHEDULE}"
+sse "${SCHEDULE}" answer >/dev/null || fail "the scheduling turn failed"
+[ "$(sse "${SCHEDULE}" action_frames)" = "1" ] || {
+  fail "the turn announced $(sse "${SCHEDULE}" action_frames) action frame(s), want 1: $(sse "${SCHEDULE}" answer | head -c 300)"
+}
+CAL_ACTION="$(sse "${SCHEDULE}" action)"
+CAL_ACTION_ID=$(expect "reading the action frame" "${CAL_ACTION}" 'd["id"]')
+echo "${CAL_ACTION}" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["tool_name"] == "create_calendar_event", "tool is %r" % a["tool_name"]
+assert a["status"] == "proposed", "status is %r" % a["status"]
+assert a["permission_level"] == "write", "permission is %r" % a["permission_level"]
+assert "dentist" in a["input"]["title"].lower(), "title is %r" % a["input"]["title"]
+assert a["input"]["start"].startswith(sys.argv[1]), "start is %r" % a["input"]["start"]
+assert a["result"] is None, "a proposal has a result: %r" % a
+' "${CAL_DAY}" || fail "the proposal is not the event that was asked for: ${CAL_ACTION}"
+ok "proposed: $(echo "${CAL_ACTION}" | json 'd["summary"]')"
+printf '     %s\n' "$(sse "${SCHEDULE}" answer | tr '\n' ' ' | head -c 260)"
+claims_done "$(sse "${SCHEDULE}" answer)"
+
+step "Checking it was proposed, not added to the calendar"
+[ "$(event_count)" = "0" ] || fail "the event is on the calendar before it was approved"
+ok "nothing on ${CAL_DAY} yet"
+
+step "Approving it"
+CAL_APPROVED=$(curl -s -X POST "${API}/api/v1/actions/${CAL_ACTION_ID}/approve" -H "${AUTH}")
+[ "$(expect "approving" "${CAL_APPROVED}" 'd["status"]')" = "executed" ] \
+  || fail "approval did not execute: ${CAL_APPROVED}"
+[ "$(event_count)" = "1" ] || fail "after approval there are $(event_count) events on ${CAL_DAY}, want 1"
+CAL_EVENTS=$(curl -s "${API}/api/v1/calendar?${CAL_WINDOW}" -H "${AUTH}")
+echo "${CAL_EVENTS}" | python3 -c '
+import sys, json
+e = json.load(sys.stdin)["events"][0]
+a = json.loads(sys.argv[1])
+assert e["id"] == a["result"]["event"]["id"], "the action names %r, the event is %r" % (a["result"]["event"]["id"], e["id"])
+assert e["start_time"] == a["input"]["start"].replace("Z", ".000Z"), \
+    "the event starts %r, the proposal said %r" % (e["start_time"], a["input"]["start"])
+assert e["end_time"] > e["start_time"] or e["all_day"], "the event has no length: %r" % e
+' "${CAL_APPROVED}" || fail "the created event is not the one approved: ${CAL_EVENTS}"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/actions/${CAL_ACTION_ID}/approve" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "a second approval returned ${CODE}, want 409"
+[ "$(event_count)" = "1" ] || fail "approving twice made a second event"
+ok "on the calendar: $(echo "${CAL_EVENTS}" | json 'd["events"][0]["title"]') at $(echo "${CAL_EVENTS}" | json 'd["events"][0]["start_time"]'); a second approval is 409"
+
+step "Checking the event's graph node"
+CAL_NODES=$(curl -s "${API}/api/v1/knowledge-graph?type=event" -H "${AUTH}")
+echo "${CAL_NODES}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+events = [n for n in d["nodes"] if n["ref_table"] == "calendar_events"]
+assert len(events) == 1, "%d event nodes, want 1" % len(events)
+n = events[0]
+assert n["ref_id"] == json.loads(sys.argv[1])["events"][0]["id"], "the node mirrors %r" % n["ref_id"]
+print("     %s (%s)" % (n["label"], n["type"]))
+' "${CAL_EVENTS}" || fail "the approved event has no graph node: ${CAL_NODES}"
+ok "the event has a node, like every other mirrored row"
+
+step "Asking what is on that day"
+ONDAY="$(mktemp)"
+ask "${CAL_CONV}" "What is on my calendar on ${CAL_DAY}?" "${ONDAY}"
+sse "${ONDAY}" answer >/dev/null || fail "the calendar-reading turn failed"
+sse "${ONDAY}" tool_sources | grep -qi "search_calendar:.*dentist" \
+  || fail "the search did not run or did not find the event: sources=$(sse "${ONDAY}" tool_sources) types=$(sse "${ONDAY}" types)"
+[ "$(sse "${ONDAY}" action_frames)" = "1" ] || fail "the read was not announced"
+echo "$(sse "${ONDAY}" action)" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["permission_level"] == "read" and a["status"] == "executed", "the read is %r" % a
+assert a["result"]["start"].startswith(sys.argv[1]), "it looked at %r, not the day asked about" % a["result"]["start"]
+' "${CAL_DAY}" || fail "the read was not recorded as an executed read over that day: $(sse "${ONDAY}" action)"
+[ "$(event_count)" = "1" ] || fail "a read changed the calendar"
+ok "search_calendar ran without approval and found $(sse "${ONDAY}" tool_sources); $(sse "${ONDAY}" tool_cited) cited"
+printf '     %s\n' "$(sse "${ONDAY}" answer | tr '\n' ' ' | head -c 260)"
+
+fi # E2E_ONLY != actions
+
+case "${E2E_ONLY:-}" in
+  actions)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n' ;;
+  calendar) printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> on the calendar -> node -> read back\n' ;;
+  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule\n' ;;
+esac

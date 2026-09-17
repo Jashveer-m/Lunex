@@ -41,9 +41,9 @@ var ErrNodeIsBacked = errors.New("node is backed by a record")
 var ErrExtraction = errors.New("relationship extraction failed")
 
 // The node types this phase scopes to, mirrored by the CHECK constraint in
-// migration 000006.
+// migration 000006 -- widened by 000008, which added `event`.
 //
-// The first four mirror a row in another table and are created by sync, never
+// The first five mirror a row in another table and are created by sync, never
 // by extraction. The last three exist only because a conversation named them:
 // there is no skills table, no people table and no projects table, and a
 // `project` node is not the same thing as a `project`-typed goal.
@@ -52,14 +52,16 @@ const (
 	NodeGoal     = "goal"
 	NodeNote     = "note"
 	NodeDocument = "document"
-	NodeSkill    = "skill"
-	NodePerson   = "person"
-	NodeProject  = "project"
+	// NodeEvent mirrors a row of calendar_events (Phase 8).
+	NodeEvent   = "event"
+	NodeSkill   = "skill"
+	NodePerson  = "person"
+	NodeProject = "project"
 )
 
 // NodeTypes is the allow-list, used by validation, by the extraction parser
 // and by the ?type= filter on the graph read.
-var NodeTypes = []string{NodeTask, NodeGoal, NodeNote, NodeDocument, NodeSkill, NodePerson, NodeProject}
+var NodeTypes = []string{NodeTask, NodeGoal, NodeNote, NodeDocument, NodeEvent, NodeSkill, NodePerson, NodeProject}
 
 // ExtractedTypes are the node types a conversation can create, and therefore
 // the only ones a user is allowed to delete directly. The rest are mirrors.
@@ -67,12 +69,13 @@ var ExtractedTypes = []string{NodeSkill, NodePerson, NodeProject}
 
 // The tables a node can mirror, and the node type each produces. This map is
 // the only place the correspondence is written down, and its keys are the same
-// four strings the ref_table CHECK constraint allows.
+// five strings the ref_table CHECK constraint allows.
 var refTableTypes = map[string]string{
-	"tasks":     NodeTask,
-	"goals":     NodeGoal,
-	"notes":     NodeNote,
-	"documents": NodeDocument,
+	"tasks":           NodeTask,
+	"goals":           NodeGoal,
+	"notes":           NodeNote,
+	"documents":       NodeDocument,
+	"calendar_events": NodeEvent,
 }
 
 // TypeForRefTable reports the node type a mirrored table produces, and whether

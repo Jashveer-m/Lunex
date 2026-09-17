@@ -17,6 +17,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/api"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/config"
 	"github.com/jashveer/lifeos/backend/internal/db"
@@ -132,6 +133,7 @@ func run(logger *slog.Logger) error {
 	noteSvc := notes.NewService(notes.NewRepository(pool), notes.WithNodeSync(graphSvc))
 	docSvc := documents.NewService(documents.NewRepository(pool), embedder, logger,
 		cfg.DocumentProcessTimeout, documents.WithNodeSync(graphSvc))
+	calendarSvc := calendar.NewService(calendar.NewRepository(pool), calendar.WithNodeSync(graphSvc))
 
 	// The memory system. It shares the chat provider and the embedder: a fact
 	// is extracted by the same kind of model that answered, and embedded by the
@@ -184,7 +186,7 @@ func run(logger *slog.Logger) error {
 	// a write tool, and it starts at POST /actions/{id}/approve.
 	actionRepo := actions.NewRepository(pool)
 	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
-		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc, Calendar: calendarSvc,
 		DocumentMinSimilarity: cfg.ChatMinSimilarity,
 	})...)
 	if err != nil {
@@ -226,6 +228,8 @@ func run(logger *slog.Logger) error {
 		Tasks:          taskSvc,
 		Goals:          goalSvc,
 		Notes:          noteSvc,
+		// Phase 8: what is on in the next day or two, as background.
+		Calendar: calendarSvc,
 		// Phase 7, all three or none.
 		Router:  router,
 		Tools:   toolRunner,
@@ -251,6 +255,7 @@ func run(logger *slog.Logger) error {
 		Tasks:       tasks.NewHandler(taskSvc, logger),
 		Goals:       goals.NewHandler(goalSvc, logger),
 		Notes:       notes.NewHandler(noteSvc, logger),
+		Calendar:    calendar.NewHandler(calendarSvc, logger),
 		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
 		Chat:        chat.NewHandler(chatSvc, logger),
 		Memories:    memories.NewHandler(memorySvc, logger),

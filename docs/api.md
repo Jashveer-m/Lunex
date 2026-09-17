@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–7)
+# Lunex API — v1 (Phases 1–8)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -416,6 +416,122 @@ Only `title` is required; `content` defaults to `""` and `tags` to `[]`.
 ### `GET`, `PATCH`, `DELETE /api/v1/notes/{id}`
 
 As for tasks. `{"tags": null}` empties the tag list rather than writing NULL.
+
+---
+
+# Phase 8 — the calendar
+
+## Calendar
+
+An event occupies the half-open interval `[start_time, end_time)`, so the 09:00
+meeting and the 10:00 one do not overlap. An all-day event is one whose ends are
+midnight and midnight the next day with `all_day` set — both ends are always
+stored, and `all_day` says how to show them rather than what they are.
+
+`recurrence_rule` is stored and never interpreted. It holds whatever string you
+put there (an RRULE, usually); the repeats it describes are **not** rows, are
+not returned by a range query, and nothing in this phase expands them.
+
+### `GET /api/v1/calendar`
+
+**`start` and `end` are required.** There is no unbounded read of this table: a
+call missing either is `400 validation_failed` naming it, rather than "here is
+everything".
+
+| Parameter | Values |
+| --- | --- |
+| `start`, `end` | **required** — RFC 3339 (`2026-11-19T00:00:00Z`) or a bare date (`2026-11-19`), which means midnight UTC on that day |
+| `q` | text the title, description or location contains — case-insensitive, taken literally; at most 200 characters |
+| `sort` | `start_time`, `end_time`, `created_at`, `updated_at`, `title`, each also with a `-` prefix (default `start_time`) |
+| `limit`, `offset` | paging (default 100, max 500) |
+
+An event is returned when it **overlaps** the window, not when it starts inside
+it: the conference that began on Tuesday is on Thursday's calendar. `end` must
+be after `start`, and at most ten years after it.
+
+```
+GET /api/v1/calendar?start=2026-11-19&end=2026-11-20
+```
+
+```json
+{
+  "events": [ { "...": "event object" } ],
+  "count": 1,
+  "start": "2026-11-19T00:00:00.000Z",
+  "end": "2026-11-20T00:00:00.000Z",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+The window is echoed back, so a client can see which range answered.
+
+### `POST /api/v1/calendar`
+
+```json
+{
+  "title": "Dentist",
+  "description": "bring the referral letter",
+  "start_time": "2026-11-19T15:00:00Z",
+  "end_time": "2026-11-19T16:00:00Z",
+  "all_day": false,
+  "location": "12 High Street",
+  "recurrence_rule": null,
+  "related_task_id": null,
+  "related_goal_id": null
+}
+```
+
+`title` and `start_time` are required. An omitted `end_time` equals
+`start_time` — a reminder at a moment — and `end_time` before `start_time` is
+`400`. `related_task_id` and `related_goal_id` must be your own rows.
+
+`201 Created` — the event object:
+
+```json
+{
+  "id": "8e5f2b21-6b9e-4a33-9a10-7c3c1a4c9b02",
+  "title": "Dentist",
+  "description": "bring the referral letter",
+  "start_time": "2026-11-19T15:00:00.000Z",
+  "end_time": "2026-11-19T16:00:00.000Z",
+  "all_day": false,
+  "location": "12 High Street",
+  "recurrence_rule": null,
+  "related_task_id": null,
+  "related_goal_id": null,
+  "created_at": "2026-09-17T09:14:02.331Z",
+  "updated_at": "2026-09-17T09:14:02.331Z"
+}
+```
+
+Errors: `400 validation_failed`, `404 not_found` (a `related_task_id` or
+`related_goal_id` that is unknown **or** somebody else's — the same answer, so
+the endpoint never confirms a foreign id).
+
+### `GET /api/v1/calendar/{id}`
+
+`200 OK` — the event object.
+
+### `PATCH /api/v1/calendar/{id}`
+
+Any subset of the create fields. `{"location": null}` clears the location;
+`{"all_day": null}` means "not an all-day event" rather than NULL; `title`,
+`start_time` and `end_time` are required columns, so `null` for any of them is
+`400`.
+
+Moving one end is checked against the stored event, not against the patch:
+`{"start_time": "2026-11-19T18:00:00Z"}` on a 09:00–10:00 meeting is `400` on
+`end_time`, and the event does not move.
+
+`200 OK` — the updated event object.
+
+### `DELETE /api/v1/calendar/{id}`
+
+`204 No Content`. The event's knowledge-graph node goes with it.
+
+Deleting a **task or goal** an event was linked to does not delete the event: the
+link becomes `null` and the hour stays booked.
 
 ---
 
@@ -1160,7 +1276,7 @@ What the assistant did, or wants to do, with a tool. Every endpoint is scoped to
 the caller: an action belonging to somebody else answers `404`, exactly like one
 that does not exist.
 
-There are eight tools. Each is a fixed Go function over the same service the
+There are ten tools. Each is a fixed Go function over the same service the
 HTTP API uses — validation, ownership and graph sync included — with a JSON
 Schema for its input and output. No tool runs code or SQL the model wrote, and
 none can delete.
@@ -1171,10 +1287,12 @@ none can delete.
 | `search_goals` | read | goals whose title or description contains a phrase, optionally with one status |
 | `search_notes` | read | notes whose title or content contains a phrase, optionally with one tag |
 | `search_documents` | read | Phase 3's vector search with a query the model chose, above the chat floor |
+| `search_calendar` | read | the events between two dates, optionally matching a phrase; the week ahead when the message gave no dates |
 | `create_task` | write | title, and optionally deadline, priority, description, category, tags |
 | `update_task` | write | changes the status, priority, title, deadline or description of one existing task |
 | `create_goal` | write | title, type (`personal` if not stated — shown in the proposal), deadline, description |
 | `create_note` | write | title (the first line of the text if none was given), content, tags |
+| `create_calendar_event` | write | title and start, and optionally end or duration, all-day, location, description |
 
 **A read runs during the turn.** When a message looks like it asks to find
 something, the model may choose a search; it runs immediately, what it found
@@ -1184,10 +1302,17 @@ becomes the turn's first sources, and it is recorded as an action born
 **A write is proposed, and runs only when you approve it.** The model's call is
 validated — with the same rules `POST /tasks` applies, so a proposal never fails
 on approval for a reason it could have known — and made canonical: a relative
-date like "friday" resolved to a date, "urgent" mapped to `high`, "the scheduler
-task" resolved to exactly one of your tasks (or declined, with the candidates,
-if it matches several). That canonical input is stored, shown to you, and is
-exactly what runs.
+date like "friday" resolved to a date, "tomorrow at 3pm" to a timestamp,
+"urgent" mapped to `high`, "the scheduler task" resolved to exactly one of your
+tasks (or declined, with the candidates, if it matches several). That canonical
+input is stored, shown to you, and is exactly what runs.
+
+A detail the message did not give is not invented. `create_calendar_event` with
+a day and no time of day proposes an **all-day** event rather than guessing an
+hour, and `search_calendar` with no dates in the message searches its stated
+default window — the next seven days, or ninety when the message names an event
+to look for — and says so in the summary, so an answer about the wrong week
+says which week it was about.
 
 ```
 read:   (runs during the turn) ─▶ executed | failed
@@ -1290,13 +1415,16 @@ edited and does not expire. See `docs/decisions.md`.
 | `description` | 10,000 characters |
 | `content` (notes) | 40,000 characters |
 | `category` | 100 characters |
+| `location` (events) | 500 characters |
+| `recurrence_rule` | 2,000 characters, never parsed |
 | `tags` | 25 tags, 50 characters each |
 | `estimated_effort_minutes`, `actual_effort_minutes` | 0 – 525,600 (a year) |
 | request body | 64 KiB |
 | uploaded file | 10 MB (`MAX_UPLOAD_BYTES`) |
 | filename | 255 characters |
 | search `query` | 4,000 characters |
-| list `q` (tasks, goals, notes) | 200 characters |
+| list `q` (tasks, goals, notes, calendar) | 200 characters |
+| calendar window (`end` − `start`) | 10 years |
 | chat message `content` | 8,000 characters |
 | memory `content` | 1,000 characters |
 | graph node `label` | 200 characters; an extracted name is also capped at 8 words |

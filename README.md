@@ -20,11 +20,17 @@ Personal life-operating-system.
   node when you write it, conversations grow the edges between them, and a
   question that names something you have gets its connections as context. Two
   Postgres tables, one hop, no graph database.
-- **Phase 7** — tools and the action engine: eight fixed tools over the
-  existing services, a routing step that decides per message whether one is
-  needed, and an approval flow. A search runs straight away; a change — create a
-  task, goal or note, update a task — is only *proposed*, and nothing is written
-  until you approve it.
+- **Phase 7** — tools and the action engine: fixed tools over the existing
+  services, a routing step that decides per message whether one is needed, and
+  an approval flow. A search runs straight away; a change — create a task, goal
+  or note, update a task — is only *proposed*, and nothing is written until you
+  approve it.
+- **Phase 8** — the calendar: events with a start and an end, queried by date
+  range and never unbounded, each with a graph node like everything else. The
+  assistant can look at your week (`search_calendar`) and *propose* an event
+  (`create_calendar_event`) under the same approval rule, and what is on in the
+  next two days joins the context of every answer — which is what makes "what
+  does my day look like" answerable.
 - **UI phase** — the web app over all of it: sign-in, tasks/goals/notes,
   document upload, a streaming chat with inline citations and Approve/Reject
   cards for proposed changes, and a memory manager.
@@ -60,6 +66,7 @@ lunex/
 │   │   ├── ai/            # LLM provider interface + Ollama and mock backends
 │   │   ├── api/           # router and middleware wiring
 │   │   ├── auth/          # argon2id, JWT, sessions, service, handlers
+│   │   ├── calendar/      # events: range queries, links to a task or goal, node sync
 │   │   ├── chat/          # conversations, the RAG orchestrator, SSE streaming
 │   │   ├── config/        # environment configuration
 │   │   ├── db/            # connection pool, migration runner, pgvector param
@@ -72,14 +79,14 @@ lunex/
 │   │   ├── notes/         # notes: model, service, handlers
 │   │   ├── optional/      # the three-state field a PATCH body needs
 │   │   ├── tasks/         # tasks + dependencies: model, service, handlers
-│   │   ├── tools/         # the tool registry: eight fixed tools, the approval gate
+│   │   ├── tools/         # the tool registry: ten fixed tools, the approval gate
 │   │   ├── users/         # user + profile model and repository
 │   │   └── validate/      # field rules shared by the modules
 │   ├── migrations/        # embedded .sql migrations
 │   └── go.mod
 ├── frontend/              # the web UI (Vite + React)
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -284,6 +291,46 @@ correctly on 23 of 24 and proposed no write it was not asked for
 requests ("add", "task", "find", "mark", …), because on a slow CPU it costs up
 to a minute before the first token. `AGENT_TOOLS=false` turns the tools off and
 leaves the Phase 6 assistant.
+
+### The calendar (Phase 8)
+
+A read is always a range — there is no "all my events":
+
+```sh
+curl -s "localhost:8080/api/v1/calendar?start=2026-11-16&end=2026-11-23" -H "$AUTH"
+# {"events":[{"title":"Dentist","start_time":"2026-11-19T15:00:00.000Z","end_time":"2026-11-19T16:00:00.000Z",
+#             "all_day":false,"related_task_id":null,…}],"count":1,"start":"2026-11-16T00:00:00.000Z",…}
+```
+
+An event that started on Tuesday and runs until Friday is on Thursday's
+calendar: the query matches anything *overlapping* the window, not only what
+starts inside it.
+
+The assistant reaches it under the same rule as everything else:
+
+```sh
+# "Add a dentist appointment to my calendar on 2026-11-19 at 3pm."
+# event: action
+# data: {"id":"…","tool_name":"create_calendar_event","status":"proposed",
+#        "summary":"Add \"Dentist\" to the calendar on Thu 19 Nov 2026 15:00–16:00.",…}
+
+curl -s -X POST localhost:8080/api/v1/actions/$ACTION_ID/approve -H "$AUTH"
+# {"status":"executed","result":{"event":{"title":"Dentist",…}},…}
+```
+
+Two rules shape what it proposes. A date or a time it was not given is not
+invented: "book the dentist on Thursday" has no time of day in it, so it
+becomes an all-day Thursday rather than a meeting at nine, and a window the
+router cannot find in your message is dropped in favour of the tool's stated
+default — which the proposal names in days, so an answer about the wrong week
+says which week it was. And the times themselves are resolved by Go, not by the
+model: "tomorrow at 3pm" is arithmetic, and a 3B model gets it wrong often
+enough to matter.
+
+Recurrence is stored and not interpreted. `recurrence_rule` holds whatever you
+put there; the repeats it describes are not rows, are not returned by a range
+query, and the assistant is told to say so rather than describe next week's
+occurrence as scheduled.
 
 ## The web UI
 
@@ -502,3 +549,20 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     twice, and the end-to-end run warns when it happens; what is guaranteed is
     that nothing is written until you approve, whatever the reply says.
 40. **Relative dates are resolved in UTC**, not in your profile's timezone.
+41. **No recurrence expansion.** `recurrence_rule` is an opaque string: one
+    recurring event is one row, a range query returns that row and no other
+    occurrence, and nothing computes the repeats. Expansion needs exceptions,
+    time zones and a bound on the tail, and half of it is worse than none.
+42. **No external calendar sync.** No Google Calendar, no CalDAV, no iCal
+    import or export. The calendar is internal, which also means nothing
+    reconciles an event you moved somewhere else.
+43. **The calendar has no screen of its own.** Events reach the web UI only as
+    citations in an answer, and are created through the API or by approving a
+    proposal.
+44. **The assistant cannot move or cancel an event.** `create_calendar_event`
+    is the only calendar write, for the same reason there are no delete tools:
+    the wrong meeting moved is a meeting missed, and it wants a proposal that
+    shows exactly what would change.
+45. **Event times are UTC throughout**, including the ones the assistant reads
+    off your calendar and quotes back at you. The profile's timezone is still
+    not used anywhere.

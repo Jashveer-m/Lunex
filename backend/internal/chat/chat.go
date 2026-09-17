@@ -109,6 +109,10 @@ const (
 	SourceTask  = "task"
 	SourceGoal  = "goal"
 	SourceNote  = "note"
+	// SourceEvent is something on the user's calendar. It is the only source
+	// picked by *when* it is rather than by what it says, which is what makes
+	// "what does my day look like" answerable at all.
+	SourceEvent = "event"
 )
 
 // Source is one retrieved item, recorded on the assistant message that was
@@ -118,15 +122,15 @@ const (
 // wire shape at once, so what the API returns is what the column holds.
 type Source struct {
 	Type string `json:"type"`
-	// ID is the document, memory, graph node, task, goal or note id --
-	// something the client can follow to the underlying record.
+	// ID is the document, memory, graph node, task, goal, note or calendar
+	// event id -- something the client can follow to the underlying record.
 	ID uuid.UUID `json:"id"`
 	// Label is the marker the prompt showed the model ("S1", "S2", ...). It is
 	// stored because Cited is derived from finding it in the answer, and
 	// because a client rendering "[S1]" needs to know what S1 was.
 	Label string `json:"label"`
-	// Title is the filename, the task/goal/note title, the graph node's label,
-	// or -- for a memory, which has no title -- its type.
+	// Title is the filename, the task/goal/note/event title, the graph node's
+	// label, or -- for a memory, which has no title -- its type.
 	Title string `json:"title"`
 	// ChunkIndex is set for documents only. Similarity is set for everything
 	// retrieved semantically, which is documents and memories; the task, goal

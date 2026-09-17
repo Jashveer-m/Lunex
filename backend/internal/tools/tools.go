@@ -2,7 +2,7 @@
 // behalf.
 //
 // A tool is a fixed, reviewed Go function over one of the existing services --
-// tasks, goals, notes, documents -- with a name, a description, an input
+// tasks, goals, notes, documents, calendar -- with a name, a description, an input
 // schema, an output schema and a permission level. There is nothing else: no
 // tool runs code the model wrote, builds SQL out of what the model said, or
 // reaches a service method its interface does not name. The model's only power
@@ -37,6 +37,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -113,7 +114,15 @@ type Param struct {
 	// Cues are words one of which must also be in the message for a free-text
 	// filter to be grounded -- "tag" for a tag, so a topic is not read as one.
 	Cues []string
+	// Aliases are the other keys a model writes for this argument. They matter
+	// for a filter: the router drops an ungrounded filter by key, so a key the
+	// tool reads and the declaration does not name would be a value that
+	// escapes the grounding check entirely.
+	Aliases []string
 }
+
+// Keys are every argument key this parameter is read from, its own name first.
+func (p Param) Keys() []string { return append([]string{p.Name}, p.Aliases...) }
 
 // Tool is one registered capability.
 //
@@ -159,13 +168,16 @@ type Result struct {
 	Tasks  []tasks.Task
 	Goals  []goals.Goal
 	Notes  []notes.Note
+	Events []calendar.Event
 	Chunks []documents.SearchResult
 	// More reports that a search found more than it returned.
 	More bool
 }
 
 // Count is how many records the result carries.
-func (r Result) Count() int { return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Chunks) }
+func (r Result) Count() int {
+	return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Events) + len(r.Chunks)
+}
 
 // define builds a Tool whose canonical input is the Go type In.
 //

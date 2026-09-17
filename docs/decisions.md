@@ -1590,8 +1590,8 @@ routing call and its share of the check.
 
 ## The system prompt's action rule has two versions
 
-Without tools, rule 8 is Phase 4's: the assistant can only read, and says so.
-With them it can propose, and the rule's whole job is the one lie a proposal
+Without tools, the action rule is Phase 4's: the assistant can only read, and
+says so. With them it can propose, and the rule's whole job is the one lie a proposal
 invites -- "done, I've added that task". It says a proposal has not been made,
 that replying in the chat does not approve it, and to report earlier proposals
 exactly as the ACTIONS section states them.
@@ -1840,3 +1840,219 @@ The extraction and routing timeouts default to 180s and the turn to 18m
 already needed on the development machine. A faster model can lower all four.
 `LOG_LEVEL` (default `info`) makes the extractors' drop reasons visible at
 `debug`.
+
+# Phase 8 decisions
+
+## The calendar read is a range query, and there is no other kind
+
+`GET /calendar` requires `start` and `end`. Every other list endpoint in this
+codebase offers an unfiltered read with paging; this one does not, and the
+absence is the design rather than an omission.
+
+A calendar grows a row per meeting for as long as the user has the account, and
+the only question anybody asks of it is "what is on between X and Y". An
+unbounded read is therefore a denial-of-service lever with no use case behind
+it. It is also a trap for a client: a page of "your first fifty events" looks
+like an answer and is not one, and a client that drew a week from it would draw
+the wrong week silently.
+
+So the window is part of the query rather than a filter on it: `Filter.Start`
+and `Filter.End` are required, `ValidateFilter` reports a missing one as the
+field error it is, and the SQL is one index scan over `(user_id, start_time)`.
+The response echoes the window back, so what answered is visible in the answer.
+
+## Overlap, not containment, and the interval is half-open
+
+An event is returned when it *overlaps* the window. A query that matched only
+events starting inside it would hide the conference that began on Tuesday from
+Thursday's calendar — exactly the events most worth seeing.
+
+The interval is half-open, `[start, end)`: the 09:00–10:00 meeting and the
+10:00–11:00 one do not overlap, and an event ending exactly at the window's
+start is outside it. The clause is:
+
+```sql
+start_time < :end AND (end_time > :start OR start_time >= :start)
+```
+
+The second half of the disjunction is for a zero-length event — a reminder at a
+moment, which the CHECK allows because people put them in calendars — whose end
+is not *after* the window start even when it sits inside the window.
+
+## Both ends are always stored, and `all_day` is a display fact
+
+An all-day event is a row whose ends are midnight and midnight the next day,
+with `all_day` set. The alternative — a null `end_time` meaning "all day" —
+makes every range query special-case a missing end, and a range query that has
+to special-case anything is a range query that gets it wrong somewhere.
+
+`all_day` therefore says how to *show* the interval, not what it is. A client
+renders "Thursday" rather than "00:00–00:00"; the SQL treats it like any other
+event.
+
+## `recurrence_rule` is stored and never read
+
+The brief scopes recurrence to storage, and the reason is worth writing down:
+expansion is a phase, not a feature. It needs exceptions (EXDATE, a moved
+occurrence), time zones (a weekly 09:00 that crosses a DST boundary), a bound on
+the unbounded tail, and a decision about whether an occurrence is a row. Half of
+that is worse than none, because a calendar that expands repeats *sometimes* is
+one the user cannot trust.
+
+So the column is opaque: any string within the length limit is accepted, nothing
+parses it, and a range query returns the single stored row and no occurrence of
+it. The chat prompt says so out loud in the calendar rule, and the event summary
+the model sees carries "repeats (only this occurrence is recorded)" — because a
+model shown an RRULE will otherwise describe next Monday as scheduled.
+
+## Deleting a task does not delete the event it was booked for
+
+`related_task_id` and `related_goal_id` are `ON DELETE SET NULL`, unlike the
+`ON DELETE CASCADE` from `users`. Deleting the task you set aside Thursday
+morning for should not silently remove Thursday morning from your calendar: the
+hour was blocked, and whether it is still needed is a decision, not a
+consequence.
+
+## The calendar repository reads `tasks` and `goals`
+
+`Repository.TaskExists` and `GoalExists` are the only place in this codebase
+where one module's SQL touches another module's table, and it is a considered
+exception.
+
+The foreign key alone cannot do the job: it accepts *another user's* task id
+perfectly happily, which is the leak the whole ownership design exists to
+prevent. The check has to be owner-scoped, so it has to be a query. The
+alternatives were wiring the task and goal services into the calendar service —
+two dependencies, threaded through `cmd/api` and every test, to answer a
+question that is one index probe — or adding an `Exists` method to both services
+for this one caller. The coupling already exists in the schema, since
+`calendar_events` has a foreign key to each table, and `ownsRow` is four lines
+with the table name as a literal at both call sites.
+
+A link the caller does not own is `ErrNotFound`, not a validation error naming
+the field: the two answers differ, and only the first keeps another user's ids
+unconfirmable. It is the rule `tasks` already applies to `parent_task_id`.
+
+## A time of day the user did not give is not invented
+
+`create_calendar_event` with a day and no time proposes an **all-day** event.
+
+This is the hardening pass's rule (item 42) applied to a new kind of argument.
+"Book the dentist on Thursday" states a day and no hour; a proposal for 09:00
+would be a detail the assistant made up, shown to the user as though they had
+said it. An all-day Thursday is true, is visible, and is editable.
+
+The same rule decides what counts as a stated time. "3pm", "15:00" and "noon"
+are times. "Tomorrow evening" is not: it is a time of day to a person and a
+two-hour error bar to a calendar. A bare number is not either — "lunch at 1" is
+a time and "in 1 week" is not, and a pattern that reads both the same way turns
+a date the user *did* give into a time they did not.
+
+## The window is a filter, so the router grounds it — and the default is stated
+
+`search_calendar`'s `start` and `end` are `Filter` params, which means the
+router drops a value the user's message does not contain (item 42). A fabricated
+date range is the worst kind of invented filter: it does not empty a search
+visibly, it answers a question about the wrong days, and "nothing on Tuesday" is
+a sentence the user has no way to tell from the truth.
+
+When both ends are dropped — or were never given — the tool uses a stated
+default: the next seven days, or ninety when the message names an event to look
+for, because the dentist appointment somebody is trying to remember is not
+usually this week. That default is not the thing the rule forbids, for two
+reasons: it is the same window every time rather than a guess at what the user
+meant, and the proposal summary and the ACTIONS section both name the days it
+used. An answer drawn from the wrong week says which week it was.
+
+`Param.Aliases` exists for this. The router drops an ungrounded filter *by key*,
+so a window the tool reads from `when` while the declaration only names `start`
+would be a value that escapes the check entirely. Declaring the aliases makes
+the grounding cover every key the tool reads.
+
+## The calendar leads the heuristic sources
+
+Retrieval order is: what a read tool found, then documents, then memories, then
+the graph, then **the calendar**, then tasks, goals and notes.
+
+The calendar goes first among the heuristic items because it is the only one of
+them selected by *time* rather than by status. An event this afternoon is about
+now in a way that a pending task is not, and "what does my day look like" is
+answerable from background context only if the day is in the context.
+
+The window is two days and the cap is three events, which are small on purpose.
+Next month's conference is not background to every question; a question that is
+actually about next month routes to `search_calendar`, which takes the dates
+from the user. The window starts at the top of *today* rather than at `now`, so
+an event that began this morning is still in front of the model at four in the
+afternoon — "what have I got on today" is a question about the whole day.
+
+## An event's times are written out for the model
+
+The summary the model sees is `starts Thu 19 Nov 2026 15:00 UTC`, not an ISO
+timestamp. Date arithmetic is the thing a 3B model gets confidently wrong — it
+is why `ParseDate` exists — and a model shown `2026-11-19T15:00:00Z` will offer
+to work out what day that is. Writing the weekday and the month out removes the
+temptation rather than relying on the model to resist it.
+
+Rule 8 of the system prompt says the same thing twice more: use the times as
+written, and an empty calendar section means "I found nothing on your calendar",
+not "you are free". Asked "am I free on Friday" with nothing retrieved, a 3B
+model reaches for "yes, you are free" — which is a claim about the calendar
+rather than the absence of one.
+
+## One index, not two
+
+The brief asked for an index on `user_id` and one on `(user_id, start_time)`.
+There is one composite index, and it serves both: its leading column answers a
+plain owner lookup, including the one the `ON DELETE CASCADE` from `users`
+makes. A standalone `user_id` index would be a second copy of the same prefix,
+paid for on every insert. It is the call migration 000006 already made for
+`knowledge_nodes`, and it is noted here because it is a deliberate departure
+from the brief's wording rather than from its intent.
+
+# Phase 8 — explicitly deferred
+
+## 45. No recurrence expansion
+
+See above. One recurring event is one row; nothing computes the occurrences, and
+no query returns them.
+
+## 46. No external calendar sync
+
+No Google Calendar, no CalDAV, no iCal import or export. The calendar is
+internal, which also means nothing reconciles an event moved somewhere else, and
+there is no notion of an event this user does not own (an invitation).
+
+## 47. No `update_calendar_event` and no delete tool
+
+`create_calendar_event` is the only calendar write the assistant has. Moving an
+event is the same sharp edge as deleting a task — the wrong meeting moved is a
+meeting missed — and it needs the same "show the user exactly what would change"
+that deletion is waiting for (item 29). `PATCH /calendar/{id}` is the API, and
+the UI would be the place to offer it.
+
+## 48. No conflict detection, no free/busy, no travel time
+
+Two events at the same time are two events. Nothing warns, nothing suggests a
+slot, and "am I free on Thursday" is answered by listing what is on, not by
+reasoning about gaps. Each of those is a feature with its own edge cases
+(all-day events, zero-length reminders, working hours) and none is in this
+phase.
+
+## 49. No reminders or notifications
+
+`calendar_events` has no notion of an alert, and there is no scheduler to fire
+one. That needs the job queue the whole project still does not have.
+
+## 50. The calendar has no screen
+
+The web UI gained one source type and nothing else: an event appears as a
+citation in an answer, with no page to open. Creating one through the UI means
+the API or an approved proposal.
+
+## 51. Times are UTC, like every other date here
+
+Item 35 applies unchanged: "tomorrow at 3pm" is 15:00 UTC, the summary says UTC,
+and the profile's timezone is still read by nothing. For a calendar this is more
+visible than it was for a deadline, and it is the first thing a timezone phase
+would fix.

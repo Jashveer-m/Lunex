@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jashveer/lifeos/backend/internal/ai"
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -28,6 +29,7 @@ type harness struct {
 	tasks    *fakeTasks
 	goals    *fakeGoals
 	notes    *fakeNotes
+	calendar *fakeEvents
 	provider *ai.Mock
 	user     uuid.UUID
 	conv     Conversation
@@ -44,12 +46,13 @@ func newHarness(t *testing.T, provider *ai.Mock) *harness {
 		tasks:    &fakeTasks{byUser: map[uuid.UUID][]tasks.Task{}},
 		goals:    &fakeGoals{byUser: map[uuid.UUID][]goals.Goal{}},
 		notes:    &fakeNotes{byUser: map[uuid.UUID][]notes.Note{}},
+		calendar: &fakeEvents{byUser: map[uuid.UUID][]calendar.Event{}},
 		provider: provider,
 		user:     uuid.New(),
 	}
 	h.svc = NewService(Deps{
 		Store: h.store, Provider: provider,
-		Documents: h.docs, Tasks: h.tasks, Goals: h.goals, Notes: h.notes,
+		Documents: h.docs, Tasks: h.tasks, Goals: h.goals, Notes: h.notes, Calendar: h.calendar,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	// A fixed clock, so the date in the system prompt is assertable.

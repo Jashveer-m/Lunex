@@ -14,6 +14,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/actions"
 	"github.com/jashveer/lifeos/backend/internal/auth"
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
@@ -30,6 +31,7 @@ type Deps struct {
 	Tasks       *tasks.Handler
 	Goals       *goals.Handler
 	Notes       *notes.Handler
+	Calendar    *calendar.Handler
 	Documents   *documents.Handler
 	Chat        *chat.Handler
 	Memories    *memories.Handler
@@ -99,6 +101,11 @@ func NewRouter(d Deps) http.Handler {
 			r.Mount("/tasks", d.Tasks.Routes())
 			r.Mount("/goals", d.Goals.Routes())
 			r.Mount("/notes", d.Notes.Routes())
+
+			// Phase 8. A calendar read is one index scan over a range and a
+			// write is one insert plus a graph sync: database work with no
+			// model anywhere, so the ordinary budget.
+			r.Mount("/calendar", d.Calendar.Routes())
 
 			// Phase 5. Managing memories is database work: listing, editing
 			// and deleting rows. The model and the embedder are only involved

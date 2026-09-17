@@ -16,6 +16,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/actions"
 	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -140,9 +141,36 @@ func (l *actionLog) Describe(a actions.Action) string { return l.reg.Describe(a.
 // chat side does could run a write even if it found a way to ask.
 type toolHarness struct {
 	*harness
-	tools *toolTasks
-	log   *actionLog
-	reg   *tools.Registry
+	tools    *toolTasks
+	calendar *toolCalendar
+	log      *actionLog
+	reg      *tools.Registry
+}
+
+// toolCalendar is one calendar service playing both parts it plays in
+// production: the lister the heuristic reads, and the service the tools call.
+// Its Create counts a write the chat turn must never make.
+type toolCalendar struct {
+	mu      sync.Mutex
+	events  *fakeEvents
+	creates int
+}
+
+func (c *toolCalendar) List(ctx context.Context, userID uuid.UUID, f calendar.Filter) ([]calendar.Event, error) {
+	return c.events.List(ctx, userID, f)
+}
+
+func (c *toolCalendar) Create(context.Context, uuid.UUID, calendar.CreateInput) (calendar.Event, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.creates++
+	return calendar.Event{}, errors.New("the chat turn must never create a calendar event")
+}
+
+func (c *toolCalendar) writes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.creates
 }
 
 // routingReply answers the routing call with a fixed decision and every other
@@ -160,9 +188,11 @@ func routingReply(decision string, answer func(prompt string) string) *ai.Mock {
 func newToolHarness(t *testing.T, provider *ai.Mock) *toolHarness {
 	t.Helper()
 	tt := &toolTasks{byUser: map[uuid.UUID][]tasks.Task{}}
+	cal := &toolCalendar{events: &fakeEvents{byUser: map[uuid.UUID][]calendar.Event{}}}
 	reg, err := tools.NewRegistry(nil, tools.Standard(tools.Services{
 		Tasks: tt, Goals: noGoals{}, Notes: noNotes{}, Documents: &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
-		Now: func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) },
+		Calendar: cal,
+		Now:      func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) },
 	})...)
 	if err != nil {
 		t.Fatal(err)
@@ -172,13 +202,14 @@ func newToolHarness(t *testing.T, provider *ai.Mock) *toolHarness {
 		docs:     &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
 		goals:    &fakeGoals{byUser: map[uuid.UUID][]goals.Goal{}},
 		notes:    &fakeNotes{byUser: map[uuid.UUID][]notes.Note{}},
+		calendar: cal.events,
 		provider: provider,
 		user:     uuid.New(),
 	}
-	h := &toolHarness{harness: base, tools: tt, reg: reg, log: &actionLog{store: base.store, reg: reg}}
+	h := &toolHarness{harness: base, tools: tt, calendar: cal, reg: reg, log: &actionLog{store: base.store, reg: reg}}
 	base.svc = NewService(Deps{
 		Store: base.store, Provider: provider,
-		Documents: base.docs, Tasks: tt, Goals: base.goals, Notes: base.notes,
+		Documents: base.docs, Tasks: tt, Goals: base.goals, Notes: base.notes, Calendar: cal,
 		Router:  agents.NewRouter(provider, reg, slog.New(slog.NewTextHandler(io.Discard, nil)), agents.Options{}),
 		Tools:   reg,
 		Actions: h.log,

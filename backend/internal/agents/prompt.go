@@ -74,6 +74,13 @@ var shots = []shot{
 	{tools.CreateTask, "Remind me to water the plants on Sunday",
 		`{"tool": "create_task", "arguments": {"title": "Water the plants", "deadline": "sunday"}}`},
 	{NoTool, "I've been really busy finishing my thesis chapters this week.", `{"tool": "none", "arguments": {}}`},
+	// The calendar pair. The first teaches that a question about the diary is a
+	// look rather than a search of anything else; the second that the time of
+	// day is copied as the user wrote it, like every other date in this prompt.
+	{tools.SearchCalendar, "What's on my calendar tomorrow?",
+		`{"tool": "search_calendar", "arguments": {"start": "tomorrow"}}`},
+	{tools.CreateCalendarEvent, "Book the dentist for Thursday at 3pm",
+		`{"tool": "create_calendar_event", "arguments": {"title": "Dentist", "start": "thursday at 3pm"}}`},
 }
 
 // RoutingPrompt is the prompt for one routing decision: the system

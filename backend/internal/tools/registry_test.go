@@ -182,7 +182,7 @@ func TestPrepareNeverWrites(t *testing.T) {
 
 // --- declarations ---------------------------------------------------------------
 
-func TestStandardToolsAreTheBriefsEight(t *testing.T) {
+func TestStandardToolsAreTheBriefsTen(t *testing.T) {
 	w := newWorld()
 	var reads, writes []string
 	for _, tool := range w.reg.Tools() {
@@ -195,10 +195,10 @@ func TestStandardToolsAreTheBriefsEight(t *testing.T) {
 	}
 	sort.Strings(reads)
 	sort.Strings(writes)
-	if want := []string{SearchDocuments, SearchGoals, SearchNotes, SearchTasks}; !slices.Equal(reads, want) {
+	if want := []string{SearchCalendar, SearchDocuments, SearchGoals, SearchNotes, SearchTasks}; !slices.Equal(reads, want) {
 		t.Fatalf("read tools = %v, want %v", reads, want)
 	}
-	if want := []string{CreateGoal, CreateNote, CreateTask, UpdateTask}; !slices.Equal(writes, want) {
+	if want := []string{CreateCalendarEvent, CreateGoal, CreateNote, CreateTask, UpdateTask}; !slices.Equal(writes, want) {
 		t.Fatalf("write tools = %v, want %v", writes, want)
 	}
 	// Deletion is deferred. Nothing may be registered that sounds like it.
@@ -248,6 +248,7 @@ func TestCanonicalInputOnlyCarriesDeclaredParams(t *testing.T) {
 		"title": "t", "description": "d", "priority": "high", "deadline": "tomorrow",
 		"category": "c", "tags": []any{"a"}, "query": "q", "status": "completed", "tag": "x",
 		"type": "career", "content": "body", "task": "scheduler",
+		"start": "2026-09-30 14:00", "end": "2026-09-30 15:00", "location": "the shed",
 		"user_id": uuid.NewString(), "id": "ignored",
 	}
 	for _, tool := range w.reg.Tools() {

@@ -30,7 +30,7 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 // partition a named-agent layer can compose, rather than labels.
 func TestGeneralIsTheUnionOfTheDomainAgents(t *testing.T) {
 	owner := map[string]string{}
-	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent} {
+	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent} {
 		for _, name := range a.Tools {
 			if prev, dup := owner[name]; dup {
 				t.Fatalf("%s belongs to both %s and %s", name, prev, a.Name)
@@ -359,6 +359,88 @@ func TestTheRouterDoesNotGroundWriteArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	if d.Args.String("title") != "Renew passport" || d.Args.String("priority") != "high" {
+		t.Fatalf("decision = %+v, want the write's arguments untouched", d)
+	}
+}
+
+// The same rule for the calendar's window, which is the Phase 8 case of it: a
+// date range the user did not give would not empty a search, it would answer a
+// question about the wrong days -- and "nothing on Tuesday" is a sentence the
+// user has no way to tell from the truth.
+//
+// A dropped window is not a failed call. The tool falls back to its stated
+// default and the summary names the days it looked at, so the answer says which
+// week it was about.
+func TestTheRouterDropsCalendarDatesTheMessageDoesNotGive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		message, reply string
+		want           map[string]string // argument -> value, "" meaning it must be gone
+	}{
+		"dates nobody gave": {
+			"What's on my calendar?",
+			`{"tool": "search_calendar", "arguments": {"start": "2026-09-10", "end": "2026-09-17"}}`,
+			map[string]string{"start": "", "end": ""}},
+		"the day the user named": {
+			"What's on my calendar tomorrow?",
+			`{"tool": "search_calendar", "arguments": {"start": "tomorrow"}}`,
+			map[string]string{"start": "tomorrow"}},
+		"a stretch the user named": {
+			"Am I busy next week?",
+			`{"tool": "search_calendar", "arguments": {"start": "next week"}}`,
+			map[string]string{"start": "next week"}},
+		"a date written as the user wrote it": {
+			"What have I got on between 2026-09-14 and 2026-09-18?",
+			`{"tool": "search_calendar", "arguments": {"start": "2026-09-14", "end": "2026-09-18"}}`,
+			map[string]string{"start": "2026-09-14", "end": "2026-09-18"}},
+		// The aliases are declared on the parameter, so a window written under
+		// one is checked exactly like one written under its own name --
+		// otherwise "when" would be the way round the rule.
+		"an invented window under an alias": {
+			"What's on my calendar?",
+			`{"tool": "search_calendar", "arguments": {"when": "next month"}}`,
+			map[string]string{"when": ""}},
+		"a window under an alias the user gave": {
+			"What's on my calendar next month?",
+			`{"tool": "search_calendar", "arguments": {"when": "next month"}}`,
+			map[string]string{"when": "next month"}},
+		"a placeholder": {
+			"What's on my calendar?",
+			`{"tool": "search_calendar", "arguments": {"start": "<unknown>"}}`,
+			map[string]string{"start": ""}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := NewRouter(&ai.Mock{Reply: tc.reply}, standard(), quiet(), Options{})
+			d, err := r.Decide(context.Background(), General, tc.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Tool != tools.SearchCalendar {
+				t.Fatalf("decision = %+v, want the call kept", d)
+			}
+			for arg, want := range tc.want {
+				_, present := d.Args[arg]
+				switch {
+				case want == "" && present:
+					t.Fatalf("%s = %v survived; the message does not give it", arg, d.Args[arg])
+				case want != "" && d.Args.String(arg) != want:
+					t.Fatalf("%s = %v, want %q kept", arg, d.Args[arg], want)
+				}
+			}
+		})
+	}
+}
+
+// A proposed event's own details are not filtered: the time and the title are
+// shown to the user in the proposal before anything is written, which is the
+// check that applies to a write.
+func TestTheRouterDoesNotGroundAProposedEvent(t *testing.T) {
+	r := NewRouter(&ai.Mock{Reply: `{"tool": "create_calendar_event", "arguments": {"title": "Dentist", "start": "thursday at 3pm"}}`},
+		standard(), quiet(), Options{})
+	d, err := r.Decide(context.Background(), General, "Book the dentist for Thursday afternoon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Args.String("title") != "Dentist" || d.Args.String("start") != "thursday at 3pm" {
 		t.Fatalf("decision = %+v, want the write's arguments untouched", d)
 	}
 }

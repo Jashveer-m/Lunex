@@ -8,9 +8,9 @@
 // proposed) is identical for every one of them -- so there is one Router, and
 // an agent is the argument it is called with.
 //
-// This phase has exactly one agent the orchestrator uses, General, and it is
-// composed out of four domain agents -- TaskAgent, GoalAgent, NoteAgent and
-// DocumentAgent -- that each wrap one module's tools. They are not personas and
+// There is exactly one agent the orchestrator uses, General, and it is
+// composed out of five domain agents -- TaskAgent, GoalAgent, NoteAgent,
+// DocumentAgent and CalendarAgent -- that each wrap one module's tools. They are not personas and
 // nothing routes to them individually yet. They exist so that the named-agent
 // layer the spec describes (a Study agent, a Career agent) is an addition
 // rather than a rework: a later phase puts a first step in front of Decide that
@@ -72,9 +72,13 @@ var (
 		Name: "documents", Purpose: "searching the user's uploaded documents",
 		Tools: []string{tools.SearchDocuments},
 	}
+	CalendarAgent = Agent{
+		Name: "calendar", Purpose: "looking at the user's calendar and scheduling events on it",
+		Tools: []string{tools.SearchCalendar, tools.CreateCalendarEvent},
+	}
 )
 
-// General is the one agent the orchestrator uses in this phase: all of the
-// domain agents' tools.
+// General is the one agent the orchestrator uses: all of the domain agents'
+// tools.
 var General = Compose("general", "anything the assistant can do with the user's data",
-	TaskAgent, GoalAgent, NoteAgent, DocumentAgent)
+	TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent)

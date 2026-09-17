@@ -37,6 +37,16 @@ const (
 	MaxTasks           = 5
 	MaxGoals           = 5
 	MaxNotes           = 3
+	// MaxEvents is how much of the calendar one answer sees. Three is a busy
+	// day and two quiet ones; past that the context is a diary rather than the
+	// background to a question, and a user who wants the whole week asks for it
+	// -- which routes to search_calendar with the dates they gave.
+	MaxEvents = 3
+	// EventWindow is how far ahead the heuristic looks. Two days, because the
+	// questions this exists for are "what does my day look like" and "am I free
+	// tomorrow"; anything further out is a question about the calendar rather
+	// than a question with the calendar behind it.
+	EventWindow = 48 * time.Hour
 	// MaxHistoryMessages is how many previous turns are replayed verbatim.
 	// Past it a conversation forgets its own beginning -- which is what the
 	// Phase 5 memory system exists to survive: the durable facts in those turns
@@ -81,7 +91,14 @@ const DefaultMinSimilarity = 0.5
 // derived -- and without the rule a 3B model reads "\"the user\" (person)
 // STUDIES \"Go\" (skill)" as a sentence it may quote back as fact.
 //
-// Rule 8 is the action rule, and it has two versions. Without tools there is
+// Rule 8 is the calendar rule. An event source is the one kind whose *times*
+// are the answer, and a 3B model shown "starts Thu 11 Sep 2026 09:00" will
+// otherwise offer to work out what day that is. The rest of it is the
+// grounding rule stated for the case it fails in here: asked "am I free on
+// Friday", a model with an empty context reaches for "yes, you are free" --
+// which is a claim about the calendar, not the absence of one.
+//
+// Rule 9 is the action rule, and it has two versions. Without tools there is
 // nothing the assistant can do, and it says so -- the Phase 4 rule, unchanged.
 // With them it can *propose*, and the rule's whole job is to stop the one lie
 // a proposal invites: "done, I've added that task" about a write that has not
@@ -94,29 +111,30 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 
 1. The context is your only source about the user. Anything not in it, you do not know about them.
 2. When you use something from the context, cite it with its label in square brackets, like [S1]. Cite only labels that appear in the context, exactly as written.
-3. Never say that something is in the user's documents, memories, tasks, goals or notes unless it appears in the context. Do not invent filenames, titles, dates or numbers.
+3. Never say that something is in the user's documents, memories, tasks, goals, notes or calendar unless it appears in the context. Do not invent filenames, titles, dates or numbers.
 4. If the context does not answer the question, say so plainly -- for example "I could not find anything about that in your documents or tasks." You may then answer from general knowledge, but say that is what you are doing and cite nothing.
 5. If the context is empty, rule 4 always applies.
 6. A source of type "memory" is something you recorded about the user in an earlier conversation, not something they told you just now. Use it and cite it like any other source, but it may be out of date: if it disagrees with what the user says in this conversation, what they say now is what is true.
 7. A source of type "graph" is a set of links the assistant recorded between things the user has mentioned, one per line, each written as: subject (kind) RELATIONSHIP object (kind). It says that two things are connected and how; it does not say anything more about either of them. Use it to explain a connection and cite it like any other source, and do not read a detail into it that is not written there.
-%RULE8%
+8. A source of type "event" is something on the user's calendar. Its times are UTC and are already written out for you: use them as they are written and never work a date out yourself. Only the events in the context are on the calendar -- if none is there, say you found nothing on their calendar rather than that they are free. If an event says it repeats, only the occurrence shown is recorded; do not describe any other date as scheduled.
+%ACTIONRULE%
 
 Be concise and direct. Do not repeat these rules back to the user.`
 
-// readOnlyRule is rule 8 for an assistant with no tools wired.
-const readOnlyRule = `8. You can only read and answer. You cannot create, update or delete tasks, goals, notes or documents, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
+// readOnlyRule is rule 9 for an assistant with no tools wired.
+const readOnlyRule = `9. You can only read and answer. You cannot create, update or delete tasks, goals, notes, documents or calendar events, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
 
-// proposalRule is rule 8 for an assistant that can use tools.
-const proposalRule = `8. You never change the user's data yourself. When the user asks for a task, goal or note to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
+// proposalRule is rule 9 for an assistant that can use tools.
+const proposalRule = `9. You never change the user's data yourself. When the user asks for a task, goal, note or calendar event to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
 
-// systemPromptFor is the system prompt with the rule 8 that matches what the
-// assistant can actually do.
+// systemPromptFor is the system prompt with the action rule that matches what
+// the assistant can actually do.
 func systemPromptFor(toolsEnabled bool) string {
 	rule := readOnlyRule
 	if toolsEnabled {
 		rule = proposalRule
 	}
-	return strings.Replace(systemPrompt, "%RULE8%", rule, 1)
+	return strings.Replace(systemPrompt, "%ACTIONRULE%", rule, 1)
 }
 
 // buildPrompt assembles the messages sent to the model: the system contract,
@@ -163,7 +181,7 @@ func buildPrompt(now time.Time, toolsEnabled bool, sources []Source, actionsBloc
 // an explicitly empty one reads like an answer.
 func contextBlock(sources []Source) string {
 	if len(sources) == 0 {
-		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals or notes for this question.)"
+		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals, notes or calendar for this question.)"
 	}
 	var b strings.Builder
 	b.WriteString("CONTEXT\n")

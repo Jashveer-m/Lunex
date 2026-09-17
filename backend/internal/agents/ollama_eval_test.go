@@ -46,6 +46,15 @@ var evalCases = []struct {
 	{"I have been learning Rust this term so that I can finish the compiler project", []string{""}},
 	{"What do my field notes say happened over the tundra?", []string{"", tools.SearchDocuments, tools.SearchNotes}},
 	{"Remind me how Rust fits in with everything else I have going on.", []string{"", tools.SearchTasks, tools.SearchNotes, tools.SearchGoals}},
+	// Phase 8. The last two are the ones worth watching: a question about the
+	// day may reasonably reach for the calendar or the tasks, and a remark
+	// about lunch is a remark.
+	{"What's on my calendar tomorrow?", []string{tools.SearchCalendar}},
+	{"Book the dentist for Thursday at 3pm", []string{tools.CreateCalendarEvent}},
+	{"Schedule a team sync on 2026-10-05 at 10am", []string{tools.CreateCalendarEvent}},
+	{"What have I got on next week?", []string{"", tools.SearchCalendar}},
+	{"What does my day look like?", []string{"", tools.SearchCalendar, tools.SearchTasks}},
+	{"I had a lovely lunch with Sam yesterday.", []string{""}},
 }
 
 // TestRoutingAgainstOllama runs the production gate, prompt and parser against
@@ -65,7 +74,10 @@ func TestRoutingAgainstOllama(t *testing.T) {
 	model := os.Getenv("CHAT_MODEL")
 	provider := ai.NewOllama(os.Getenv("OLLAMA_BASE_URL"), model, 10*time.Minute)
 	router := NewRouter(provider, standard(), quiet(), Options{Timeout: 10 * time.Minute})
-	writes := map[string]bool{tools.CreateTask: true, tools.UpdateTask: true, tools.CreateGoal: true, tools.CreateNote: true}
+	writes := map[string]bool{
+		tools.CreateTask: true, tools.UpdateTask: true, tools.CreateGoal: true,
+		tools.CreateNote: true, tools.CreateCalendarEvent: true,
+	}
 
 	right, spurious := 0, 0
 	for _, tc := range evalCases {

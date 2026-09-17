@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
@@ -74,11 +75,20 @@ type (
 	NoteLister interface {
 		List(ctx context.Context, userID uuid.UUID, f notes.Filter) ([]notes.Note, error)
 	}
+	// EventLister is Phase 8's calendar, read the way the other resource
+	// listers are: as a plain function with the owner id as an argument. It is
+	// optional -- a nil one is an assistant that retrieves exactly what Phase 7
+	// did -- because the module is, and because an operator running without a
+	// calendar should not get an empty section implying they have one.
+	EventLister interface {
+		List(ctx context.Context, userID uuid.UUID, f calendar.Filter) ([]calendar.Event, error)
+	}
 )
 
 // retrieve gathers the context for one question, strongest first: whatever a
 // read tool found for it, then document chunks that actually match it, then
-// the memories that match it, then the user's current tasks, goals and notes.
+// the memories that match it, then what is on the user's calendar in the next
+// day or two, then their current tasks, goals and notes.
 //
 // Documents and memories are matched semantically. Tasks, goals and notes are
 // not -- they are selected by a plain heuristic (in progress, due soonest,
@@ -86,6 +96,11 @@ type (
 // visible to the model: a chunk or a memory arrives ranked by similarity, an
 // item arrives as background the question may or may not be about, and the
 // system prompt forbids citing anything that does not answer the question.
+//
+// The calendar leads the heuristic items because it is the only one of them
+// selected by time rather than by status: an event in the next two days is
+// about now in a way that a pending task is not, which is what makes "what does
+// my day look like" answerable from background context at all.
 //
 // Memories come after documents and before the heuristic items because that is
 // their standing: a fact the assistant recorded about the user is stronger
@@ -132,6 +147,12 @@ func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question strin
 		return nil, err
 	}
 	out = append(out, linked...)
+
+	soon, err := s.upcomingEvents(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, soon...)
 
 	found2, err := s.currentTasks(ctx, userID)
 	if err != nil {
@@ -249,6 +270,38 @@ func (s *Service) related(ctx context.Context, userID uuid.UUID, question string
 	return out, nil
 }
 
+// upcomingEvents is the calendar heuristic: what is on between now and
+// EventWindow from now, soonest first.
+//
+// It is a plain range query rather than a retrieval subsystem, and the window
+// is deliberately short. An event next month does not belong in the context of
+// every question; the one this afternoon does, and a question that is actually
+// about next month routes to search_calendar, which takes the dates from the
+// user. The window starts at the top of today rather than at `now` so an event
+// that began this morning is still in front of the model at four in the
+// afternoon -- "what have I got on today" is a question about the whole day.
+func (s *Service) upcomingEvents(ctx context.Context, userID uuid.UUID) ([]Source, error) {
+	if s.calendar == nil {
+		return nil, nil
+	}
+	now := s.now().UTC()
+	from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	found, err := s.calendar.List(ctx, userID, calendar.Filter{
+		Start: from, End: now.Add(EventWindow), Sort: calendar.DefaultSort, Limit: MaxEvents,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieve calendar: %w", err)
+	}
+	out := make([]Source, 0, len(found))
+	for _, e := range found {
+		out = append(out, Source{
+			Type: SourceEvent, ID: e.ID, Title: e.Title,
+			Excerpt: truncate(eventSummary(e), MaxExcerptChars),
+		})
+	}
+	return out, nil
+}
+
 // currentTasks is the task heuristic: what the user is working on, then what
 // is due soonest. Two queries rather than one because Filter takes a single
 // status, and "in progress" and "due next" are different questions.
@@ -350,8 +403,37 @@ func graphSummary(n graph.Neighborhood) string {
 	return strings.Join(lines, "\n")
 }
 
-// singular turns a ref_table name into the word for one of its rows.
-func singular(table string) string { return strings.TrimSuffix(table, "s") }
+// singular turns a ref_table name into the words for one of its rows:
+// "calendar_events" is "calendar event", not "calendar_event".
+func singular(table string) string {
+	return strings.TrimSuffix(strings.ReplaceAll(table, "_", " "), "s")
+}
+
+// eventSummary renders one event as the line the model is shown. When it is
+// comes first and is spelled in full, including the weekday: the model is
+// answering questions like "what is on tomorrow", and a bare date makes it do
+// calendar arithmetic it is bad at.
+func eventSummary(e calendar.Event) string {
+	parts := []string{"starts " + e.StartTime.UTC().Format("Mon 2 Jan 2006 15:04") + " UTC"}
+	if e.AllDay {
+		parts = []string{"all day on " + e.StartTime.UTC().Format("Mon 2 Jan 2006")}
+		if last := e.EndTime.Add(-time.Nanosecond).UTC(); last.Format(time.DateOnly) != e.StartTime.UTC().Format(time.DateOnly) {
+			parts = []string{"all day from " + e.StartTime.UTC().Format("Mon 2 Jan 2006") +
+				" to " + last.Format("Mon 2 Jan 2006")}
+		}
+	} else {
+		parts = append(parts, "ends "+e.EndTime.UTC().Format("Mon 2 Jan 2006 15:04")+" UTC")
+	}
+	if e.Location != nil && *e.Location != "" {
+		parts = append(parts, "at "+*e.Location)
+	}
+	if e.RecurrenceRule != nil && *e.RecurrenceRule != "" {
+		// Said plainly, because the repeats are not rows: the model is being
+		// shown one event and must not describe next week's as scheduled.
+		parts = append(parts, "repeats (only this occurrence is recorded)")
+	}
+	return withDescription(strings.Join(parts, " · "), e.Description)
+}
 
 func taskSummary(t tasks.Task) string {
 	parts := []string{"priority " + t.Priority, "status " + t.Status}

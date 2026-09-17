@@ -198,6 +198,10 @@ func toolSources(tool string, r tools.Result) []Source {
 		out = append(out, Source{Type: SourceNote, ID: n.ID, Title: n.Title, Tool: tool,
 			Excerpt: truncate(noteSummary(n), MaxExcerptChars)})
 	}
+	for _, e := range r.Events {
+		out = append(out, Source{Type: SourceEvent, ID: e.ID, Title: e.Title, Tool: tool,
+			Excerpt: truncate(eventSummary(e), MaxExcerptChars)})
+	}
 	return out
 }
 
@@ -328,6 +332,9 @@ func (t toolStep) unconfirmed() []string {
 // dates, and not the closed-set values (a status of "completed", a priority of
 // "high"), which say how the change is made rather than what it is about and
 // would otherwise match any fact that uses the word.
+//
+// An event's `start` and `end` are dates by another name, and are skipped for
+// the same reason `deadline` is.
 func changeText(input []byte) string {
 	var fields map[string]any
 	if json.Unmarshal(input, &fields) != nil {
@@ -340,7 +347,11 @@ func changeText(input []byte) string {
 	sort.Strings(keys)
 	var parts []string
 	for _, k := range keys {
-		if k == "deadline" || k == "status" || k == "priority" || k == "type" || strings.HasSuffix(k, "_id") {
+		switch k {
+		case "deadline", "start", "end", "status", "priority", "type":
+			continue
+		}
+		if strings.HasSuffix(k, "_id") {
 			continue
 		}
 		switch v := fields[k].(type) {

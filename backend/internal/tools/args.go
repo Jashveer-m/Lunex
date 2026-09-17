@@ -156,3 +156,25 @@ var goalTypeSynonyms = map[string]string{
 	"health": "personal", "fitness": "personal", "hobby": "personal", "life": "personal",
 	"projects": "project",
 }
+
+// Bool returns the first of the named arguments that holds something a model
+// writes for yes or no, and whether one did. Anything else is "not given",
+// because a flag the model wrote as "maybe" is not a flag the user set.
+func (a Args) Bool(names ...string) (value, ok bool) {
+	for _, name := range names {
+		v, present := a[name]
+		if !present {
+			continue
+		}
+		if b, isBool := v.(bool); isBool {
+			return b, true
+		}
+		switch strings.ToLower(strings.TrimSpace(fmt.Sprint(v))) {
+		case "true", "yes", "y", "1", "all day", "all-day", "allday":
+			return true, true
+		case "false", "no", "n", "0":
+			return false, true
+		}
+	}
+	return false, false
+}

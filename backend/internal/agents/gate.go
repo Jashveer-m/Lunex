@@ -47,6 +47,11 @@ var toolCues = []string{
 	// the things the tools act on
 	"task", "todo", "to-do", "goal", "note", "document", "doc", "file", "pdf", "upload",
 	"deadline", "due", "priorit", "milestone",
+	// the calendar. "calendar", "event", "meeting" and the rest name the thing;
+	// "agenda", "diary" and "plan" are how people ask to see it ("what's my
+	// plan for tomorrow?"). They are cues, not decisions: the model still
+	// chooses the tool, and a false positive costs one routing call.
+	"calendar", "event", "meeting", "appointment", "agenda", "diary", "plan", "book",
 	// asking for something to exist
 	"add", "create", "make", "new", "save", "jot", "write", "record", "log", "remind",
 	"remember", "track", "put", "schedule", "set",

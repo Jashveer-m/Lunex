@@ -87,9 +87,12 @@ const TYPE_LABEL: Record<Source['type'], string> = {
   task: 'Task',
   goal: 'Goal',
   note: 'Note',
+  event: 'Event',
 }
 
-const TYPE_LINK: Record<Source['type'], string> = {
+/** Partial: a source type with no page of its own shows no link rather than a
+ *  link somewhere else. Calendar events have none yet. */
+const TYPE_LINK: Partial<Record<Source['type'], string>> = {
   document: '/documents',
   memory: '/memories',
   graph: '/graph',
@@ -130,9 +133,11 @@ function SourceItem({ source, messageKey }: { source: Source; messageKey: string
           <p className="rounded-md border-l-2 border-line-strong bg-sunken/60 px-2.5 py-1.5 text-xs leading-relaxed whitespace-pre-line text-ink-muted">
             {source.excerpt}
           </p>
-          <Link to={TYPE_LINK[source.type]} className="mt-1 inline-block text-[11px] text-accent hover:underline">
-            Open {TYPE_LABEL[source.type].toLowerCase()}s →
-          </Link>
+          {TYPE_LINK[source.type] && (
+            <Link to={TYPE_LINK[source.type]!} className="mt-1 inline-block text-[11px] text-accent hover:underline">
+              Open {TYPE_LABEL[source.type].toLowerCase()}s →
+            </Link>
+          )}
         </div>
       )}
     </li>

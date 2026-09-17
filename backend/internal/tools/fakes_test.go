@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -177,6 +178,67 @@ func (f *fakeNotes) Create(_ context.Context, userID uuid.UUID, in notes.CreateI
 	return notes.Note{ID: uuid.New(), UserID: userID, Title: in.Title, Content: in.Content, Tags: in.Tags}, nil
 }
 
+// fakeCalendar keeps the overlap rule the SQL has, so a test can seed an event
+// that started before the window and see it come back.
+type fakeCalendar struct {
+	mu      sync.Mutex
+	byUser  map[uuid.UUID][]calendar.Event
+	creates []calendar.CreateInput
+	filters []calendar.Filter
+	err     error
+}
+
+func newFakeCalendar() *fakeCalendar {
+	return &fakeCalendar{byUser: map[uuid.UUID][]calendar.Event{}}
+}
+
+func (f *fakeCalendar) seed(owner uuid.UUID, title string, start time.Time, d time.Duration) calendar.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := calendar.Event{ID: uuid.New(), UserID: owner, Title: title, StartTime: start, EndTime: start.Add(d)}
+	f.byUser[owner] = append(f.byUser[owner], e)
+	return e
+}
+
+func (f *fakeCalendar) List(_ context.Context, userID uuid.UUID, filter calendar.Filter) ([]calendar.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.filters = append(f.filters, filter)
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []calendar.Event
+	for _, e := range f.byUser[userID] {
+		if !e.StartTime.Before(filter.End) {
+			continue
+		}
+		if !e.EndTime.After(filter.Start) && e.StartTime.Before(filter.Start) {
+			continue
+		}
+		q := strings.ToLower(filter.Query)
+		if q != "" && !strings.Contains(strings.ToLower(e.Title), q) {
+			continue
+		}
+		out = append(out, e)
+		if filter.Limit > 0 && len(out) == filter.Limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCalendar) Create(_ context.Context, userID uuid.UUID, in calendar.CreateInput) (calendar.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creates = append(f.creates, in)
+	e := calendar.Event{
+		ID: uuid.New(), UserID: userID, Title: in.Title,
+		StartTime: in.StartTime, EndTime: in.EndTime, AllDay: in.AllDay,
+	}
+	f.byUser[userID] = append(f.byUser[userID], e)
+	return e, nil
+}
+
 type fakeDocs struct {
 	mu      sync.Mutex
 	byUser  map[uuid.UUID][]documents.SearchResult
@@ -241,26 +303,28 @@ func (l *fakeLedger) Approve(_ context.Context, userID, id uuid.UUID) (Approved,
 
 // world is one registry over fresh fakes.
 type world struct {
-	reg    *Registry
-	tasks  *fakeTasks
-	goals  *fakeGoals
-	notes  *fakeNotes
-	docs   *fakeDocs
-	ledger *fakeLedger
-	user   uuid.UUID
+	reg      *Registry
+	tasks    *fakeTasks
+	goals    *fakeGoals
+	notes    *fakeNotes
+	docs     *fakeDocs
+	calendar *fakeCalendar
+	ledger   *fakeLedger
+	user     uuid.UUID
 }
 
 func newWorld() *world {
 	w := &world{
-		tasks:  newFakeTasks(),
-		goals:  &fakeGoals{byUser: map[uuid.UUID][]goals.Goal{}},
-		notes:  &fakeNotes{byUser: map[uuid.UUID][]notes.Note{}},
-		docs:   &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
-		ledger: newFakeLedger(),
-		user:   uuid.New(),
+		tasks:    newFakeTasks(),
+		goals:    &fakeGoals{byUser: map[uuid.UUID][]goals.Goal{}},
+		notes:    &fakeNotes{byUser: map[uuid.UUID][]notes.Note{}},
+		docs:     &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
+		calendar: newFakeCalendar(),
+		ledger:   newFakeLedger(),
+		user:     uuid.New(),
 	}
 	reg, err := NewRegistry(w.ledger, Standard(Services{
-		Tasks: w.tasks, Goals: w.goals, Notes: w.notes, Documents: w.docs,
+		Tasks: w.tasks, Goals: w.goals, Notes: w.notes, Documents: w.docs, Calendar: w.calendar,
 		DocumentMinSimilarity: 0.5, Now: func() time.Time { return testNow },
 	})...)
 	if err != nil {
@@ -278,5 +342,8 @@ func (w *world) totalWrites() int {
 	w.notes.mu.Lock()
 	n := len(w.notes.creates)
 	w.notes.mu.Unlock()
-	return w.tasks.writes() + g + n
+	w.calendar.mu.Lock()
+	c := len(w.calendar.creates)
+	w.calendar.mu.Unlock()
+	return w.tasks.writes() + g + n + c
 }

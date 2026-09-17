@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jashveer/lifeos/backend/internal/actions"
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
@@ -273,6 +274,36 @@ func (f *fakeNotes) List(_ context.Context, userID uuid.UUID, filter notes.Filte
 		return nil, f.err
 	}
 	return f.byUser[userID], nil
+}
+
+// fakeEvents is the calendar, keeping the overlap rule the SQL has so a test
+// can seed an event outside the window and see it left out.
+type fakeEvents struct {
+	mu      sync.Mutex
+	byUser  map[uuid.UUID][]calendar.Event
+	err     error
+	callers []uuid.UUID
+	filters []calendar.Filter
+}
+
+func (f *fakeEvents) List(_ context.Context, userID uuid.UUID, filter calendar.Filter) ([]calendar.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callers = append(f.callers, userID)
+	f.filters = append(f.filters, filter)
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := []calendar.Event{}
+	for _, e := range f.byUser[userID] {
+		if e.StartTime.Before(filter.End) && e.EndTime.After(filter.Start) {
+			out = append(out, e)
+		}
+		if filter.Limit > 0 && len(out) == filter.Limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // --- Phase 5 fakes ----------------------------------------------------------

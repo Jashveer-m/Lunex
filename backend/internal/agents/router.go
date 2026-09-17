@@ -133,16 +133,21 @@ func (r *Router) dropUngroundedFilters(offered []tools.Tool, d *Decision, messag
 			if !p.Filter {
 				continue
 			}
-			raw, present := d.Args[p.Name]
-			if !present {
-				continue
+			// Every key the tool reads this argument from, not only its
+			// declared name: a value written under an alias the check skipped
+			// would reach the tool exactly as an invented one does.
+			for _, key := range p.Keys() {
+				raw, present := d.Args[key]
+				if !present {
+					continue
+				}
+				if value := d.Args.String(key); value != "" && tools.FilterGrounded(p, value, message) {
+					continue
+				}
+				delete(d.Args, key)
+				r.log.Info("routing dropped a filter the message does not give",
+					"tool", d.Tool, "param", p.Name, "key", key, "value", raw)
 			}
-			if value := d.Args.String(p.Name); value != "" && tools.FilterGrounded(p, value, message) {
-				continue
-			}
-			delete(d.Args, p.Name)
-			r.log.Info("routing dropped a filter the message does not give",
-				"tool", d.Tool, "param", p.Name, "value", raw)
 		}
 	}
 }

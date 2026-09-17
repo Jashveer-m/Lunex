@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
@@ -19,10 +20,10 @@ import (
 // another user's data for the same structural reason the repositories cannot.
 //
 // Note what is missing. No interface here has a Delete method, and only the
-// task one has Update: the brief scopes this phase to creating tasks, goals and
-// notes and updating tasks, and an interface that does not name a method is a
-// guarantee that no tool calls it. Adding a delete tool is a deliberate change
-// to one of these, not a line anybody writes by accident.
+// task one has Update: the briefs scope the tools to creating tasks, goals,
+// notes and calendar events and updating tasks, and an interface that does not
+// name a method is a guarantee that no tool calls it. Adding a delete tool is a
+// deliberate change to one of these, not a line anybody writes by accident.
 type (
 	TaskService interface {
 		List(ctx context.Context, userID uuid.UUID, f tasks.Filter) ([]tasks.Task, error)
@@ -41,6 +42,10 @@ type (
 	DocumentSearcher interface {
 		Search(ctx context.Context, userID uuid.UUID, q documents.SearchQuery) ([]documents.SearchResult, error)
 	}
+	CalendarService interface {
+		List(ctx context.Context, userID uuid.UUID, f calendar.Filter) ([]calendar.Event, error)
+		Create(ctx context.Context, userID uuid.UUID, in calendar.CreateInput) (calendar.Event, error)
+	}
 )
 
 // Services is what the standard tools are built over.
@@ -49,6 +54,7 @@ type Services struct {
 	Goals     GoalService
 	Notes     NoteService
 	Documents DocumentSearcher
+	Calendar  CalendarService
 	// DocumentMinSimilarity is search_documents' floor. It is the chat
 	// retrieval floor, passed in rather than defaulted here, so a document the
 	// assistant finds by searching is held to the same bar as one it retrieves
@@ -64,21 +70,28 @@ type Services struct {
 // number the Phase 4 heuristic settled on for the same reason.
 const SearchLimit = 5
 
-// The names of the Phase 7 tools. They are constants because other packages --
-// the agents that group them, the tests that pin them -- refer to them, and a
-// typo in a string would be a tool that silently never gets offered.
+// The names of the tools. They are constants because other packages -- the
+// agents that group them, the tests that pin them -- refer to them, and a typo
+// in a string would be a tool that silently never gets offered.
 const (
 	SearchTasks     = "search_tasks"
 	SearchGoals     = "search_goals"
 	SearchNotes     = "search_notes"
 	SearchDocuments = "search_documents"
+	SearchCalendar  = "search_calendar"
 	CreateTask      = "create_task"
 	UpdateTask      = "update_task"
 	CreateGoal      = "create_goal"
 	CreateNote      = "create_note"
+	// CreateCalendarEvent is Phase 8's one write. There is no
+	// update_calendar_event to go with it: moving an event is the same sharp
+	// edge as deleting one -- the wrong meeting moved is a meeting missed --
+	// and it needs the same "show the user exactly what would change" that
+	// deletion is waiting for. See docs/decisions.md.
+	CreateCalendarEvent = "create_calendar_event"
 )
 
-// Standard returns this phase's eight tools, read tools first.
+// Standard returns the tools, read tools first.
 //
 // There is no delete tool. Deleting through a conversation is a sharper edge
 // than creating -- an approved create that was wrong costs a click to undo, an
@@ -93,10 +106,12 @@ func Standard(s Services) []Tool {
 		searchGoalsTool(s),
 		searchNotesTool(s),
 		searchDocumentsTool(s),
+		searchCalendarTool(s),
 		createTaskTool(s),
 		updateTaskTool(s),
 		createGoalTool(s),
 		createNoteTool(s),
+		createCalendarEventTool(s),
 	}
 }
 
@@ -109,7 +124,7 @@ var searchStopWords = map[string]struct{}{
 	"the": {}, "and": {}, "for": {}, "with": {}, "about": {}, "that": {}, "this": {},
 	"all": {}, "any": {}, "some": {}, "my": {}, "our": {}, "from": {}, "into": {},
 	"task": {}, "tasks": {}, "goal": {}, "goals": {}, "note": {}, "notes": {},
-	"todo": {}, "item": {}, "items": {},
+	"todo": {}, "item": {}, "items": {}, "event": {}, "events": {}, "calendar": {},
 }
 
 // searchTerms is the whole phrase first, then -- as a fallback -- up to three of
