@@ -53,7 +53,12 @@ const (
 	NodeNote     = "note"
 	NodeDocument = "document"
 	// NodeEvent mirrors a row of calendar_events (Phase 8).
-	NodeEvent   = "event"
+	NodeEvent = "event"
+	// NodeExpense mirrors a row of expenses (Phase 9). Expense *categories* are
+	// not mirrored: a category is a label on other rows rather than a thing
+	// that happened, and a node per category would match the mention scan on
+	// the word "food".
+	NodeExpense = "expense"
 	NodeSkill   = "skill"
 	NodePerson  = "person"
 	NodeProject = "project"
@@ -61,7 +66,8 @@ const (
 
 // NodeTypes is the allow-list, used by validation, by the extraction parser
 // and by the ?type= filter on the graph read.
-var NodeTypes = []string{NodeTask, NodeGoal, NodeNote, NodeDocument, NodeEvent, NodeSkill, NodePerson, NodeProject}
+var NodeTypes = []string{NodeTask, NodeGoal, NodeNote, NodeDocument, NodeEvent, NodeExpense,
+	NodeSkill, NodePerson, NodeProject}
 
 // ExtractedTypes are the node types a conversation can create, and therefore
 // the only ones a user is allowed to delete directly. The rest are mirrors.
@@ -69,13 +75,14 @@ var ExtractedTypes = []string{NodeSkill, NodePerson, NodeProject}
 
 // The tables a node can mirror, and the node type each produces. This map is
 // the only place the correspondence is written down, and its keys are the same
-// five strings the ref_table CHECK constraint allows.
+// six strings the ref_table CHECK constraint allows.
 var refTableTypes = map[string]string{
 	"tasks":           NodeTask,
 	"goals":           NodeGoal,
 	"notes":           NodeNote,
 	"documents":       NodeDocument,
 	"calendar_events": NodeEvent,
+	"expenses":        NodeExpense,
 }
 
 // TypeForRefTable reports the node type a mirrored table produces, and whether
@@ -90,9 +97,11 @@ func TypeForRefTable(table string) (string, bool) {
 // The relationships this phase scopes to, mirrored by the CHECK constraint in
 // migration 000006.
 //
-// SPENT_ON and VISITED from the spec are absent: they point at expenses and
-// trips, and neither module exists yet, so an edge of either type could never
-// have a real node on its far side.
+// SPENT_ON and VISITED from the spec are absent. VISITED points at trips, which
+// do not exist. SPENT_ON now could have a real node on its far side -- Phase 9
+// mirrors expenses -- but adding it means widening the relationship CHECK and
+// teaching the extraction prompt when to use it, which is a change to how the
+// model reads every turn rather than a new table. See docs/decisions.md.
 const (
 	// RelRelatedTo is the unspecific link, and the fallback for a relationship
 	// the model named in words the allow-list does not have.

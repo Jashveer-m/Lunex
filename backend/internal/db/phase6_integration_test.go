@@ -182,7 +182,7 @@ func TestGraphConstraints(t *testing.T) {
 
 	t.Run("an unknown node type is rejected", func(t *testing.T) {
 		if _, err := pool.Exec(
-			`INSERT INTO knowledge_nodes (user_id, type, label) VALUES ($1, 'expense', 'coffee')`, alice); err == nil {
+			`INSERT INTO knowledge_nodes (user_id, type, label) VALUES ($1, 'invoice', 'coffee')`, alice); err == nil {
 			t.Fatal("a node type outside the allow-list was stored")
 		}
 	})
@@ -201,7 +201,7 @@ func TestGraphConstraints(t *testing.T) {
 	t.Run("an unknown ref_table is rejected", func(t *testing.T) {
 		if _, err := pool.Exec(
 			`INSERT INTO knowledge_nodes (user_id, type, label, ref_table, ref_id)
-			 VALUES ($1, 'task', 't', 'expenses', gen_random_uuid())`, alice); err == nil {
+			 VALUES ($1, 'task', 't', 'receipts', gen_random_uuid())`, alice); err == nil {
 			t.Fatal("a ref_table outside the allow-list was stored")
 		}
 	})

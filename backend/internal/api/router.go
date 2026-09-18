@@ -17,6 +17,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
@@ -32,6 +33,7 @@ type Deps struct {
 	Goals       *goals.Handler
 	Notes       *notes.Handler
 	Calendar    *calendar.Handler
+	Finance     *finance.Handler
 	Documents   *documents.Handler
 	Chat        *chat.Handler
 	Memories    *memories.Handler
@@ -106,6 +108,13 @@ func NewRouter(d Deps) http.Handler {
 			// write is one insert plus a graph sync: database work with no
 			// model anywhere, so the ordinary budget.
 			r.Mount("/calendar", d.Calendar.Routes())
+
+			// Phase 9. A finance read is one index scan over a date range --
+			// or one GROUP BY, for the summary -- and a write is one insert
+			// plus a graph sync: database work with no model anywhere, so the
+			// ordinary budget.
+			r.Mount("/expenses", d.Finance.ExpenseRoutes())
+			r.Mount("/expense-categories", d.Finance.CategoryRoutes())
 
 			// Phase 5. Managing memories is database work: listing, editing
 			// and deleting rows. The model and the embedder are only involved

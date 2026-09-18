@@ -31,6 +31,13 @@ Personal life-operating-system.
   (`create_calendar_event`) under the same approval rule, and what is on in the
   next two days joins the context of every answer — which is what makes "what
   does my day look like" answerable.
+- **Phase 9** — the finance module: expenses with a category, a currency and a
+  date, added up per category by the database rather than by the model. Money
+  is exact everywhere — an integer number of hundredths, never a float. The
+  assistant can look at what you spent (`search_expenses`), total it
+  (`analyze_spending`) and *propose* a new expense (`create_expense`) under the
+  same approval rule. It reports what your own records show and does not give
+  financial advice, which is a rule in the system prompt with a test on it.
 - **UI phase** — the web app over all of it: sign-in, tasks/goals/notes,
   document upload, a streaming chat with inline citations and Approve/Reject
   cards for proposed changes, and a memory manager.
@@ -72,6 +79,7 @@ lunex/
 │   │   ├── db/            # connection pool, migration runner, pgvector param
 │   │   ├── documents/     # upload, extract, chunk, embed, search
 │   │   ├── embeddings/    # Ollama client behind an Embedder interface
+│   │   ├── finance/       # expenses: exact money, categories, spending totals, node sync
 │   │   ├── goals/         # goals + milestones: model, service, handlers
 │   │   ├── graph/         # knowledge graph: node sync, relationship extraction, 1-hop lookup
 │   │   ├── memories/      # extraction, embedding, retrieval, management
@@ -332,6 +340,67 @@ put there; the repeats it describes are not rows, are not returned by a range
 query, and the assistant is told to say so rather than describe next week's
 occurrence as scheduled.
 
+### Expenses (Phase 9)
+
+Every account starts with five categories — Food, Transport, Housing,
+Utilities, Other — seeded by a trigger on `users`, so they exist however the
+account was made. A read does not need a date range, unlike the calendar: a
+ledger grows a row per purchase, and "what have I ever spent on this?" is a
+real question.
+
+```sh
+curl -s "localhost:8080/api/v1/expenses?start=2026-09-01&end=2026-09-30" -H "$AUTH"
+# {"expenses":[{"amount":450.50,"currency":"INR","category":"Food",
+#               "description":"lunch with the team","expense_date":"2026-09-17",…}],"count":1,…}
+```
+
+Both ends are inclusive — `end=2026-09-30` includes the 30th — because these
+are dates, not timestamps.
+
+Totals are worked out by the database, not by the model:
+
+```sh
+curl -s "localhost:8080/api/v1/expenses/summary?start=2026-09-01&end=2026-09-30" -H "$AUTH"
+# {"count":5,"currencies":[{"currency":"INR","total":1001.00,"count":4,
+#    "categories":[{"category":"Food","total":601.00,"count":2},…,
+#                  {"category":null,"total":100.00,"count":1}]},
+#   {"currency":"USD","total":20.00,"count":1,…}]}
+```
+
+There is no grand total across currencies, and that is the design: nothing here
+converts, so adding ₹500 to $20 would need a rate whose staleness nobody could
+see in the answer. The expenses filed under no category are a line of their
+own, so the lines always add up to the total.
+
+Money is exact at every layer — a `numeric(12,2)` column and an integer number
+of hundredths in Go, never a float — so a hundred entries of `0.10` total
+`10.00`. More than two decimal places is refused rather than rounded.
+
+The assistant reaches it under the same rule as everything else:
+
+```sh
+# "I spent 450.50 on lunch today, log it under food."
+# event: action
+# data: {"id":"…","tool_name":"create_expense","status":"proposed",
+#        "summary":"Record an expense of INR 450.50 under "Food" (for lunch) on Thu 17 Sep 2026.",…}
+
+curl -s -X POST localhost:8080/api/v1/actions/$ACTION_ID/approve -H "$AUTH"
+# {"status":"executed","result":{"expense":{"amount":450.50,…}},…}
+```
+
+Two things it will not invent. A **category** you do not have is refused, with
+your actual categories in the message, so it asks instead of filing money under
+a label you never made — wrong once, wrong in every total after. And a
+**currency** your message does not name (as a code, a word or a symbol) is
+dropped before the proposal is built: measured, llama3.2:3b wrote `USD` for a
+message with no currency in it, and "USD 1450.50" reads on the card like
+something you said.
+
+Asked how much you spent, it reports what your own records add up to. It is not
+a financial adviser, does not claim to be, and does not tell you what to do with
+your money — rule 9 of the system prompt, with a test that checks the framing
+reaches the model.
+
 ## The web UI
 
 `make frontend-dev` (with the API running) serves it at http://localhost:5173;
@@ -566,3 +635,16 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
 45. **Event times are UTC throughout**, including the ones the assistant reads
     off your calendar and quotes back at you. The profile's timezone is still
     not used anywhere.
+46. **No budgets.** Phase 9 records spending and adds it up. There is no
+    budget, no target, no "you are over by ₹2,000" and no forecast — and the
+    assistant is forbidden from inventing one.
+47. **No currency conversion.** An expense stays in the currency it was
+    incurred in. There is no rate table and no exchange-rate fetch, so a total
+    is always a total *per currency* and there is no combined figure.
+48. **No receipt parsing.** Linking an expense to an uploaded document links
+    it, and nothing more: nothing reads the file or pulls an amount out of it.
+49. **The assistant cannot change or delete an expense**, and categories cannot
+    be renamed or deleted through the API — both would rewrite spending history
+    through a door that cannot show you what would change.
+50. **Finance has no screen of its own.** `GET /expenses/summary` exists in the
+    shape a dashboard would want, and nothing draws it yet.

@@ -113,6 +113,17 @@ const (
 	// picked by *when* it is rather than by what it says, which is what makes
 	// "what does my day look like" answerable at all.
 	SourceEvent = "event"
+	// SourceExpense is one expense the user recorded.
+	SourceExpense = "expense"
+	// SourceSpending is a set of totals a tool added up from the user's own
+	// expenses. It is the only source that is neither a record nor a link but
+	// a *computation*, and it exists so the arithmetic happens in Postgres
+	// rather than in a 3B model's head: "how much did I spend on food" has one
+	// right answer, and a model asked to add up forty rows will not reliably
+	// produce it. The rule that goes with it is in the system prompt, and it
+	// covers both what the figures mean and what the assistant must not do
+	// with them.
+	SourceSpending = "spending"
 )
 
 // Source is one retrieved item, recorded on the assistant message that was
@@ -122,15 +133,18 @@ const (
 // wire shape at once, so what the API returns is what the column holds.
 type Source struct {
 	Type string `json:"type"`
-	// ID is the document, memory, graph node, task, goal, note or calendar
-	// event id -- something the client can follow to the underlying record.
+	// ID is the document, memory, graph node, task, goal, note, calendar event
+	// or expense id -- something the client can follow to the underlying
+	// record. It is the zero uuid for a "spending" source, which is a total
+	// rather than a row and has nothing to follow.
 	ID uuid.UUID `json:"id"`
 	// Label is the marker the prompt showed the model ("S1", "S2", ...). It is
 	// stored because Cited is derived from finding it in the answer, and
 	// because a client rendering "[S1]" needs to know what S1 was.
 	Label string `json:"label"`
 	// Title is the filename, the task/goal/note/event title, the graph node's
-	// label, or -- for a memory, which has no title -- its type.
+	// label, what an expense was for, the period a spending total covers, or
+	// -- for a memory, which has no title -- its type.
 	Title string `json:"title"`
 	// ChunkIndex is set for documents only. Similarity is set for everything
 	// retrieved semantically, which is documents and memories; the task, goal

@@ -19,6 +19,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/chat"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
@@ -80,6 +81,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	goalSvc := goals.NewService(goals.NewRepository(pool), goals.WithNodeSync(graphSvc))
 	noteSvc := notes.NewService(notes.NewRepository(pool), notes.WithNodeSync(graphSvc))
 	calendarSvc := calendar.NewService(calendar.NewRepository(pool), calendar.WithNodeSync(graphSvc))
+	financeSvc := finance.NewService(finance.NewRepository(pool), finance.WithNodeSync(graphSvc))
 	// The assistant runs against a mock model for the same reason the document
 	// tests run against a deterministic embedder: what these tests measure is
 	// the routing and the SQL scoping, not whether a model understood a
@@ -97,7 +99,8 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	// every write tool has to pass through.
 	actionRepo := actions.NewRepository(pool)
 	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
-		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc, Calendar: calendarSvc,
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
+		Calendar: calendarSvc, Finance: financeSvc,
 		DocumentMinSimilarity: 0.5,
 	})...)
 	if err != nil {
@@ -131,6 +134,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Goals:       goals.NewHandler(goalSvc, discard),
 		Notes:       notes.NewHandler(noteSvc, discard),
 		Calendar:    calendar.NewHandler(calendarSvc, discard),
+		Finance:     finance.NewHandler(financeSvc, discard),
 		Documents:   documents.NewHandler(docSvc, discard, 0),
 		Chat:        chat.NewHandler(chatSvc, discard),
 		Memories:    memories.NewHandler(memorySvc, discard),

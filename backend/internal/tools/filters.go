@@ -3,9 +3,10 @@ package tools
 import (
 	"regexp"
 	"strings"
+	"unicode"
 )
 
-// FilterGrounded reports whether a value the model wrote for a filter argument
+// ValueGrounded reports whether a value the model wrote for a grounded argument
 // is one the user's message actually gives.
 //
 // A filter is the one kind of argument a model can get wrong silently. A bad
@@ -26,9 +27,11 @@ import (
 // hashtag: "greenhouse" in "what do my greenhouse notes say" is a topic, and
 // only "notes tagged greenhouse" or "#greenhouse" makes it a tag.
 //
-// It reports false for a param that is not a filter; see Param.Filter.
-func FilterGrounded(p Param, value, message string) bool {
-	if !p.Filter {
+// It applies to a write's arguments too, when they are declared Grounded --
+// see Param.Grounded for the measured case. It reports false for a param that
+// is neither.
+func ValueGrounded(p Param, value, message string) bool {
+	if !p.MustBeGrounded() {
 		return false
 	}
 	value = strings.TrimSpace(value)
@@ -40,21 +43,17 @@ func FilterGrounded(p Param, value, message string) bool {
 		if v == "" {
 			return false
 		}
-		if mentionsWords(message, v) {
-			return true
-		}
-		for word, means := range p.Synonyms {
-			if means == v && mentionsWords(message, word) {
-				return true
-			}
-		}
-		return false
+		return mentionsWords(message, v) || saidInOtherWords(p, v, message)
 	}
 	if mentionsWords(message, "#"+strings.TrimPrefix(value, "#")) {
 		return true
 	}
 	if !mentionsWords(message, value) {
-		return false
+		// A value the message gives in other words, which for an open set is
+		// the only way it can: "20 dollars" and "$20" both give USD, and
+		// neither contains the code. Same rule the closed-set branch above
+		// applies, for a param whose set is not closed.
+		return saidInOtherWords(p, value, message)
 	}
 	if len(p.Cues) == 0 {
 		return true
@@ -65,6 +64,40 @@ func FilterGrounded(p Param, value, message string) bool {
 		}
 	}
 	return false
+}
+
+// saidInOtherWords reports whether the message names the value through one of
+// the param's synonyms -- "dollars" or "$" for USD.
+//
+// A synonym with no letters or digits in it is a symbol, and is looked for as a
+// plain substring: "$20" has no word boundary between the "$" and the number,
+// so the word-boundary test that everything else uses would never match it.
+func saidInOtherWords(p Param, value, message string) bool {
+	for word, means := range p.Synonyms {
+		if !strings.EqualFold(means, value) {
+			continue
+		}
+		if isSymbol(word) {
+			if strings.Contains(message, word) {
+				return true
+			}
+			continue
+		}
+		if mentionsWords(message, word) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSymbol reports whether s is punctuation rather than a word -- "$", "₹".
+func isSymbol(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // mentionsWords reports whether phrase occurs in text as whole words, case and

@@ -15,8 +15,8 @@ import (
 // with chat and extraction prompts going through the same model between turns,
 // is most of the time. Most messages are greetings, thanks, questions about
 // the world and remarks about the user's day, and a request to use a tool
-// names what it wants done to what: a task, a note, a goal, a document; add,
-// find, mark, save.
+// names what it wants done to what: a task, a note, a goal, a document, an
+// expense; add, find, mark, save, spent.
 //
 // So the gate is lexical and deliberately permissive. It looks for one of the
 // cue words below at the start of a word, and when it finds one the model
@@ -52,6 +52,13 @@ var toolCues = []string{
 	// plan for tomorrow?"). They are cues, not decisions: the model still
 	// chooses the tool, and a false positive costs one routing call.
 	"calendar", "event", "meeting", "appointment", "agenda", "diary", "plan", "book",
+	// money. "spend"/"spent", "cost", "paid" and "bought" are how an expense
+	// gets mentioned at all; "budget" and "afford" are in here because the
+	// questions that use them are answered from the same records -- and are
+	// exactly the questions the financial-advice rule in the chat prompt is
+	// about, which the assistant can only apply if it has looked.
+	"expense", "spend", "spent", "spending", "cost", "paid", "pay", "bought", "buy",
+	"budget", "afford", "money", "receipt", "invoice", "rupee", "dollar",
 	// asking for something to exist
 	"add", "create", "make", "new", "save", "jot", "write", "record", "log", "remind",
 	"remember", "track", "put", "schedule", "set",

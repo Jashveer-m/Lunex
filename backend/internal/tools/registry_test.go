@@ -182,7 +182,7 @@ func TestPrepareNeverWrites(t *testing.T) {
 
 // --- declarations ---------------------------------------------------------------
 
-func TestStandardToolsAreTheBriefsTen(t *testing.T) {
+func TestStandardToolsAreTheBriefsThirteen(t *testing.T) {
 	w := newWorld()
 	var reads, writes []string
 	for _, tool := range w.reg.Tools() {
@@ -195,10 +195,12 @@ func TestStandardToolsAreTheBriefsTen(t *testing.T) {
 	}
 	sort.Strings(reads)
 	sort.Strings(writes)
-	if want := []string{SearchCalendar, SearchDocuments, SearchGoals, SearchNotes, SearchTasks}; !slices.Equal(reads, want) {
+	if want := []string{AnalyzeSpending, SearchCalendar, SearchDocuments, SearchExpenses,
+		SearchGoals, SearchNotes, SearchTasks}; !slices.Equal(reads, want) {
 		t.Fatalf("read tools = %v, want %v", reads, want)
 	}
-	if want := []string{CreateCalendarEvent, CreateGoal, CreateNote, CreateTask, UpdateTask}; !slices.Equal(writes, want) {
+	if want := []string{CreateCalendarEvent, CreateExpense, CreateGoal, CreateNote,
+		CreateTask, UpdateTask}; !slices.Equal(writes, want) {
 		t.Fatalf("write tools = %v, want %v", writes, want)
 	}
 	// Deletion is deferred. Nothing may be registered that sounds like it.
@@ -246,9 +248,13 @@ func TestCanonicalInputOnlyCarriesDeclaredParams(t *testing.T) {
 	w.tasks.seed(w.user, "Write the scheduler", "pending")
 	everything := Args{
 		"title": "t", "description": "d", "priority": "high", "deadline": "tomorrow",
-		"category": "c", "tags": []any{"a"}, "query": "q", "status": "completed", "tag": "x",
+		// "Food" rather than a nonsense string: it is a plain free-text
+		// category to the task tools and one of the seeded expense categories
+		// to create_expense, which refuses a category the user does not have.
+		"category": "Food", "tags": []any{"a"}, "query": "q", "status": "completed", "tag": "x",
 		"type": "career", "content": "body", "task": "scheduler",
 		"start": "2026-09-30 14:00", "end": "2026-09-30 15:00", "location": "the shed",
+		"amount": "500", "currency": "INR",
 		"user_id": uuid.NewString(), "id": "ignored",
 	}
 	for _, tool := range w.reg.Tools() {

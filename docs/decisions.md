@@ -2056,3 +2056,389 @@ Item 35 applies unchanged: "tomorrow at 3pm" is 15:00 UTC, the summary says UTC,
 and the profile's timezone is still read by nothing. For a calendar this is more
 visible than it was for a deadline, and it is the first thing a timezone phase
 would fix.
+
+# Phase 9 decisions
+
+## Money is an integer, everywhere, at every layer
+
+`Amount` is an `int64` of hundredths. It is never a `float64` — not in the
+service, not in the repository, not on the wire, and not in the SQL driver.
+
+This is the one decision in the module with no trade-off to weigh. A `float64`
+cannot represent `0.1`, so a column of them does not add up to what a person
+adding the same numbers on paper gets; and the entire point of the summary
+endpoint is to produce a total somebody will compare against their bank. Ten
+lots of `0.10` have to be `1.00`, not `0.9999999999999999`.
+
+So the column is `numeric(12,2)`, which is exact decimal, and the two ends are
+joined without a float in between:
+
+- Reading, the SELECT asks for `amount::text` and `ParseAmount` turns the digits
+  Postgres holds into the same integer that was written. Asking for the numeric
+  directly would let the driver decide, and one of its choices is a float.
+- Writing, the INSERT sends `$n::numeric` with the canonical decimal string.
+- On the wire, `Amount.MarshalJSON` writes the digits out as an unquoted JSON
+  *number* (`450.50`) rather than passing them through a float on the way. A
+  client that decodes it into a float of its own has made that choice itself;
+  this side does not make it for them.
+
+More than two decimal places is **refused**, not rounded. `12.345` is a value
+this column cannot hold, and silently making it `12.35` is an edit to somebody's
+ledger that nobody asked for. Rejecting it costs one field error; accepting it
+costs a number that is quietly wrong forever.
+
+## There is no total, only a total per currency
+
+Nothing in this phase converts currencies, and the shape of `Summary` is what
+enforces that: totals are grouped by currency first, and there is no field
+holding a combined figure. `GET /expenses/summary` returns a list of currencies
+and no grand total; `analyze_spending` reports them separately and says in words
+that they are not added together.
+
+The brief rules out multi-currency conversion, but the reason it is worth
+stating as a *shape* rather than as a missing feature is that a combined total
+is the kind of wrong that cannot be seen. Adding ₹500 to $20 needs a rate; a
+rate has a date; and a stale or wrong one produces a plausible number that
+nobody looking at the answer can tell from the truth. A schema that cannot
+express the combined figure cannot produce it by accident.
+
+## Unlike the calendar, the range is optional — and inclusive
+
+Two deliberate departures from Phase 8, both because dates are not timestamps
+and a ledger is not a diary.
+
+**Optional.** `GET /calendar` requires a window because a calendar grows a row
+per meeting and "all my events" is a denial-of-service lever with no use case
+(see above). A finance table grows a row per purchase, and "what have I ever
+spent on this?" is a real question with a real answer. So `start` and `end` are
+optional here and the paging is what bounds the read. What is still refused is a
+range that runs *backwards*, which returns nothing whatever is in the table.
+
+**Inclusive.** `calendar.Filter` is half-open; `finance.Filter` is closed on
+both ends. `?start=2026-09-01&end=2026-09-30` is September, all of it. These are
+`date` values: there is no moment between the last instant of the 30th and the
+first of the 1st for an exclusive bound to be more correct about, and an
+exclusive `end` would mean a month query had to name the 1st of *October*, which
+is not what anybody types. The list and the summary share one `WHERE` clause
+(`Filter.conditions`) so the two can never disagree about which expenses a
+period holds.
+
+The dates themselves are `date` columns and `time.Time` at midnight UTC, run
+through `finance.Day` on the way in and on the way out. An expense has no time
+of day, and inventing one would make "this month" depend on which timezone
+invented it.
+
+## What the parser refuses, and what it leaves to validation
+
+Two rules in `ParseAmount` that a review found the wrong way round, both about
+where a limit belongs.
+
+**A comma is a grouping separator and never a decimal point.** The parser
+strips `1,234.50` to `1234.50`, and it used to strip `12,34` to `1234` — a
+hundredfold error, silent, and reachable both from `POST /expenses` with
+`{"amount": "12,34"}` and from a user saying "I spent 12,34 euros". Half the
+world writes the decimal comma, so guessing is not available: a comma not
+followed by exactly three digits is now refused, with a message saying to use a
+full stop.
+
+**How large one expense may be is validation's rule, not the parser's.** The
+parser used to reject more than ten whole digits, matching `numeric(12,2)`. But
+`ParseAmount` also reads back the *sums* the summary query produces, and two
+expenses of `MaxAmount` add up to eleven digits — so a user with two very large
+expenses got a 500 from `GET /expenses/summary`, permanently. The parser's only
+limit is now what an `int64` of hundredths can hold, which `strconv.ParseInt`
+reports; `MaxAmount` stays in `ValidateCreate`, where a single row's size is
+actually decided. A leading zero stopped being an overflow as a side effect.
+
+## Dates in this module are read backwards
+
+`calendarDate` resolves a year-less "5 September" to the *next* one, because it
+was written for deadlines and a deadline is ahead of you. An expense is behind
+you, and the same parser serving both directions produced two bugs.
+
+A bare calendar date is now pulled back a year when it lands in the future, for
+`create_expense` and for the start of a period. The rule is narrow on purpose:
+only a phrase that names a month with no year is moved, so "tomorrow" stays
+where the user put it.
+
+The end of a *range* is not read backwards — it is anchored to the start, in
+the earliest year that does not put it before it. "1 September to 30
+September", asked on the 10th, is this September; reading the end backwards on
+its own would pull it to last year and invert the range. An end with no start
+is left where the phrase puts it, because "everything up to 30 September" read
+backwards would hide this year's spending, while read forwards it simply
+includes everything.
+
+And whatever survives all that, `create_expense` refuses a date in the future.
+Money cannot have been spent on a day that has not happened, and an expense
+dated forwards falls outside every period anybody asks about. The HTTP API does
+not refuse it — there a date is something the caller stated, not something a
+model inferred.
+
+`AddDate` also had to be replaced for months: it normalizes an overflowing
+day-of-month *forward*, so the 31st of March minus one month is the 3rd of
+March. "How much did I spend in the past month", asked on the 31st, silently
+left out the first three days of the period it named — and a total wrong by a
+few days does not look wrong. `MonthsBefore` clamps to the end of the month it
+lands in instead.
+
+## The default categories are seeded by a trigger on `users`
+
+The brief asked whether this should be a migration-time seed or lazy creation on
+first use. It is neither: migration 000009 puts an `AFTER INSERT` trigger on
+`users` that inserts the five defaults, plus a one-off backfill for the accounts
+that already exist.
+
+A migration-time `INSERT` alone is wrong: it covers the users who exist the
+moment it runs and nobody who registers afterwards, so it would have to be
+paired with application code regardless.
+
+Putting it in that application code — `users.Repository.Create`, which already
+inserts the user and its profile in one transaction — would make the `users`
+package depend on the finance schema, and would fire only on the one path that
+remembered to call it. The trigger makes "every user has the default categories"
+true of the table whatever creates a user: the API, a `psql` session, a test
+fixture, a future admin import. It is the argument `drop_knowledge_node` makes
+in 000006, applied to an insert instead of a delete.
+
+Lazy creation on first use was the other candidate, and it is worse for a reason
+that is not about correctness. An empty category list gives a new user a "pick a
+category" control with nothing in it, and gives `create_expense` nothing to
+resolve "food" against — so the very first expense anybody logs is filed under
+nothing, which is exactly the case the categories exist to avoid.
+
+## Category names are unique case-insensitively
+
+`UNIQUE (user_id, lower(name))`, not `UNIQUE (user_id, name)`.
+
+This was found by a test rather than designed: with a plain unique constraint,
+`POST /expense-categories {"name": "food"}` succeeded for a user who already had
+`Food`. The consequence is not cosmetic. `CategoryByName` resolves
+case-insensitively — it has to, because the model writes whatever the user
+typed — so two rows make "log it under food" ambiguous, and a spending breakdown
+reports one category as two lines that each look like the whole of it.
+
+The name is still stored as the user spelled it; only the comparison ignores
+case. It is the call migration 000001 makes for `users.email`, for the same
+reason.
+
+## `analyze_spending` is a tool that returns a computation, not records
+
+Every other read tool answers with rows: `search_tasks` returns tasks,
+`search_calendar` returns events, and the orchestrator renders each one as a
+source. `analyze_spending` returns a `tools.Report` — a title and a block of
+text carrying figures that are already worked out — and the chat layer renders
+it as a source of type `spending`.
+
+Two reasons, and the second is the important one.
+
+The cheap one is context budget: "how much did I spend last year" over a
+thousand rows is one `GROUP BY` and a handful of lines, or a thousand rows in
+front of a model with an 8k window.
+
+The real one is that a 3B model asked to add up forty amounts will produce a
+number, and it will sometimes be wrong. There is exactly one right answer to
+"how much did I spend on food this month", the user can check it against their
+bank, and a plausible wrong total is the worst output this system can produce.
+So the arithmetic happens in Postgres, the words describing it are written by
+the tool that did the arithmetic — not by the orchestrator, because a second
+place that formats totals is a second place they can be formatted wrongly — and
+the system prompt tells the model the figures are already computed and must not
+be re-totalled or converted.
+
+The `Source` for a report carries the zero uuid: it is a total, not a row, and
+there is nothing for a client to open.
+
+## `create_expense` refuses an unknown category; the reads absorb it
+
+The same argument — a category name the user's list does not have — gets
+opposite treatment in the write and in the two reads, on purpose.
+
+`search_expenses` and `analyze_spending` fold an unmatched name into the text
+search. "What did I spend on coffee?" then answers from the descriptions instead
+of coming back empty because there is no `Coffee` category, and the summary says
+what it actually did. A read that answered the wrong question can be run again.
+
+`create_expense` declines, and the `ArgumentError` names the categories that do
+exist so the model can ask a precise question. Filing money under a label the
+user never made is not recoverable by reading it again: it is wrong in the
+breakdown, in the summary and in every answer built on them, from then on. A
+tool that quietly added "Coffe" because a model spelled it that way would make
+the category list a dumping ground for typos and the analysis built on it
+meaningless.
+
+This is also why `tools.FinanceService` has `Categories` and `CategoryByName`
+and no `CreateCategory`: no tool can add a category, which makes "the category
+list is the user's" structural rather than a rule.
+
+## The proposal stores the category by name, not by id
+
+`createExpenseInput` carries `category: "Food"` and no `category_id`, and the id
+is resolved again when the approval runs.
+
+The stored input is what the user is shown before approving, and a uuid is not
+something anybody can check. It is also the whole of what the tool's declared
+params allow — a test pins that a canonical input never carries a key the schema
+does not declare — and a resolved id would be exactly such a key.
+
+Re-resolving is safe here because nothing this phase offers renames or deletes a
+category. If the name does not resolve at approval time the write *fails* and is
+recorded as failed, rather than quietly filing the money under nothing.
+
+## The financial-advice boundary is a prompt rule, in every prompt
+
+The master spec requires that spending analysis be framed as informational
+rather than as professional financial advice. That is rule 9 of the chat system
+prompt, and three things about how it is written were deliberate.
+
+**It is in every prompt, not only the ones a finance tool ran for.** The
+half about sources needs a source to apply to; the half about advice does not.
+"Should I move my savings into an index fund?" retrieves nothing at all, and it
+is precisely the question where a model with no rule in front of it answers
+confidently. Gating the rule on a finance tool having run would remove it from
+the turn that needs it most.
+
+**It names the sentences, not the principle.** "Do not give financial advice" is
+a rule a 3B model agrees with and then breaks; a list of what not to say —
+invest, save, borrow, buy, sell, this category is too high, you should spend
+less — is one it follows. It also forbids claiming professional or regulatory
+standing outright, because "as your financial adviser" is a sentence a model
+will write to sound helpful.
+
+**It says what the assistant may do instead.** Describing what the user's own
+numbers show is not advice, and is stated as the approved alternative. A rule
+that only forbade would push the model into refusing to answer questions it can
+answer perfectly well — which is its own failure, just a quieter one.
+
+The rule is in the prompt whether or not the model obeys it, and that is what a
+test can check: `internal/chat/finance_test.go` asserts the framing reaches the
+answering model, for a turn that ran `analyze_spending` and for a turn that
+retrieved nothing. What the model then writes is checked by `scripts/e2e.sh`,
+which warns rather than fails — the same treatment `claims_done` gets, for the
+same reason.
+
+## The currency is grounded in the message; the rest of the proposal is not
+
+The hardening pass's rule was that a *filter* argument has to come from the
+user's message, because a made-up filter is the one argument that is silently
+wrong: the search runs, finds nothing, and the user is told truthfully that
+nothing matched. A write's arguments were deliberately not checked — they are
+shown to the user in the proposal before anything happens.
+
+Phase 9 found the exception, and found it in the end-to-end run rather than by
+reasoning. Asked "I spent 1450.50 on printer cartridges today, log it",
+llama3.2:3b called `create_expense` with `currency: "USD"` — a message with no
+currency in it at all. The proposal then read "Record an expense of USD
+1450.50", the user approves it, and ₹1450.50 is filed as $1450.50: a row that is
+never added to their rupee total, because nothing here converts currencies.
+
+The reason a currency is not like a title is that the user cannot check it. A
+title is their own words echoed back — if it is wrong they see that it is wrong.
+"USD" is a fact the assistant supplied, and it reads on the proposal exactly
+like one they supplied themselves.
+
+So `tools.Param` gained `Grounded`, which is `Filter`'s rule without `Filter`'s
+"this narrows a read" meaning, and `currency` is the one write argument that
+carries it. The check accepts the code, the word (`dollars`, `rupees`) or the
+symbol (`$`, `₹`) — a symbol through a substring test rather than the
+word-boundary one, since `$20` has no boundary between the two — and drops
+anything else, leaving the column default, which the proposal then shows.
+
+The amount is not checked, and does not need to be: `parseMoney` reads a
+currency out of the amount string (`"$20"`, `"20 dollars"`) and that string is
+the user's own figure copied over. Nor is anything else about the write: the
+rule is for arguments the user cannot audit by reading, and there is exactly one
+of those here.
+
+## An expense node is labelled by what it was for, never "Expense"
+
+Expenses are mirrored into the knowledge graph like tasks, goals, notes,
+documents and events. Categories are not: a category is a label on other rows
+rather than a thing that happened, and five category nodes per account would be
+five nodes the mention scan fires on whenever somebody says "food".
+
+An expense has no title, so `NodeLabel` builds one: the description when there
+is one, and otherwise the category and the date ("Food expense on 2026-09-17").
+It is never the bare word "Expense", and that is the whole reason it is a
+function rather than a column. The graph's mention scan matches a node when its
+label occurs in the message, so a node labelled "Expense" would fire on every
+question containing the word — the opposite of "the question named something the
+user has".
+
+## The date parser learned the past
+
+`ParseDate` gained "yesterday", "the day before yesterday" and "N days ago";
+`ParseWindow` gained "last month", "last year" and "the last N days".
+
+Nothing before Phase 9 needed them. A deadline is ahead of you and a calendar
+mostly is, so every relative phrase the parser knew pointed forwards. A ledger
+is read backwards — "I paid the rent yesterday", "how much did I spend last
+month" — and a parser that could only go forwards would have made the ordinary
+way of mentioning an expense unreadable.
+
+# Phase 9 — explicitly deferred
+
+## 52. No budgets, and nothing tracked against one
+
+The spec lists budget recommendations as a capability. This phase records
+spending and adds it up; there is no budget table, no target, no "you are over
+by ₹2,000", and no forecast. Tracking against a budget needs a budget to exist,
+a period to attach it to, and a decision about what happens when one is edited
+halfway through — and every one of those is a phase's worth of edge cases.
+
+The prompt rule forbids the assistant from inventing one in the meantime: no
+budgets or targets, and no telling the user a category is too high.
+
+## 53. No currency conversion
+
+See above. Amounts are stored in the currency they were incurred in and never
+converted, there is no rate table and no exchange-rate fetch, and a total is
+always per currency.
+
+## 54. No receipt parsing
+
+`related_document_id` links an expense to a document already uploaded, and that
+is all it does. Nothing reads the file, nothing extracts an amount or a date or
+a merchant from it, and uploading a receipt does not create an expense. Receipt
+OCR is a pipeline of its own.
+
+## 55. No `update_expense` and no delete tool
+
+`create_expense` is the only finance write the assistant has, on the same terms
+as `create_calendar_event` (item 47) and for the same reason. A number the
+assistant recorded wrongly is corrected through `PATCH /expenses/{id}` or the
+UI, not by asking it again — and changing a recorded amount through a
+conversation needs the same "show the user exactly what would change" that
+deletion is still waiting for (item 29).
+
+## 56. Categories cannot be renamed or deleted through the API
+
+`GET` and `POST` only. Renaming a category relabels every expense filed under
+it, and deleting one un-files them all through `ON DELETE SET NULL`; both are
+edits to spending history made through a door marked "categories". The foreign
+key and the cascade are in place, so a later phase that can show the user what
+would change can add both endpoints without a migration.
+
+## 57. Expenses are not background context
+
+The chat turn retrieves recent tasks, goals, notes and the next two days of the
+calendar as background on every substantial message. It does not retrieve
+recent expenses. An expense is not about *now* the way a pending task or
+tomorrow's meeting is, and a list of recent purchases in front of every answer
+would spend the context budget on something the question is almost never about.
+A question about spending routes to a tool, which is what tools are for.
+
+## 58. `SPENT_ON` is still not a relationship
+
+Migration 000006 left `SPENT_ON` out of the relationship allow-list because it
+pointed at expenses and expenses did not exist. They do now, and it is still
+out: adding it means widening a CHECK constraint *and* teaching the extraction
+prompt when to use it, which is a change to how the model reads every turn
+rather than a new table. An expense node can still be linked with `RELATED_TO`.
+
+## 59. Finance has no screen
+
+The web UI gained nothing this phase. An expense reaches the user through the
+API, through an approved proposal, or as a citation in an answer;
+`GET /expenses/summary` exists in the shape a dashboard would want, and is not
+drawn by one yet.

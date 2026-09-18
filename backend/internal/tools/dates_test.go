@@ -96,3 +96,94 @@ func TestParseDateRefusesToGuess(t *testing.T) {
 		}
 	}
 }
+
+// The past. Nothing looked backwards before Phase 9 -- a deadline is ahead and
+// a calendar mostly is -- and a ledger is read backwards: "I paid the rent
+// yesterday" is the ordinary way an expense gets mentioned.
+func TestParseDateReadsThePast(t *testing.T) {
+	for phrase, want := range map[string]string{
+		"yesterday":                "2026-09-09",
+		"last night":               "2026-09-09",
+		"the day before yesterday": "2026-09-08",
+		"3 days ago":               "2026-09-07",
+		"2 weeks ago":              "2026-08-27",
+		"1 month ago":              "2026-08-10",
+		"a year ago":               "",
+	} {
+		got, err := ParseDate(phrase, testNow)
+		if want == "" {
+			if err == nil {
+				t.Fatalf("ParseDate(%q) = %v, want a refusal rather than a guess", phrase, got)
+			}
+			continue
+		}
+		if err != nil || got.Format(time.DateOnly) != want {
+			t.Fatalf("ParseDate(%q) = %v, %v; want %s", phrase, got, err, want)
+		}
+	}
+}
+
+// The same for a stretch of the past, which is what "how much did I spend last
+// month" needs. The windows are half-open, as everywhere else here.
+func TestParseWindowReadsThePast(t *testing.T) {
+	for phrase, want := range map[string][2]string{
+		"last month":    {"2026-08-01", "2026-09-01"},
+		"last year":     {"2025-01-01", "2026-01-01"},
+		"last 7 days":   {"2026-09-04", "2026-09-11"},
+		"past 3 months": {"2026-06-11", "2026-09-11"},
+	} {
+		start, end, err := ParseWindow(phrase, testNow)
+		if err != nil {
+			t.Fatalf("ParseWindow(%q): %v", phrase, err)
+		}
+		got := [2]string{start.Format(time.DateOnly), end.Format(time.DateOnly)}
+		if got != want {
+			t.Fatalf("ParseWindow(%q) = %v, want %v", phrase, got, want)
+		}
+	}
+}
+
+// Moving back a month must clamp to the end of the month it lands in, not
+// normalize forward the way time.AddDate does. The 31st of March minus one
+// month is the 31st of February, and AddDate makes that the 3rd of March -- so
+// "how much did I spend in the past month", asked on the 31st, would leave out
+// the first three days of the period it named.
+func TestMonthsBeforeClampsToTheEndOfTheMonth(t *testing.T) {
+	for _, tc := range []struct {
+		from string
+		n    int
+		want string
+	}{
+		{"2026-03-31", 1, "2026-02-28"},
+		{"2026-05-31", 3, "2026-02-28"},
+		{"2026-01-31", 2, "2025-11-30"},
+		{"2028-03-29", 1, "2028-02-29"}, // a leap year
+		{"2026-09-10", 1, "2026-08-10"}, // the ordinary case is unchanged
+		{"2026-09-10", 12, "2025-09-10"},
+	} {
+		from, err := time.Parse(time.DateOnly, tc.from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := MonthsBefore(from, tc.n).Format(time.DateOnly); got != tc.want {
+			t.Fatalf("MonthsBefore(%s, %d) = %s, want %s", tc.from, tc.n, got, tc.want)
+		}
+	}
+
+	// And through the two parsers that use it.
+	endOfMarch := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	start, end, err := ParseWindow("past 1 month", endOfMarch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := start.Format(time.DateOnly); got != "2026-03-01" {
+		t.Fatalf(`ParseWindow("past 1 month") on the 31st starts %s, want 2026-03-01`, got)
+	}
+	if got := end.Format(time.DateOnly); got != "2026-04-01" {
+		t.Fatalf(`it ends %s, want the 1st of April`, got)
+	}
+	got, err := ParseDate("1 month ago", endOfMarch)
+	if err != nil || got.Format(time.DateOnly) != "2026-02-28" {
+		t.Fatalf(`ParseDate("1 month ago") on the 31st = %v, %v; want 2026-02-28`, got, err)
+	}
+}

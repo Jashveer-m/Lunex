@@ -202,6 +202,19 @@ func toolSources(tool string, r tools.Result) []Source {
 		out = append(out, Source{Type: SourceEvent, ID: e.ID, Title: e.Title, Tool: tool,
 			Excerpt: truncate(eventSummary(e), MaxExcerptChars)})
 	}
+	for _, e := range r.Expenses {
+		out = append(out, Source{Type: SourceExpense, ID: e.ID, Title: expenseTitle(e), Tool: tool,
+			Excerpt: truncate(expenseSummary(e), MaxExcerptChars)})
+	}
+	// A report has no row behind it, so it carries the zero id: it is a total
+	// the tool computed, not a record the client can open. analyze_spending is
+	// the only tool that produces one, which is why the type is fixed here; a
+	// second one would need the kind on tools.Report rather than a second
+	// branch.
+	for _, rep := range r.Reports {
+		out = append(out, Source{Type: SourceSpending, Title: rep.Title, Tool: tool,
+			Excerpt: truncate(rep.Text, MaxExcerptChars)})
+	}
 	return out
 }
 
@@ -333,8 +346,13 @@ func (t toolStep) unconfirmed() []string {
 // "high"), which say how the change is made rather than what it is about and
 // would otherwise match any fact that uses the word.
 //
-// An event's `start` and `end` are dates by another name, and are skipped for
-// the same reason `deadline` is.
+// An event's `start` and `end`, and an expense's `date`, are dates by another
+// name, and are skipped for the same reason `deadline` is. An expense's
+// `currency` and `category` are closed-set values by another name: "INR" and
+// "Food" say how the change is filed rather than what it is about, and would
+// otherwise match any fact that mentions either word. The amount is a number
+// and is skipped by the type switch below, which is the right answer for the
+// same reason -- what the change is *about* is its description.
 func changeText(input []byte) string {
 	var fields map[string]any
 	if json.Unmarshal(input, &fields) != nil {
@@ -348,7 +366,8 @@ func changeText(input []byte) string {
 	var parts []string
 	for _, k := range keys {
 		switch k {
-		case "deadline", "start", "end", "status", "priority", "type":
+		case "deadline", "start", "end", "date", "status", "priority", "type",
+			"currency", "category":
 			continue
 		}
 		if strings.HasSuffix(k, "_id") {

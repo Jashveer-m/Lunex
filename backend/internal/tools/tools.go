@@ -2,7 +2,7 @@
 // behalf.
 //
 // A tool is a fixed, reviewed Go function over one of the existing services --
-// tasks, goals, notes, documents, calendar -- with a name, a description, an input
+// tasks, goals, notes, documents, calendar, finance -- with a name, a description, an input
 // schema, an output schema and a permission level. There is nothing else: no
 // tool runs code the model wrote, builds SQL out of what the model said, or
 // reaches a service method its interface does not name. The model's only power
@@ -39,6 +39,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -107,8 +108,22 @@ type Param struct {
 	Required    bool
 	// Filter marks an optional argument that narrows what a read returns. The
 	// router drops one whose value the user's message does not give, rather
-	// than let a guessed value empty a search; see FilterGrounded.
+	// than let a guessed value empty a search; see ValueGrounded. It implies
+	// Grounded.
 	Filter bool
+	// Grounded marks an argument whose value must come from the user's message
+	// whatever kind of tool it belongs to, including a write's.
+	//
+	// It exists because a write has one argument shaped like a filter: a
+	// closed-set value the user either said or did not. Measured, on "I spent
+	// 1450.50 on printer cartridges today, log it": llama3.2:3b wrote
+	// `currency: "USD"` for a message with no currency in it, and the expense
+	// was filed in a second currency that is never totalled with the rest --
+	// which is the silent wrongness Filter exists to prevent, on the write
+	// side. A title or an amount is the user's own words echoed back and is
+	// checked by their eyes on the proposal; "USD" is a fact the assistant
+	// made up, and it reads like one the user supplied.
+	Grounded bool
 	// Synonyms are the words that ground an Enum filter besides its values.
 	Synonyms map[string]string
 	// Cues are words one of which must also be in the message for a free-text
@@ -123,6 +138,10 @@ type Param struct {
 
 // Keys are every argument key this parameter is read from, its own name first.
 func (p Param) Keys() []string { return append([]string{p.Name}, p.Aliases...) }
+
+// MustBeGrounded reports whether the router has to check this argument's value
+// against the message before the tool sees it.
+func (p Param) MustBeGrounded() bool { return p.Filter || p.Grounded }
 
 // Tool is one registered capability.
 //
@@ -164,19 +183,40 @@ type Call struct {
 // already uses for retrieved tasks and chunks -- so a task found by a search
 // reads to the model exactly like a task retrieved any other way.
 type Result struct {
-	Output any
-	Tasks  []tasks.Task
-	Goals  []goals.Goal
-	Notes  []notes.Note
-	Events []calendar.Event
-	Chunks []documents.SearchResult
+	Output   any
+	Tasks    []tasks.Task
+	Goals    []goals.Goal
+	Notes    []notes.Note
+	Events   []calendar.Event
+	Expenses []finance.Expense
+	Chunks   []documents.SearchResult
+	// Reports are figures a tool worked out from the user's records rather
+	// than records it found. They exist for analyze_spending, which answers
+	// "how much did I spend on food this month" with a total: there is no row
+	// that is the answer, and handing the model the hundred rows it was
+	// computed from would be both wasteful and an invitation to add them up
+	// again, differently. See tools.Report.
+	Reports []Report
 	// More reports that a search found more than it returned.
 	More bool
 }
 
-// Count is how many records the result carries.
+// Report is one computed figure, already written out for the model.
+//
+// Title names it and Text is the whole of it, rendered here rather than in the
+// orchestrator: the arithmetic and the words describing it belong to the tool
+// that did the arithmetic, and a second place that formats totals is a second
+// place they can be formatted wrongly.
+type Report struct {
+	Title string
+	Text  string
+}
+
+// Count is how many records the result carries. A report counts as one: it is
+// one thing the model is shown and one thing it can cite.
 func (r Result) Count() int {
-	return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Events) + len(r.Chunks)
+	return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Events) +
+		len(r.Expenses) + len(r.Chunks) + len(r.Reports)
 }
 
 // define builds a Tool whose canonical input is the Go type In.

@@ -229,7 +229,7 @@ func TestCalendarConstraints(t *testing.T) {
 			t.Fatalf("migration 000008 did not widen the node type allow-list: %v", err)
 		}
 		if _, err := pool.Exec(
-			`INSERT INTO knowledge_nodes (user_id, type, label) VALUES ($1, 'expense', 'coffee')`, owner); err == nil {
+			`INSERT INTO knowledge_nodes (user_id, type, label) VALUES ($1, 'invoice', 'coffee')`, owner); err == nil {
 			t.Fatal("a node type outside the allow-list was stored")
 		}
 	})

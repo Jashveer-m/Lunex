@@ -110,27 +110,33 @@ func (r *Router) Decide(ctx context.Context, agent Agent, message string) (Decis
 			"agent", agent.Name, "tool", d.Tool)
 		return Decision{}, nil
 	}
-	r.dropUngroundedFilters(offered, &d, message)
+	r.dropUngroundedArguments(offered, &d, message)
 	return d, nil
 }
 
-// dropUngroundedFilters removes every filter argument whose value the message
-// does not give, so the tool runs as if the model had left it out -- which is
-// what it should have done. See tools.FilterGrounded for the measured failure.
+// dropUngroundedArguments removes every argument whose value the message does
+// not give and whose parameter says it must, so the tool runs as if the model
+// had left it out -- which is what it should have done. See
+// tools.ValueGrounded for the measured failures.
 //
 // Dropped rather than refused: the rest of the call is usually right ("search
 // my notes for seedlings" with an invented tag is still a search for
-// seedlings), and running it without the filter answers the question the user
-// asked. Only filters are checked. A write's arguments are shown to the user
-// in the proposal before anything happens, and a search's query is the model's
-// own wording by design.
-func (r *Router) dropUngroundedFilters(offered []tools.Tool, d *Decision, message string) {
+// seedlings), and running it without the argument answers the question the
+// user asked -- or, for a write, proposes what the user actually said with the
+// invented detail left at its default, which the proposal then shows them.
+//
+// Most of what is checked is read filters, because a made-up filter is the
+// argument a user cannot tell from the truth. The exception is a write
+// argument that behaves like one -- see tools.Param.Grounded. What is *not*
+// checked is the rest of a write's arguments: a title is the model's wording
+// of what the user asked for, and the user reads it on the proposal.
+func (r *Router) dropUngroundedArguments(offered []tools.Tool, d *Decision, message string) {
 	for _, t := range offered {
 		if t.Name != d.Tool {
 			continue
 		}
 		for _, p := range t.Params {
-			if !p.Filter {
+			if !p.MustBeGrounded() {
 				continue
 			}
 			// Every key the tool reads this argument from, not only its
@@ -141,11 +147,11 @@ func (r *Router) dropUngroundedFilters(offered []tools.Tool, d *Decision, messag
 				if !present {
 					continue
 				}
-				if value := d.Args.String(key); value != "" && tools.FilterGrounded(p, value, message) {
+				if value := d.Args.String(key); value != "" && tools.ValueGrounded(p, value, message) {
 					continue
 				}
 				delete(d.Args, key)
-				r.log.Info("routing dropped a filter the message does not give",
+				r.log.Info("routing dropped an argument the message does not give",
 					"tool", d.Tool, "param", p.Name, "key", key, "value", raw)
 			}
 		}

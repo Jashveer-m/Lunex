@@ -9,9 +9,9 @@
 // an agent is the argument it is called with.
 //
 // There is exactly one agent the orchestrator uses, General, and it is
-// composed out of five domain agents -- TaskAgent, GoalAgent, NoteAgent,
-// DocumentAgent and CalendarAgent -- that each wrap one module's tools. They are not personas and
-// nothing routes to them individually yet. They exist so that the named-agent
+// composed out of six domain agents -- TaskAgent, GoalAgent, NoteAgent,
+// DocumentAgent, CalendarAgent and FinanceAgent -- that each wrap one module's
+// tools. They are not personas and nothing routes to them individually yet. They exist so that the named-agent
 // layer the spec describes (a Study agent, a Career agent) is an addition
 // rather than a rework: a later phase puts a first step in front of Decide that
 // picks an agent, composes it from the domain agents and whatever new modules
@@ -76,9 +76,17 @@ var (
 		Name: "calendar", Purpose: "looking at the user's calendar and scheduling events on it",
 		Tools: []string{tools.SearchCalendar, tools.CreateCalendarEvent},
 	}
+	// FinanceAgent is Phase 9. Its purpose says "what they spent" and not
+	// "their finances", and that wording is the point: this agent reads back
+	// the user's own records and adds them up. It does not advise, and the
+	// chat system prompt says so in the rule that goes with it.
+	FinanceAgent = Agent{
+		Name: "finance", Purpose: "looking at what the user spent, adding it up, and recording new expenses",
+		Tools: []string{tools.SearchExpenses, tools.AnalyzeSpending, tools.CreateExpense},
+	}
 )
 
 // General is the one agent the orchestrator uses: all of the domain agents'
 // tools.
 var General = Compose("general", "anything the assistant can do with the user's data",
-	TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent)
+	TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent, FinanceAgent)

@@ -313,7 +313,7 @@ func TestGraphTypeFilterReturnsADrawableSubgraph(t *testing.T) {
 		t.Fatalf("the filtered read returned %v dangling edges", count)
 	}
 
-	resp, out := doJSON(t, srv, http.MethodGet, "/api/v1/knowledge-graph?type=expense", alice, nil)
+	resp, out := doJSON(t, srv, http.MethodGet, "/api/v1/knowledge-graph?type=invoice", alice, nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("an unknown type filter = %d, want 400: %v", resp.StatusCode, out)
 	}

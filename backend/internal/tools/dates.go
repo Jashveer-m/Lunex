@@ -63,6 +63,14 @@ func ParseDate(s string, now time.Time) (time.Time, error) {
 		return today.AddDate(0, 0, 1), nil
 	case "the day after tomorrow", "day after tomorrow":
 		return today.AddDate(0, 0, 2), nil
+	// The past, which arrived with Phase 9. A deadline is always ahead and a
+	// calendar mostly is, so until there was a ledger to record nothing here
+	// looked backwards -- and "I paid the rent yesterday" is the ordinary way
+	// an expense gets mentioned.
+	case "yesterday", "yday", "last night", "yesterday evening", "yesterday morning":
+		return today.AddDate(0, 0, -1), nil
+	case "the day before yesterday", "day before yesterday":
+		return today.AddDate(0, 0, -2), nil
 	case "next week", "in a week", "a week from now", "a week from today":
 		return today.AddDate(0, 0, 7), nil
 	case "next month", "in a month", "a month from now":
@@ -73,6 +81,23 @@ func ParseDate(s string, now time.Time) (time.Time, error) {
 		return time.Date(today.Year(), today.Month()+1, 0, 0, 0, 0, 0, time.UTC), nil
 	case "end of the year", "end of year", "the end of the year":
 		return time.Date(today.Year(), time.December, 31, 0, 0, 0, 0, time.UTC), nil
+	}
+
+	if m := agoDate.FindStringSubmatch(s); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil || n <= 0 || n > 3650 {
+			return time.Time{}, fmt.Errorf("could not read %q as a date", raw)
+		}
+		switch m[2] {
+		case "day":
+			return today.AddDate(0, 0, -n), nil
+		case "week":
+			return today.AddDate(0, 0, -7*n), nil
+		case "month":
+			return MonthsBefore(today, n), nil
+		case "year":
+			return MonthsBefore(today, 12*n), nil
+		}
 	}
 
 	if m := relativeDate.FindStringSubmatch(s); m != nil {
@@ -107,6 +132,31 @@ func ParseDate(s string, now time.Time) (time.Time, error) {
 }
 
 var relativeDate = regexp.MustCompile(`^in (\d+) (day|week|month)s?$`)
+
+// agoDate reads "3 days ago", "2 weeks ago" -- the backwards counterpart, which
+// only expenses have a use for.
+var agoDate = regexp.MustCompile(`^(\d+) (day|week|month|year)s? ago$`)
+
+// MonthsBefore is t moved back n months, clamped to the end of the month it
+// lands in.
+//
+// time.Time.AddDate does not clamp, it *normalizes forward*: the 31st of March
+// minus one month is the 31st of February, which AddDate turns into the 3rd of
+// March. For a deadline that is a curiosity; for "how much did I spend in the
+// past month" it is a total that silently leaves out the first three days of
+// the period the user asked about, and no total that is wrong by a few days
+// looks wrong.
+func MonthsBefore(t time.Time, n int) time.Time {
+	utc := t.UTC()
+	first := time.Date(utc.Year(), utc.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -n, 0)
+	// The 0th of the next month is the last of this one.
+	last := time.Date(first.Year(), first.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	day := utc.Day()
+	if day > last {
+		day = last
+	}
+	return time.Date(first.Year(), first.Month(), day, 0, 0, 0, 0, time.UTC)
+}
 
 var weekdays = map[string]time.Weekday{
 	"sunday": time.Sunday, "sun": time.Sunday,

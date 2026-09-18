@@ -99,6 +99,7 @@ func TestSyncNodeMapsEachTableToItsType(t *testing.T) {
 	h := newHarness(t, nil)
 	for table, want := range map[string]string{
 		"tasks": NodeTask, "goals": NodeGoal, "notes": NodeNote, "documents": NodeDocument,
+		"calendar_events": NodeEvent, "expenses": NodeExpense,
 	} {
 		h.svc.SyncNode(context.Background(), h.user, table, uuid.New(), "a "+table+" row")
 		nodes, _ := h.store.NodesByLabel(context.Background(), h.user, "a "+table+" row")
@@ -112,7 +113,7 @@ func TestSyncNodeMapsEachTableToItsType(t *testing.T) {
 // constraint would reject it anyway, and inventing a type would be worse.
 func TestSyncNodeRefusesAnUnknownTable(t *testing.T) {
 	h := newHarness(t, nil)
-	h.svc.SyncNode(context.Background(), h.user, "expenses", uuid.New(), "a coffee")
+	h.svc.SyncNode(context.Background(), h.user, "receipts", uuid.New(), "a coffee")
 	if n := h.store.nodeCount(h.user); n != 0 {
 		t.Fatalf("an unknown source table wrote %d nodes", n)
 	}
@@ -489,7 +490,7 @@ func TestGraphReturnsAClosedSubgraph(t *testing.T) {
 
 func TestGraphRejectsAnUnknownType(t *testing.T) {
 	var verrs validate.Errors
-	_, err := h(t).svc.Graph(context.Background(), uuid.New(), Filter{Type: "expense"})
+	_, err := h(t).svc.Graph(context.Background(), uuid.New(), Filter{Type: "invoice"})
 	if !errors.As(err, &verrs) || verrs[0].Field != "type" {
 		t.Fatalf("err = %v, want a validation error on `type`", err)
 	}

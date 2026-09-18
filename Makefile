@@ -24,10 +24,12 @@ test-integration:
 # then creates a task and checks its graph node, states a relationship and
 # checks the edge was extracted, and asks about it in a third conversation --
 # then asks the assistant to create a task, approves the proposal, asks for
-# another and rejects it, and finally asks it to schedule something, approves
-# that and reads it back off the calendar.
+# another and rejects it, asks it to schedule something, approves that and reads
+# it back off the calendar, and finally asks it to log an expense, approves it,
+# asks how much has been spent this month and checks the total is the one the
+# API reports and the answer is not phrased as financial advice.
 # E2E_ONLY=actions runs just the action part, E2E_ONLY=calendar just the
-# calendar part.
+# calendar part, E2E_ONLY=finance just the finance part.
 # Needs Postgres with pgvector and a running Ollama; see docs/testing.md.
 test-e2e:
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" ./scripts/e2e.sh

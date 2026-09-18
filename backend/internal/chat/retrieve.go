@@ -11,6 +11,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
@@ -201,6 +202,14 @@ func deduplicated(in []Source) []Source {
 	seen := make(map[key]struct{}, len(in))
 	out := in[:0:0]
 	for _, s := range in {
+		// A source with no id is not a record, so it cannot be the same record
+		// twice. A "spending" total is the one kind: it carries the zero uuid
+		// because there is no row to open, and two of them in a turn are two
+		// different answers that would otherwise collapse into one.
+		if s.ID == uuid.Nil {
+			out = append(out, s)
+			continue
+		}
 		k := key{kind: s.Type, id: s.ID, chunk: -1}
 		if s.ChunkIndex != nil {
 			k.chunk = *s.ChunkIndex
@@ -431,6 +440,33 @@ func eventSummary(e calendar.Event) string {
 		// Said plainly, because the repeats are not rows: the model is being
 		// shown one event and must not describe next week's as scheduled.
 		parts = append(parts, "repeats (only this occurrence is recorded)")
+	}
+	return withDescription(strings.Join(parts, " · "), e.Description)
+}
+
+// expenseTitle is what one expense is called in the context block. It is
+// finance.NodeLabel -- what the expense is called in the knowledge graph -- so
+// the same purchase reads the same whichever way the model meets it.
+func expenseTitle(e finance.Expense) string { return finance.NodeLabel(e) }
+
+// expenseSummary renders one expense as the line the model is shown.
+//
+// The amount comes first and carries its currency, because the amount is what
+// was asked about and a bare number would be one the model might attach to the
+// wrong currency in an answer covering two. The date is spelled in full,
+// including the weekday, for the reason eventSummary gives: the model should
+// never have to work out what day a date was.
+func expenseSummary(e finance.Expense) string {
+	parts := []string{e.Currency + " " + e.Amount.String(),
+		"on " + e.Date.UTC().Format("Mon 2 Jan 2006")}
+	if e.CategoryName != nil && *e.CategoryName != "" {
+		parts = append(parts, "category "+*e.CategoryName)
+	} else {
+		parts = append(parts, "no category")
+	}
+	if e.RelatedDocumentID != nil {
+		// Said plainly: there is a receipt on file, and nothing has read it.
+		parts = append(parts, "has a document attached (its contents are not shown here)")
 	}
 	return withDescription(strings.Join(parts, " · "), e.Description)
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/db"
 	"github.com/jashveer/lifeos/backend/internal/documents"
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
@@ -134,6 +135,7 @@ func run(logger *slog.Logger) error {
 	docSvc := documents.NewService(documents.NewRepository(pool), embedder, logger,
 		cfg.DocumentProcessTimeout, documents.WithNodeSync(graphSvc))
 	calendarSvc := calendar.NewService(calendar.NewRepository(pool), calendar.WithNodeSync(graphSvc))
+	financeSvc := finance.NewService(finance.NewRepository(pool), finance.WithNodeSync(graphSvc))
 
 	// The memory system. It shares the chat provider and the embedder: a fact
 	// is extracted by the same kind of model that answered, and embedded by the
@@ -186,7 +188,8 @@ func run(logger *slog.Logger) error {
 	// a write tool, and it starts at POST /actions/{id}/approve.
 	actionRepo := actions.NewRepository(pool)
 	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
-		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc, Calendar: calendarSvc,
+		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
+		Calendar: calendarSvc, Finance: financeSvc,
 		DocumentMinSimilarity: cfg.ChatMinSimilarity,
 	})...)
 	if err != nil {
@@ -256,6 +259,7 @@ func run(logger *slog.Logger) error {
 		Goals:       goals.NewHandler(goalSvc, logger),
 		Notes:       notes.NewHandler(noteSvc, logger),
 		Calendar:    calendar.NewHandler(calendarSvc, logger),
+		Finance:     finance.NewHandler(financeSvc, logger),
 		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
 		Chat:        chat.NewHandler(chatSvc, logger),
 		Memories:    memories.NewHandler(memorySvc, logger),

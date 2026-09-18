@@ -10,6 +10,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -46,6 +47,19 @@ type (
 		List(ctx context.Context, userID uuid.UUID, f calendar.Filter) ([]calendar.Event, error)
 		Create(ctx context.Context, userID uuid.UUID, in calendar.CreateInput) (calendar.Event, error)
 	}
+	// FinanceService is Phase 9's expenses. Summarize is the interesting one:
+	// it is here so analyze_spending can answer "how much did I spend on food"
+	// with a number Postgres worked out, instead of a year of rows for a 3B
+	// model to add up. Categories and CategoryByName are read-only -- there is
+	// no CreateCategory, so no tool can add one, which is what makes "the
+	// category list is the user's" structural rather than a rule.
+	FinanceService interface {
+		List(ctx context.Context, userID uuid.UUID, f finance.Filter) ([]finance.Expense, error)
+		Summarize(ctx context.Context, userID uuid.UUID, f finance.Filter) (finance.Summary, error)
+		Categories(ctx context.Context, userID uuid.UUID) ([]finance.Category, error)
+		CategoryByName(ctx context.Context, userID uuid.UUID, name string) (finance.Category, error)
+		Create(ctx context.Context, userID uuid.UUID, in finance.CreateInput) (finance.Expense, error)
+	}
 )
 
 // Services is what the standard tools are built over.
@@ -55,6 +69,7 @@ type Services struct {
 	Notes     NoteService
 	Documents DocumentSearcher
 	Calendar  CalendarService
+	Finance   FinanceService
 	// DocumentMinSimilarity is search_documents' floor. It is the chat
 	// retrieval floor, passed in rather than defaulted here, so a document the
 	// assistant finds by searching is held to the same bar as one it retrieves
@@ -83,12 +98,18 @@ const (
 	UpdateTask      = "update_task"
 	CreateGoal      = "create_goal"
 	CreateNote      = "create_note"
+	SearchExpenses  = "search_expenses"
+	AnalyzeSpending = "analyze_spending"
 	// CreateCalendarEvent is Phase 8's one write. There is no
 	// update_calendar_event to go with it: moving an event is the same sharp
 	// edge as deleting one -- the wrong meeting moved is a meeting missed --
 	// and it needs the same "show the user exactly what would change" that
 	// deletion is waiting for. See docs/decisions.md.
 	CreateCalendarEvent = "create_calendar_event"
+	// CreateExpense is Phase 9's one write, on the same terms: there is no
+	// update_expense and no delete, so a number the assistant recorded can be
+	// corrected through the API or the UI and not by asking it again.
+	CreateExpense = "create_expense"
 )
 
 // Standard returns the tools, read tools first.
@@ -107,11 +128,14 @@ func Standard(s Services) []Tool {
 		searchNotesTool(s),
 		searchDocumentsTool(s),
 		searchCalendarTool(s),
+		searchExpensesTool(s),
+		analyzeSpendingTool(s),
 		createTaskTool(s),
 		updateTaskTool(s),
 		createGoalTool(s),
 		createNoteTool(s),
 		createCalendarEventTool(s),
+		createExpenseTool(s),
 	}
 }
 
@@ -125,6 +149,7 @@ var searchStopWords = map[string]struct{}{
 	"all": {}, "any": {}, "some": {}, "my": {}, "our": {}, "from": {}, "into": {},
 	"task": {}, "tasks": {}, "goal": {}, "goals": {}, "note": {}, "notes": {},
 	"todo": {}, "item": {}, "items": {}, "event": {}, "events": {}, "calendar": {},
+	"expense": {}, "expenses": {}, "spending": {}, "spent": {}, "cost": {}, "costs": {},
 }
 
 // searchTerms is the whole phrase first, then -- as a fallback -- up to three of

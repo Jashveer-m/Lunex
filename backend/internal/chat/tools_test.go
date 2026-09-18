@@ -143,6 +143,7 @@ type toolHarness struct {
 	*harness
 	tools    *toolTasks
 	calendar *toolCalendar
+	finance  *toolFinance
 	log      *actionLog
 	reg      *tools.Registry
 }
@@ -189,10 +190,11 @@ func newToolHarness(t *testing.T, provider *ai.Mock) *toolHarness {
 	t.Helper()
 	tt := &toolTasks{byUser: map[uuid.UUID][]tasks.Task{}}
 	cal := &toolCalendar{events: &fakeEvents{byUser: map[uuid.UUID][]calendar.Event{}}}
+	fin := newToolFinance()
 	reg, err := tools.NewRegistry(nil, tools.Standard(tools.Services{
 		Tasks: tt, Goals: noGoals{}, Notes: noNotes{}, Documents: &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
-		Calendar: cal,
-		Now:      func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) },
+		Calendar: cal, Finance: fin,
+		Now: func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) },
 	})...)
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +208,9 @@ func newToolHarness(t *testing.T, provider *ai.Mock) *toolHarness {
 		provider: provider,
 		user:     uuid.New(),
 	}
-	h := &toolHarness{harness: base, tools: tt, calendar: cal, reg: reg, log: &actionLog{store: base.store, reg: reg}}
+	h := &toolHarness{harness: base, tools: tt, calendar: cal, finance: fin, reg: reg,
+		log: &actionLog{store: base.store, reg: reg}}
+	fin.seedCategories(base.user)
 	base.svc = NewService(Deps{
 		Store: base.store, Provider: provider,
 		Documents: base.docs, Tasks: tt, Goals: base.goals, Notes: base.notes, Calendar: cal,

@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–8)
+# Lunex API — v1 (Phases 1–9)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -532,6 +532,215 @@ Moving one end is checked against the stored event, not against the patch:
 
 Deleting a **task or goal** an event was linked to does not delete the event: the
 link becomes `null` and the hour stays booked.
+
+---
+
+# Phase 9 — expenses
+
+## Expense categories
+
+Every user is given five categories when they register — **Food**, **Transport**,
+**Housing**, **Utilities**, **Other** — by a trigger on the `users` table, so
+they exist however the account was created. A category name is unique per user
+and compared **case-insensitively**: `Food` and `food` are one category, and the
+name is stored as you spelled it.
+
+There is no `PATCH` and no `DELETE`. Renaming a category would relabel every
+expense filed under it, and deleting one silently un-files them; both are edits
+to spending history made through a door marked "categories", and both wait for a
+phase that can show you what would change.
+
+### `GET /api/v1/expense-categories`
+
+```json
+{
+  "categories": [
+    {
+      "id": "a1f0c4d2-6b9e-4a33-9a10-7c3c1a4c9b02",
+      "name": "Food",
+      "created_at": "2026-09-17T09:14:02.331Z"
+    }
+  ],
+  "count": 5
+}
+```
+
+### `POST /api/v1/expense-categories`
+
+```json
+{ "name": "Books" }
+```
+
+`201 Created` — the category object. A name you already have is
+`400 validation_failed` on `name`, not a second row.
+
+---
+
+## Expenses
+
+An expense is an **amount**, a **currency**, and the **day** it was spent on.
+
+Money is exact. `amount` is a `numeric(12,2)` column and an integer number of
+hundredths in the service — never a float, at any layer. It is sent and returned
+as an unquoted JSON number with two decimal places (`450.50`); a decimal string
+(`"450.50"`) is also accepted on the way in. **More than two decimal places is
+rejected, not rounded**: `12.345` is a number this column cannot hold, and
+quietly making it `12.35` is an edit to your ledger that nobody asked for.
+
+Nothing converts currencies. An expense stays in the currency it was incurred
+in, and a total is therefore always a total *per currency* — which is the shape
+of the summary below. There is no rate table, no conversion, and no grand total.
+
+`expense_date` is a **date**, not a timestamp: `2026-09-17`, with no time of day
+and no timezone. A full RFC 3339 timestamp is accepted and read for the day it
+falls on.
+
+`related_document_id` links an expense to a receipt or invoice you already
+uploaded. It links and nothing more — no parsing, no extraction, no amount read
+out of the file.
+
+### `GET /api/v1/expenses`
+
+**`start` and `end` are optional here**, unlike the calendar: a history question
+with no dates in it is a reasonable question about a table that grows a row per
+purchase, and the paging is what bounds the read.
+
+| Parameter | Values |
+| --- | --- |
+| `start`, `end` | `YYYY-MM-DD`, **both bounds inclusive** — `start=2026-09-01&end=2026-09-30` is the whole of September. Either may be omitted |
+| `category_id` | a category of yours, or `none` for the expenses filed under no category |
+| `q` | text the description contains — case-insensitive, taken literally; at most 200 characters |
+| `sort` | `expense_date`, `amount`, `created_at`, `updated_at`, each also with a `-` prefix (default `-expense_date`) |
+| `limit`, `offset` | paging (default 50, max 200) |
+
+The bounds are inclusive on both ends because these are dates rather than
+timestamps: there is no moment between the last instant of the 30th and the
+first of the 1st for an exclusive bound to be more correct about, and an
+exclusive `end` would mean a month query had to name the 1st of the next month.
+
+`end` before `start` is `400 validation_failed`.
+
+```
+GET /api/v1/expenses?start=2026-09-01&end=2026-09-30
+```
+
+```json
+{
+  "expenses": [ { "...": "expense object" } ],
+  "count": 1,
+  "start": "2026-09-01",
+  "end": "2026-09-30",
+  "limit": 50,
+  "offset": 0
+}
+```
+
+The window is echoed back, and both bounds are `null` when you named none.
+
+### `POST /api/v1/expenses`
+
+```json
+{
+  "amount": 450.50,
+  "currency": "INR",
+  "category_id": "a1f0c4d2-6b9e-4a33-9a10-7c3c1a4c9b02",
+  "description": "lunch with the team",
+  "expense_date": "2026-09-17",
+  "related_document_id": null
+}
+```
+
+`amount` and `expense_date` are required. `amount` must be greater than zero —
+a refund is not modelled this phase — and at most `9999999999.99`. `currency` is
+a three-letter code, upper-cased on the way in, and defaults to `INR`; it is not
+checked against a list of real currencies, because nothing here does anything
+with it but group by it. `category_id` and `related_document_id` must be your
+own rows.
+
+`201 Created` — the expense object:
+
+```json
+{
+  "id": "3f9d1c77-2a4b-4e88-9c31-5b2e0a7d6f14",
+  "amount": 450.50,
+  "currency": "INR",
+  "category_id": "a1f0c4d2-6b9e-4a33-9a10-7c3c1a4c9b02",
+  "category": "Food",
+  "description": "lunch with the team",
+  "expense_date": "2026-09-17",
+  "related_document_id": null,
+  "created_at": "2026-09-17T09:14:02.331Z",
+  "updated_at": "2026-09-17T09:14:02.331Z"
+}
+```
+
+`category` is the name beside the id, joined on read, so a client renders a row
+without a second request — and a deleted category reads back as `null` for both
+rather than as a dangling id.
+
+Errors: `400 validation_failed`, `404 not_found` (a `category_id` or
+`related_document_id` that is unknown **or** somebody else's — the same answer,
+so the endpoint never confirms a foreign id).
+
+### `GET /api/v1/expenses/summary`
+
+The aggregate behind "how much did I spend on food this month", worked out by
+one `GROUP BY` rather than by shipping every row to the caller. It takes the
+same filter as the list — `start`, `end`, `category_id`, `q` — and ignores the
+paging: a summary of the first page is not a summary.
+
+```
+GET /api/v1/expenses/summary?start=2026-09-01&end=2026-09-30
+```
+
+```json
+{
+  "start": "2026-09-01",
+  "end": "2026-09-30",
+  "count": 5,
+  "currencies": [
+    {
+      "currency": "INR",
+      "total": 1001.00,
+      "count": 4,
+      "categories": [
+        { "category_id": "a1f0…", "category": "Food", "total": 601.00, "count": 2 },
+        { "category_id": "b2e1…", "category": "Transport", "total": 300.00, "count": 1 },
+        { "category_id": null, "category": null, "total": 100.00, "count": 1 }
+      ]
+    },
+    { "currency": "USD", "total": 20.00, "count": 1, "categories": [ "…" ] }
+  ]
+}
+```
+
+Largest first, currencies and then categories within them. The expenses filed
+under **no** category are a line with `category: null` rather than being
+dropped, so the lines always add up to the total.
+
+There is **no grand total across currencies**, and that is deliberate: adding
+₹500 to $20 needs a rate, a rate has a date, and a wrong one produces a
+plausible number nobody can see is wrong.
+
+### `GET /api/v1/expenses/{id}`
+
+`200 OK` — the expense object.
+
+### `PATCH /api/v1/expenses/{id}`
+
+Any subset of the create fields. `{"category_id": null}` un-files the expense
+and `{"description": null}` clears the description; `amount`, `currency` and
+`expense_date` are required columns, so `null` for any of them is `400`.
+
+`200 OK` — the updated expense object.
+
+### `DELETE /api/v1/expenses/{id}`
+
+`204 No Content`. The expense's knowledge-graph node goes with it.
+
+Deleting a **category** an expense was filed under does not delete the expense:
+`category_id` becomes `null` and the money is still spent. The same for a
+receipt.
 
 ---
 
@@ -1276,7 +1485,7 @@ What the assistant did, or wants to do, with a tool. Every endpoint is scoped to
 the caller: an action belonging to somebody else answers `404`, exactly like one
 that does not exist.
 
-There are ten tools. Each is a fixed Go function over the same service the
+There are thirteen tools. Each is a fixed Go function over the same service the
 HTTP API uses — validation, ownership and graph sync included — with a JSON
 Schema for its input and output. No tool runs code or SQL the model wrote, and
 none can delete.
@@ -1292,7 +1501,10 @@ none can delete.
 | `update_task` | write | changes the status, priority, title, deadline or description of one existing task |
 | `create_goal` | write | title, type (`personal` if not stated — shown in the proposal), deadline, description |
 | `create_note` | write | title (the first line of the text if none was given), content, tags |
+| `search_expenses` | read | the expenses the user recorded, optionally over a period, in a category, or matching a phrase; the whole history when the message gave no dates |
+| `analyze_spending` | read | totals over a period, broken down by category and kept separate per currency; this month when the message gave no dates |
 | `create_calendar_event` | write | title and start, and optionally end or duration, all-day, location, description |
+| `create_expense` | write | amount, and optionally currency, category, description, date (today if not stated — shown in the proposal) |
 
 **A read runs during the turn.** When a message looks like it asks to find
 something, the model may choose a search; it runs immediately, what it found
@@ -1313,6 +1525,31 @@ hour, and `search_calendar` with no dates in the message searches its stated
 default window — the next seven days, or ninety when the message names an event
 to look for — and says so in the summary, so an answer about the wrong week
 says which week it was about.
+
+`analyze_spending` does the arithmetic in Postgres and hands the model the
+totals already written out, rather than a year of rows to add up. Its figures
+are the same ones `GET /expenses/summary` reports, currencies kept apart, and
+the period it covered is named in the summary — so an answer drawn from the
+wrong month says which month it was.
+
+`create_expense` will **not invent a currency**. A currency the message does not
+name — as a code, a word (`dollars`) or a symbol (`$`) — is dropped before the
+proposal is built, and the default applies. It is the only *write* argument
+checked that way, and it is checked because it is the only one a user cannot
+catch by reading the proposal: "USD 1450.50" looks like something they said, and
+an expense in a currency they never named is money that is never totalled with
+the rest of theirs.
+
+`create_expense` will **not invent a category**. A name that is not one of
+yours is declined with the list of the ones that are, so the assistant asks
+rather than filing money under a label you never made — a mis-filed expense is
+wrong in every total from then on. The two reads do the opposite with the same
+argument: an unmatched name becomes part of the text search, because a search
+can be run again.
+
+When the assistant reports spending it states what your own records show. It is
+not a financial adviser, does not claim to be one, and does not tell you what to
+do with your money; the rule is in the system prompt and is checked by a test.
 
 ```
 read:   (runs during the turn) ─▶ executed | failed
@@ -1415,6 +1652,10 @@ edited and does not expire. See `docs/decisions.md`.
 | `description` | 10,000 characters |
 | `content` (notes) | 40,000 characters |
 | `category` | 100 characters |
+| `name` (expense categories) | 1–100 characters, whitespace collapsed |
+| `description` (expenses) | 1,000 characters |
+| `amount` | greater than 0, at most 9,999,999,999.99, at most two decimal places |
+| `currency` | exactly 3 letters |
 | `location` (events) | 500 characters |
 | `recurrence_rule` | 2,000 characters, never parsed |
 | `tags` | 25 tags, 50 characters each |
@@ -1423,8 +1664,9 @@ edited and does not expire. See `docs/decisions.md`.
 | uploaded file | 10 MB (`MAX_UPLOAD_BYTES`) |
 | filename | 255 characters |
 | search `query` | 4,000 characters |
-| list `q` (tasks, goals, notes, calendar) | 200 characters |
+| list `q` (tasks, goals, notes, calendar, expenses) | 200 characters |
 | calendar window (`end` − `start`) | 10 years |
+| expense list paging | default 50, max 200 |
 | chat message `content` | 8,000 characters |
 | memory `content` | 1,000 characters |
 | graph node `label` | 200 characters; an extracted name is also capped at 8 words |

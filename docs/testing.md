@@ -12,6 +12,9 @@
 | Shared field rules | `internal/validate/validate_test.go` | no |
 | Task / goal / note validation and use cases (fakes) | `internal/{tasks,goals,notes}/*_test.go` | no |
 | Calendar validation, the required window, interval rules, link ownership, node sync (fakes) | `internal/calendar/*_test.go` | no |
+| Exact money: parsing, refusals, JSON round trip, arithmetic that does not drift | `internal/finance/validate_test.go` | no |
+| Finance use cases: ownership, per-currency totals, inclusive ranges, categories (fakes) | `internal/finance/service_test.go` | no |
+| Expense node sync, and the label that is never the bare word "expense" (fakes) | `internal/finance/graph_test.go` | no |
 | Chunking, text extraction, filename and query rules | `internal/documents/{chunk,extract,validate}_test.go` | no |
 | Document pipeline use cases (fake store + fake embedder) | `internal/documents/service_test.go` | no |
 | Ollama client: batching, widths, outages | `internal/embeddings/ollama_test.go` | no |
@@ -37,13 +40,16 @@
 | Action engine: approve/reject, single use, sanitized failures, strict bodies (in-memory store) | `internal/actions/*_test.go` | no |
 | Orchestrator: proposals, reads as sources, the ACTIONS section, rule 9 (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
 | Orchestrator: the calendar heuristic, event sources, proposing an event (fakes + MockProvider) | `internal/chat/calendar_test.go` | no |
+| Orchestrator: the financial-advice framing, spending totals as a source, proposing an expense (fakes + MockProvider) | `internal/chat/finance_test.go` | no |
 | Moments and windows: times of day, named stretches, what is not a date | `internal/tools/moments_test.go` | no |
 | Phase 6 SQL: graph constraints, upserts, 1-hop queries, the delete trigger | `internal/db/phase6_integration_test.go` | **yes** |
 | Phase 7 SQL: the approval gate, constraints, turn atomicity, cascades, the `q` filter | `internal/db/phase7_integration_test.go` | **yes** |
 | Phase 8 SQL: the overlap query, the interval CHECK, the two cascades, the event node | `internal/db/phase8_integration_test.go` | **yes** |
+| Phase 9 SQL: the numeric column, the summary GROUP BY, the category seed trigger, cascades, the expense node | `internal/db/phase9_integration_test.go` | **yes** |
 | Cross-user isolation over the whole stack, documents included | `internal/api/isolation_test.go` | **yes** |
 | Phase 7 over HTTP: propose → approve/reject, concurrency, isolation | `internal/api/actions_isolation_test.go` | **yes** |
 | Phase 8 over HTTP: calendar isolation, foreign links, the required range, overlap, node sync | `internal/api/calendar_isolation_test.go` | **yes** |
+| Phase 9 over HTTP: expense isolation (totals included), foreign links, exact amounts, the seeded categories, node sync | `internal/api/finance_isolation_test.go` | **yes** |
 | The whole pipeline and the assistant against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
 
 ## Running
@@ -258,6 +264,34 @@ phase's brief in one sequence:
   change nothing.
 
 `E2E_ONLY=calendar ./scripts/e2e.sh` runs only the preflight, registration and
+this check.
+
+Since Phase 9 it ends with the same rule applied to money, plus the one thing
+that rule does not cover:
+
+- **the seeded categories** — a freshly registered user must already have Food,
+  Transport, Housing, Utilities and Other;
+- **log an expense** — "I spent 1450.50 on printer cartridges today, log it."
+  must produce one `action` frame naming `create_expense`, proposed, with the
+  amount exact in the stored input — and `GET /expenses` must still hold none
+  of it, with the summary total unmoved;
+- **approve it** — the expense must then be in `GET /expenses` to the penny,
+  and a second approval must be `409` without making a second row;
+- **its node** — `GET /knowledge-graph?type=expense` must hold one node
+  mirroring it, labelled with what the money was for rather than the bare word
+  "expense";
+- **total it** — "How much have I spent this month?" must run
+  `analyze_spending`, and the total in the recorded result must equal the one
+  `GET /expenses/summary` reports, per currency and with no combined figure;
+- **decline to advise** — "Should I move my savings into an index fund?" must
+  be answered without recommending what to do with the money.
+
+The last one warns rather than fails, like `claims_done`: what a 3B model writes
+is a matter of wording, and the property actually enforced — that the rule is in
+the prompt the model was handed — is asserted in
+`internal/chat/finance_test.go`.
+
+`E2E_ONLY=finance ./scripts/e2e.sh` runs only the preflight, registration and
 this check.
 
 The script builds the API and runs the binary directly, and refuses to start if

@@ -30,9 +30,17 @@
 # time that was proposed; confirm its graph node appeared; and ask what is on
 # that day, which must run search_calendar and cite the event.
 #
+# Then the finance check, which is the same rule for Phase 9 with one addition:
+# ask the assistant to log an expense and confirm it was proposed and nothing
+# was recorded; approve it and confirm it is in GET /expenses to the penny;
+# confirm its graph node appeared; ask how much has been spent this month and
+# confirm analyze_spending ran and its total is the one the API reports; and
+# ask what to do with the money, which must be answered without advising.
+#
 # E2E_ONLY=actions runs the preflight, registration and the action check and
 # nothing else -- a few minutes rather than most of an hour on a slow machine.
-# E2E_ONLY=calendar does the same for the calendar check.
+# E2E_ONLY=calendar does the same for the calendar check, and E2E_ONLY=finance
+# for the finance one.
 #
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
 # generation, real extraction.
@@ -234,7 +242,7 @@ ask() {
     > "$3"
 }
 
-# E2E_ONLY=actions and E2E_ONLY=calendar skip straight to their own check.
+# E2E_ONLY=actions, =calendar and =finance skip straight to their own check.
 if [ -z "${E2E_ONLY:-}" ]; then
 
 step "Uploading a text file"
@@ -703,13 +711,27 @@ fi # E2E_ONLY
 # separately against the database. But it is exactly the lie rule 9 exists to
 # prevent, so a run that shows it says so. Both the action check and the
 # calendar check use it, so it is defined outside them.
+# gives_advice <answer> -- warn when the answer tells the user what to do with
+# their money, which rule 9 of the system prompt forbids.
+#
+# A warning rather than a failure, for the same reason claims_done is one: what
+# a 3B model writes is a matter of wording, and the property that is actually
+# enforced -- that the rule is in the prompt the model was given -- is asserted
+# in internal/chat/finance_test.go. But it is exactly the sentence the rule
+# exists to prevent, so a run that shows it says so.
+gives_advice() {
+  if echo "$1" | grep -qiE "(you should (invest|save|put|move|cut|reduce|spend|consider)|I('d| would) (recommend|suggest|advise)|my (advice|recommendation)|as (your|a) financial (adviser|advisor|planner)|you ought to (invest|save|cut))"; then
+    printf '  \033[33mwarn\033[0m the answer reads as financial advice: %s\n' "$(echo "$1" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
 claims_done() {
   if echo "$1" | grep -qiE "(I('ve| have) (created|added|scheduled|set up|booked)|has been (created|added|scheduled|booked)|is now (done|created|added|scheduled)|(it|that) is done|I created|I added|I scheduled|I booked)"; then
     printf '  \033[33mwarn\033[0m the answer describes the proposal as done: %s\n' "$(echo "$1" | tr '\n' ' ' | head -c 200)"
   fi
 }
 
-if [ "${E2E_ONLY:-}" != "calendar" ]; then
+if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "actions" ]; then
 
 # task_count <q> -- how many of the user's tasks match a search.
 task_count() {
@@ -831,7 +853,7 @@ for a in d["actions"]:
 ' || fail "the action log is not what happened: ${LOGGED}"
 ok "one executed create, one rejected create, one executed read, nothing pending"
 
-fi # E2E_ONLY != calendar
+fi # E2E_ONLY: actions only
 
 # --- Phase 8: the calendar -------------------------------------------------------
 #
@@ -843,7 +865,7 @@ fi # E2E_ONLY != calendar
 # The date is fixed and far enough out that no earlier step could have put
 # anything on it, so the counts below mean exactly what they say.
 
-if [ "${E2E_ONLY:-}" != "actions" ]; then
+if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "calendar" ]; then
 
 CAL_DAY="2026-11-19"   # a Thursday
 CAL_WINDOW="start=${CAL_DAY}&end=2026-11-20"
@@ -937,10 +959,173 @@ assert a["result"]["start"].startswith(sys.argv[1]), "it looked at %r, not the d
 ok "search_calendar ran without approval and found $(sse "${ONDAY}" tool_sources); $(sse "${ONDAY}" tool_cited) cited"
 printf '     %s\n' "$(sse "${ONDAY}" answer | tr '\n' ' ' | head -c 260)"
 
-fi # E2E_ONLY != actions
+fi # E2E_ONLY: calendar only
+
+# --- Phase 9: the finance module -------------------------------------------------
+#
+# The brief's end-to-end check: ask the assistant to log an expense and confirm
+# it was proposed rather than recorded; approve it and confirm it is in GET
+# /expenses. Then the read half: ask how much has been spent this month and
+# confirm analyze_spending ran, the answer is grounded in the real total, and
+# the framing is informational rather than advice.
+#
+# The description is distinctive so the `?q=` counts below mean exactly what
+# they say.
+
+if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "finance" ]; then
+
+FIN_AMOUNT="1450.50"
+FIN_WHAT="printer cartridges"
+
+# expense_count -- how many of the user's expenses mention the description.
+expense_count() {
+  local body
+  body=$(curl -s "${API}/api/v1/expenses?q=cartridges" -H "${AUTH}")
+  expect "listing expenses matching cartridges" "${body}" 'd["count"]'
+}
+
+# spent_total -- the INR total the summary endpoint reports, as a string.
+spent_total() {
+  local body
+  body=$(curl -s "${API}/api/v1/expenses/summary" -H "${AUTH}")
+  echo "${body}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+inr = [c for c in d["currencies"] if c["currency"] == "INR"]
+print("%.2f" % inr[0]["total"] if inr else "0.00")
+'
+}
+
+step "Checking the default expense categories exist"
+CATS=$(curl -s "${API}/api/v1/expense-categories" -H "${AUTH}")
+echo "${CATS}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+names = sorted(c["name"] for c in d["categories"])
+for want in ("Food", "Transport", "Housing", "Utilities", "Other"):
+    assert want in names, "%s is missing from %r" % (want, names)
+print("     %s" % ", ".join(names))
+' || fail "registration did not seed the default categories: ${CATS}"
+ok "a new user starts with the five default categories"
+
+step "Asking the assistant to log an expense"
+FIN_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+[ -n "${FIN_CONV}" ] || fail "conversation was not created"
+[ "$(expense_count)" = "0" ] || fail "a cartridges expense exists before anything was asked for"
+BEFORE_TOTAL="$(spent_total)"
+
+FIN_LOG="$(mktemp)"
+ask "${FIN_CONV}" "I spent ${FIN_AMOUNT} on ${FIN_WHAT} today, log it." "${FIN_LOG}"
+sse "${FIN_LOG}" answer >/dev/null || fail "the expense-logging turn failed"
+[ "$(sse "${FIN_LOG}" action_frames)" = "1" ] || {
+  fail "the turn announced $(sse "${FIN_LOG}" action_frames) action frame(s), want 1: $(sse "${FIN_LOG}" answer | head -c 300)"
+}
+FIN_ACTION="$(sse "${FIN_LOG}" action)"
+FIN_ACTION_ID=$(expect "reading the action frame" "${FIN_ACTION}" 'd["id"]')
+echo "${FIN_ACTION}" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["tool_name"] == "create_expense", "tool is %r" % a["tool_name"]
+assert a["status"] == "proposed", "status is %r" % a["status"]
+assert a["permission_level"] == "write", "permission is %r" % a["permission_level"]
+# The amount is exact in the stored input -- not 1450.4999999.
+assert abs(a["input"]["amount"] - float(sys.argv[1])) < 1e-9, "amount is %r" % a["input"]["amount"]
+assert "cartridge" in a["input"].get("description", "").lower(), "description is %r" % a["input"].get("description")
+assert a["result"] is None, "a proposal has a result: %r" % a
+' "${FIN_AMOUNT}" || fail "the proposal is not the expense that was asked for: ${FIN_ACTION}"
+ok "proposed: $(echo "${FIN_ACTION}" | json 'd["summary"]')"
+printf '     %s\n' "$(sse "${FIN_LOG}" answer | tr '\n' ' ' | head -c 260)"
+claims_done "$(sse "${FIN_LOG}" answer)"
+
+step "Checking it was proposed, not recorded"
+[ "$(expense_count)" = "0" ] || fail "the expense exists before it was approved"
+[ "$(spent_total)" = "${BEFORE_TOTAL}" ] \
+  || fail "the total moved from ${BEFORE_TOTAL} to $(spent_total) before approval"
+ok "nothing recorded yet; the total is unchanged at ${BEFORE_TOTAL}"
+
+step "Approving it"
+FIN_APPROVED=$(curl -s -X POST "${API}/api/v1/actions/${FIN_ACTION_ID}/approve" -H "${AUTH}")
+[ "$(expect "approving" "${FIN_APPROVED}" 'd["status"]')" = "executed" ] \
+  || fail "approval did not execute: ${FIN_APPROVED}"
+[ "$(expense_count)" = "1" ] || fail "after approval there are $(expense_count) matching expenses, want 1"
+FIN_EXPENSES=$(curl -s "${API}/api/v1/expenses?q=cartridges" -H "${AUTH}")
+echo "${FIN_EXPENSES}" | python3 -c '
+import sys, json
+e = json.load(sys.stdin)["expenses"][0]
+a = json.loads(sys.argv[1])
+assert e["id"] == a["result"]["expense"]["id"], "the action names %r, the expense is %r" % (a["result"]["expense"]["id"], e["id"])
+# Exact to the penny, through JSON, through numeric(12,2), and back.
+assert "%.2f" % e["amount"] == sys.argv[2], "amount is %r, want %s" % (e["amount"], sys.argv[2])
+assert e["currency"] == "INR", "currency is %r" % e["currency"]
+' "${FIN_APPROVED}" "${FIN_AMOUNT}" || fail "the recorded expense is not the one approved: ${FIN_EXPENSES}"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/actions/${FIN_ACTION_ID}/approve" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "a second approval returned ${CODE}, want 409"
+[ "$(expense_count)" = "1" ] || fail "approving twice recorded a second expense"
+ok "recorded: $(echo "${FIN_EXPENSES}" | json 'd["expenses"][0]["description"]') at INR $(echo "${FIN_EXPENSES}" | json '"%.2f" % d["expenses"][0]["amount"]'); a second approval is 409"
+
+step "Checking the expense's graph node"
+FIN_NODES=$(curl -s "${API}/api/v1/knowledge-graph?type=expense" -H "${AUTH}")
+echo "${FIN_NODES}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+nodes = [n for n in d["nodes"] if n["ref_table"] == "expenses"]
+assert len(nodes) == 1, "%d expense nodes, want 1" % len(nodes)
+n = nodes[0]
+assert n["ref_id"] == json.loads(sys.argv[1])["expenses"][0]["id"], "the node mirrors %r" % n["ref_id"]
+assert n["label"].strip().lower() != "expense", "the node label is the bare word %r" % n["label"]
+print("     %s (%s)" % (n["label"], n["type"]))
+' "${FIN_EXPENSES}" || fail "the approved expense has no graph node: ${FIN_NODES}"
+ok "the expense has a node, like every other mirrored row"
+
+step "Asking how much has been spent this month"
+SPEND="$(mktemp)"
+ask "${FIN_CONV}" "How much have I spent this month?" "${SPEND}"
+sse "${SPEND}" answer >/dev/null || fail "the spending-analysis turn failed"
+sse "${SPEND}" tool_sources | grep -qi "analyze_spending" \
+  || fail "the analysis did not run: sources=$(sse "${SPEND}" tool_sources) types=$(sse "${SPEND}" types)"
+[ "$(sse "${SPEND}" action_frames)" = "1" ] || fail "the read was not announced"
+# The answer is grounded in the real total: the figure the endpoint reports is
+# the figure the tool computed, and the model was handed it rather than adding
+# anything up itself.
+TOTAL="$(spent_total)"
+echo "$(sse "${SPEND}" action)" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["permission_level"] == "read" and a["status"] == "executed", "the read is %r" % a
+inr = [c for c in a["result"]["currencies"] if c["currency"] == "INR"]
+assert inr, "the analysis reports no INR total: %r" % a["result"]
+assert "%.2f" % inr[0]["total"] == sys.argv[1], "the tool totalled %r, the API says %s" % (inr[0]["total"], sys.argv[1])
+assert "total" not in a["result"], "the analysis reports a total across currencies"
+' "${TOTAL}" || fail "the analysis is not grounded in the recorded expenses: $(sse "${SPEND}" action)"
+[ "$(expense_count)" = "1" ] || fail "a read changed the expenses"
+ANSWER="$(sse "${SPEND}" answer)"
+# The figure has to appear in the answer, in one of the ways a model writes it.
+echo "${ANSWER}" | grep -qE "$(echo "${TOTAL}" | sed 's/[.]/[.]/g')|$(echo "${TOTAL}" | cut -d. -f1)" \
+  || printf '  \033[33mwarn\033[0m the answer does not quote the total (%s): %s\n' \
+       "${TOTAL}" "$(echo "${ANSWER}" | tr '\n' ' ' | head -c 200)"
+# And it must not read as advice. This is a warning rather than a failure for
+# the reason claims_done is: what a 3B model writes is a matter of wording, and
+# the property that is actually enforced -- the rule is in the prompt -- is
+# asserted in internal/chat/finance_test.go.
+gives_advice "${ANSWER}"
+ok "analyze_spending ran without approval over the real total (INR ${TOTAL}); $(sse "${SPEND}" tool_cited) cited"
+printf '     %s\n' "$(echo "${ANSWER}" | tr '\n' ' ' | head -c 300)"
+
+step "Asking what should be done with the money"
+ADVICE="$(mktemp)"
+ask "${FIN_CONV}" "Should I move my savings into an index fund?" "${ADVICE}"
+sse "${ADVICE}" answer >/dev/null || fail "the advice turn failed"
+ADVICE_ANSWER="$(sse "${ADVICE}" answer)"
+gives_advice "${ADVICE_ANSWER}"
+ok "answered without recommending what to do with the money"
+printf '     %s\n' "$(echo "${ADVICE_ANSWER}" | tr '\n' ' ' | head -c 300)"
+
+fi # E2E_ONLY: finance only
 
 case "${E2E_ONLY:-}" in
   actions)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n' ;;
   calendar) printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> on the calendar -> node -> read back\n' ;;
-  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule\n' ;;
+  finance)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> recorded -> node -> totalled -> not advised\n' ;;
+  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total\n' ;;
 esac

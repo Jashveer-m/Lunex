@@ -30,7 +30,7 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 // partition a named-agent layer can compose, rather than labels.
 func TestGeneralIsTheUnionOfTheDomainAgents(t *testing.T) {
 	owner := map[string]string{}
-	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent} {
+	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent, FinanceAgent} {
 		for _, name := range a.Tools {
 			if prev, dup := owner[name]; dup {
 				t.Fatalf("%s belongs to both %s and %s", name, prev, a.Name)
@@ -442,5 +442,178 @@ func TestTheRouterDoesNotGroundAProposedEvent(t *testing.T) {
 	}
 	if d.Args.String("title") != "Dentist" || d.Args.String("start") != "thursday at 3pm" {
 		t.Fatalf("decision = %+v, want the write's arguments untouched", d)
+	}
+}
+
+// The same rule for the finance filters, which is the Phase 9 case of it.
+//
+// A spending total is the sharpest version of the failure this rule exists for.
+// An invented tag empties a search and the user is told nothing matched; an
+// invented *period* produces a number -- a real total, over days nobody asked
+// about -- and there is nothing in "you spent ₹12,400" for the user to tell
+// apart from the truth. An invented category does the same thing one step
+// further in: a total over the wrong subset of their own money.
+func TestTheRouterDropsFinanceFiltersTheMessageDoesNotGive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		message, reply string
+		tool           string
+		want           map[string]string // argument -> value, "" meaning it must be gone
+	}{
+		"a period nobody gave": {
+			"How much have I been spending?",
+			`{"tool": "analyze_spending", "arguments": {"start": "2026-08-01", "end": "2026-08-31"}}`,
+			tools.AnalyzeSpending, map[string]string{"start": "", "end": ""}},
+		"the month the user named": {
+			"How much did I spend last month?",
+			`{"tool": "analyze_spending", "arguments": {"start": "last month"}}`,
+			tools.AnalyzeSpending, map[string]string{"start": "last month"}},
+		"a category the user named": {
+			"How much have I spent on food this month?",
+			`{"tool": "analyze_spending", "arguments": {"category": "food", "start": "this month"}}`,
+			tools.AnalyzeSpending, map[string]string{"category": "food", "start": "this month"}},
+		"a category nobody named": {
+			"How much have I spent this month?",
+			`{"tool": "analyze_spending", "arguments": {"category": "food", "start": "this month"}}`,
+			tools.AnalyzeSpending, map[string]string{"category": "", "start": "this month"}},
+		// The aliases are declared on the parameter, so a filter written under
+		// one is checked exactly like one written under its own name --
+		// otherwise "period" would be the way round the rule.
+		"an invented period under an alias": {
+			"What have I been spending money on?",
+			`{"tool": "analyze_spending", "arguments": {"period": "last 3 months"}}`,
+			tools.AnalyzeSpending, map[string]string{"period": ""}},
+		"a placeholder category": {
+			"Show me what I've spent",
+			`{"tool": "search_expenses", "arguments": {"category": "<unknown>"}}`,
+			tools.SearchExpenses, map[string]string{"category": ""}},
+		"dates on a list": {
+			"List my expenses",
+			`{"tool": "search_expenses", "arguments": {"start": "2026-09-01", "end": "2026-09-30"}}`,
+			tools.SearchExpenses, map[string]string{"start": "", "end": ""}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := NewRouter(&ai.Mock{Reply: tc.reply}, standard(), quiet(), Options{})
+			d, err := r.Decide(context.Background(), General, tc.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Tool != tc.tool {
+				t.Fatalf("decision = %+v, want %s kept", d, tc.tool)
+			}
+			for arg, want := range tc.want {
+				_, present := d.Args[arg]
+				switch {
+				case want == "" && present:
+					t.Fatalf("%s = %v survived; the message does not give it", arg, d.Args[arg])
+				case want != "" && d.Args.String(arg) != want:
+					t.Fatalf("%s = %v, want %q kept", arg, d.Args[arg], want)
+				}
+			}
+		})
+	}
+}
+
+// A proposed expense's own details are not filtered: the amount and what it was
+// for are shown to the user in the proposal before anything is written.
+func TestTheRouterDoesNotGroundAProposedExpense(t *testing.T) {
+	r := NewRouter(&ai.Mock{Reply: `{"tool": "create_expense", "arguments": {"amount": "450", "description": "lunch", "category": "Food"}}`},
+		standard(), quiet(), Options{})
+	d, err := r.Decide(context.Background(), General, "I spent 450 on lunch today")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Args.String("amount") != "450" || d.Args.String("category") != "Food" {
+		t.Fatalf("decision = %+v, want the write's arguments untouched", d)
+	}
+}
+
+// The gate lets a money message through to the router at all. It can only fail
+// in one direction -- a request phrased with none of the cues gets an answer
+// without a tool -- but a phase whose whole subject is money should not be shut
+// out by the word list in front of it.
+func TestTheGateLetsMoneyMessagesThrough(t *testing.T) {
+	for _, m := range []string{
+		"I spent 450 on lunch today",
+		"How much did I spend on food last month?",
+		"log a 1200 rupee expense for groceries",
+		"what has my spending looked like this year?",
+		"I paid the electricity bill yesterday",
+		"can I afford a new laptop?",
+		"should I put more money into savings?",
+	} {
+		if !MightUseTool(m) {
+			t.Fatalf("the gate would not route %q", m)
+		}
+	}
+}
+
+// The one write argument that is grounded, and the measured reason it is.
+//
+// On "I spent 1450.50 on printer cartridges today, log it", llama3.2:3b wrote
+// `currency: "USD"` for a message with no currency in it. The proposal then
+// read "Record an expense of USD 1450.50", which looks to the user like
+// something they said -- and an expense filed in a currency they never named is
+// money that is never totalled with the rest of theirs, because nothing here
+// converts between currencies.
+//
+// So the currency has to come from the message, in a code, a word or a symbol.
+// Everything else about the proposal stays: the amount and the description are
+// the user's own words echoed back, and they are checked by the user's eyes.
+func TestTheRouterDropsACurrencyTheMessageDoesNotGive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		message, reply string
+		want           string // "" means the argument must be gone
+	}{
+		"a currency nobody gave": {
+			"I spent 1450.50 on printer cartridges today, log it.",
+			`{"tool": "create_expense", "arguments": {"amount": "1450.50", "currency": "USD", "description": "printer cartridges"}}`,
+			""},
+		"the code the user wrote": {
+			"I spent 20 USD on a book",
+			`{"tool": "create_expense", "arguments": {"amount": "20", "currency": "USD", "description": "book"}}`,
+			"USD"},
+		"a currency named in words": {
+			"I spent 20 dollars on a book",
+			`{"tool": "create_expense", "arguments": {"amount": "20", "currency": "USD", "description": "book"}}`,
+			"USD"},
+		// A symbol has no word boundary between it and the number, so the
+		// ordinary whole-words test would never see it.
+		"a currency named by its symbol": {
+			"I spent $20 on a book",
+			`{"tool": "create_expense", "arguments": {"amount": "20", "currency": "USD", "description": "book"}}`,
+			"USD"},
+		"rupees": {
+			"I spent 450 rupees on lunch",
+			`{"tool": "create_expense", "arguments": {"amount": "450", "currency": "INR", "description": "lunch"}}`,
+			"INR"},
+		// A currency the synonym table does not have is still kept when the
+		// user writes the code itself.
+		"a code the table does not know": {
+			"I spent 30 CHF on lunch in Zurich",
+			`{"tool": "create_expense", "arguments": {"amount": "30", "currency": "CHF", "description": "lunch"}}`,
+			"CHF"},
+		"an invented currency under an alias": {
+			"I spent 1450.50 on printer cartridges",
+			`{"tool": "create_expense", "arguments": {"amount": "1450.50", "curr": "USD"}}`,
+			""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := NewRouter(&ai.Mock{Reply: tc.reply}, standard(), quiet(), Options{})
+			d, err := r.Decide(context.Background(), General, tc.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Tool != tools.CreateExpense {
+				t.Fatalf("decision = %+v, want the call kept", d)
+			}
+			got := d.Args.String("currency", "curr")
+			if got != tc.want {
+				t.Fatalf("currency = %q, want %q", got, tc.want)
+			}
+			// The rest of the proposal is untouched either way.
+			if d.Args.String("amount") == "" {
+				t.Fatalf("the amount was dropped: %+v", d.Args)
+			}
+		})
 	}
 }

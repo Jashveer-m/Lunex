@@ -190,12 +190,41 @@ func ParseWindow(s string, now time.Time) (start, end time.Time, err error) {
 	case "next month":
 		first := time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0)
 		return first, first.AddDate(0, 1, 0), nil
+	case "last month", "previous month":
+		first := time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0)
+		return first, first.AddDate(0, 1, 0), nil
 	case "this year", "the year", "year":
 		first := time.Date(today.Year(), time.January, 1, 0, 0, 0, 0, time.UTC)
 		return first, first.AddDate(1, 0, 0), nil
 	case "next year":
 		first := time.Date(today.Year()+1, time.January, 1, 0, 0, 0, 0, time.UTC)
 		return first, first.AddDate(1, 0, 0), nil
+	case "last year", "previous year":
+		first := time.Date(today.Year()-1, time.January, 1, 0, 0, 0, 0, time.UTC)
+		return first, first.AddDate(1, 0, 0), nil
+	}
+
+	// The backwards stretches, which arrived with Phase 9 for the same reason
+	// "yesterday" did: a ledger is read backwards. The window ends tomorrow
+	// rather than today because it is half-open and today's spending is part of
+	// "the last 7 days".
+	if m := lastNPeriods.FindStringSubmatch(phrase); m != nil {
+		n, convErr := strconv.Atoi(m[1])
+		if convErr != nil || n <= 0 || n > 366 {
+			return time.Time{}, time.Time{}, fmt.Errorf("could not read %q as a stretch of time", s)
+		}
+		tomorrow := today.AddDate(0, 0, 1)
+		switch m[2] {
+		case "day":
+			return today.AddDate(0, 0, -n+1), tomorrow, nil
+		case "week":
+			return today.AddDate(0, 0, -7*n+1), tomorrow, nil
+		case "month":
+			// Clamped, not normalized forward: see MonthsBefore. A window that
+			// starts on the 4th of March because February has no 31st is a
+			// total missing three days of the period that was asked for.
+			return MonthsBefore(today, n).AddDate(0, 0, 1), tomorrow, nil
+		}
 	}
 
 	if m := nextNPeriods.FindStringSubmatch(phrase); m != nil {
@@ -223,6 +252,55 @@ func ParseWindow(s string, now time.Time) (start, end time.Time, err error) {
 		return m.Time, m.Time.AddDate(0, 0, 1), nil
 	}
 	return m.Day(), m.Day().AddDate(0, 0, 1), nil
+}
+
+// lastNPeriods reads "the last 7 days", "past 3 months", "previous 2 weeks".
+var lastNPeriods = regexp.MustCompile(`^(?:last|past|previous)\s+(\d+)\s*(day|week|month)s?$`)
+
+// NamesABareCalendarDate reports whether a phrase names a day and a month and
+// no year -- "5 September", "sept 30th".
+//
+// It exists because such a phrase is the one kind whose *year* is inferred, and
+// the two modules that read dates infer it in opposite directions. See
+// InThePast.
+func NamesABareCalendarDate(s string) bool {
+	s = strings.ToLower(strings.NewReplacer(",", " ", "-", " ", "/", " ").Replace(s))
+	named := false
+	for _, w := range strings.Fields(s) {
+		if _, ok := months[w]; ok {
+			named = true
+			continue
+		}
+		// Any four-digit number is a year the phrase gave for itself.
+		if len(w) == 4 {
+			if y, err := strconv.Atoi(w); err == nil && y >= 2000 && y <= 2100 {
+				return false
+			}
+		}
+	}
+	return named
+}
+
+// InThePast is a resolved day read the way a ledger reads one: backwards.
+//
+// calendarDate resolves a bare "5 September" to the *next* one, because it was
+// written for deadlines and a deadline is ahead of you. An expense is behind
+// you: money spent on "5 September", said in December, was spent this year, and
+// resolving it forward records a purchase dated next year -- which no total for
+// any period the user asks about will ever include.
+//
+// Only a bare calendar date is moved. "tomorrow" is also in the future and is
+// left exactly where it is: it is not an inferred year, it is what the user
+// said, and the caller decides whether to accept it.
+func InThePast(raw string, day, now time.Time) time.Time {
+	if !NamesABareCalendarDate(raw) {
+		return day
+	}
+	today := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	if day.After(today) {
+		return day.AddDate(-1, 0, 0)
+	}
+	return day
 }
 
 // nextNPeriods reads "the next 3 days", "next 2 weeks", "48 hours".

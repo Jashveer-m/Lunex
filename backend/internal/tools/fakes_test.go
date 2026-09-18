@@ -12,6 +12,7 @@ import (
 
 	"github.com/jashveer/lifeos/backend/internal/calendar"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
@@ -239,6 +240,185 @@ func (f *fakeCalendar) Create(_ context.Context, userID uuid.UUID, in calendar.C
 	return e, nil
 }
 
+// fakeFinance keeps the rules the SQL has that the tools depend on: the date
+// bounds are inclusive, the category filter is by id, and the summary is
+// grouped by currency and then by category. Every user starts with the five
+// categories migration 000009 seeds, so a test does not have to make them.
+type fakeFinance struct {
+	mu         sync.Mutex
+	byUser     map[uuid.UUID][]finance.Expense
+	categories map[uuid.UUID][]finance.Category
+	creates    []finance.CreateInput
+	filters    []finance.Filter
+	err        error
+}
+
+func newFakeFinance() *fakeFinance {
+	return &fakeFinance{
+		byUser:     map[uuid.UUID][]finance.Expense{},
+		categories: map[uuid.UUID][]finance.Category{},
+	}
+}
+
+// seedCategories gives a user the defaults, as registration does.
+func (f *fakeFinance) seedCategories(owner uuid.UUID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.categories[owner]) > 0 {
+		return
+	}
+	for _, name := range finance.DefaultCategories {
+		f.categories[owner] = append(f.categories[owner], finance.Category{
+			ID: uuid.New(), UserID: owner, Name: name,
+		})
+	}
+}
+
+// seed records an expense. category is a name, "" for none.
+func (f *fakeFinance) seed(owner uuid.UUID, amount finance.Amount, category, description string, day time.Time) finance.Expense {
+	f.seedCategories(owner)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := finance.Expense{
+		ID: uuid.New(), UserID: owner, Amount: amount, Currency: finance.DefaultCurrency,
+		Date: finance.Day(day),
+	}
+	if description != "" {
+		e.Description = &description
+	}
+	for _, c := range f.categories[owner] {
+		if strings.EqualFold(c.Name, category) {
+			id, name := c.ID, c.Name
+			e.CategoryID, e.CategoryName = &id, &name
+		}
+	}
+	f.byUser[owner] = append(f.byUser[owner], e)
+	return e
+}
+
+func (f *fakeFinance) matching(userID uuid.UUID, filter finance.Filter) []finance.Expense {
+	var out []finance.Expense
+	for _, e := range f.byUser[userID] {
+		switch {
+		case filter.Start != nil && e.Date.Before(*filter.Start):
+			continue
+		case filter.End != nil && e.Date.After(*filter.End):
+			continue
+		case filter.CategoryID != nil && (e.CategoryID == nil || *e.CategoryID != *filter.CategoryID):
+			continue
+		case filter.Uncategorized && e.CategoryID != nil:
+			continue
+		}
+		if q := strings.ToLower(filter.Query); q != "" {
+			desc := ""
+			if e.Description != nil {
+				desc = *e.Description
+			}
+			if !strings.Contains(strings.ToLower(desc), q) {
+				continue
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func (f *fakeFinance) List(_ context.Context, userID uuid.UUID, filter finance.Filter) ([]finance.Expense, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.filters = append(f.filters, filter)
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := f.matching(userID, filter)
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeFinance) Summarize(_ context.Context, userID uuid.UUID, filter finance.Filter) (finance.Summary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.filters = append(f.filters, filter)
+	if f.err != nil {
+		return finance.Summary{}, f.err
+	}
+	out := finance.Summary{Start: filter.Start, End: filter.End}
+	byCurrency := map[string]int{}
+	for _, e := range f.matching(userID, filter) {
+		i, seen := byCurrency[e.Currency]
+		if !seen {
+			i = len(out.Currencies)
+			byCurrency[e.Currency] = i
+			out.Currencies = append(out.Currencies, finance.CurrencyTotal{Currency: e.Currency})
+		}
+		c := &out.Currencies[i]
+		c.Total += e.Amount
+		c.Count++
+		out.Count++
+
+		name := ""
+		if e.CategoryName != nil {
+			name = *e.CategoryName
+		}
+		found := false
+		for j := range c.Categories {
+			if c.Categories[j].Category == name {
+				c.Categories[j].Total += e.Amount
+				c.Categories[j].Count++
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.Categories = append(c.Categories, finance.CategoryTotal{
+				CategoryID: e.CategoryID, Category: name, Total: e.Amount, Count: 1,
+			})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeFinance) Categories(_ context.Context, userID uuid.UUID) ([]finance.Category, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]finance.Category(nil), f.categories[userID]...), nil
+}
+
+func (f *fakeFinance) CategoryByName(_ context.Context, userID uuid.UUID, name string) (finance.Category, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.categories[userID] {
+		if strings.EqualFold(c.Name, strings.TrimSpace(name)) {
+			return c, nil
+		}
+	}
+	return finance.Category{}, finance.ErrCategoryNotFound
+}
+
+func (f *fakeFinance) Create(_ context.Context, userID uuid.UUID, in finance.CreateInput) (finance.Expense, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creates = append(f.creates, in)
+	e := finance.Expense{
+		ID: uuid.New(), UserID: userID, Amount: in.Amount, Currency: in.Currency,
+		CategoryID: in.CategoryID, Date: in.Date,
+	}
+	if in.Description != "" {
+		d := in.Description
+		e.Description = &d
+	}
+	for _, c := range f.categories[userID] {
+		if in.CategoryID != nil && c.ID == *in.CategoryID {
+			name := c.Name
+			e.CategoryName = &name
+		}
+	}
+	f.byUser[userID] = append(f.byUser[userID], e)
+	return e, nil
+}
+
 type fakeDocs struct {
 	mu      sync.Mutex
 	byUser  map[uuid.UUID][]documents.SearchResult
@@ -309,6 +489,7 @@ type world struct {
 	notes    *fakeNotes
 	docs     *fakeDocs
 	calendar *fakeCalendar
+	finance  *fakeFinance
 	ledger   *fakeLedger
 	user     uuid.UUID
 }
@@ -320,11 +501,14 @@ func newWorld() *world {
 		notes:    &fakeNotes{byUser: map[uuid.UUID][]notes.Note{}},
 		docs:     &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
 		calendar: newFakeCalendar(),
+		finance:  newFakeFinance(),
 		ledger:   newFakeLedger(),
 		user:     uuid.New(),
 	}
+	w.finance.seedCategories(w.user)
 	reg, err := NewRegistry(w.ledger, Standard(Services{
-		Tasks: w.tasks, Goals: w.goals, Notes: w.notes, Documents: w.docs, Calendar: w.calendar,
+		Tasks: w.tasks, Goals: w.goals, Notes: w.notes, Documents: w.docs,
+		Calendar: w.calendar, Finance: w.finance,
 		DocumentMinSimilarity: 0.5, Now: func() time.Time { return testNow },
 	})...)
 	if err != nil {
@@ -345,5 +529,8 @@ func (w *world) totalWrites() int {
 	w.calendar.mu.Lock()
 	c := len(w.calendar.creates)
 	w.calendar.mu.Unlock()
-	return w.tasks.writes() + g + n + c
+	w.finance.mu.Lock()
+	f := len(w.finance.creates)
+	w.finance.mu.Unlock()
+	return w.tasks.writes() + g + n + c + f
 }
