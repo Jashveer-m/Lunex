@@ -5,12 +5,13 @@ import { useAuth, useUser } from '../lib/auth'
 import { actions } from '../lib/endpoints'
 import { onActionsChanged } from '../lib/events'
 import { Link, useLocation } from '../lib/router'
-import { IconBrain, IconCalendar, IconChat, IconFile, IconGraph, IconHome, IconInbox, IconLogout } from './icons'
+import { IconBrain, IconCalendar, IconChat, IconFile, IconGraph, IconHome, IconInbox, IconLogout, IconWallet } from './icons'
 import { cx } from './ui'
 
 const NAV = [
   { to: '/', label: 'Today', icon: IconHome, match: (p: string) => p === '/' },
   { to: '/calendar', label: 'Calendar', icon: IconCalendar, match: (p: string) => p.startsWith('/calendar') },
+  { to: '/finance', label: 'Spending', icon: IconWallet, match: (p: string) => p.startsWith('/finance') },
   { to: '/chat', label: 'Assistant', icon: IconChat, match: (p: string) => p.startsWith('/chat') },
   { to: '/documents', label: 'Documents', icon: IconFile, match: (p: string) => p.startsWith('/documents') },
   { to: '/memories', label: 'Memories', icon: IconBrain, match: (p: string) => p.startsWith('/memories') },

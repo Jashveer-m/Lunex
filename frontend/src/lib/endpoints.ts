@@ -9,6 +9,11 @@ import type {
   CalendarPage,
   Conversation,
   ConversationDetail,
+  Expense,
+  ExpenseCategory,
+  ExpenseInput,
+  ExpensePage,
+  ExpenseSummary,
   Goal,
   GoalInput,
   Graph,
@@ -100,6 +105,44 @@ export const calendar = {
   update: (id: string, body: Partial<CalendarEventInput>) =>
     apiFetch<CalendarEvent>(`/api/v1/calendar/${id}`, { method: 'PATCH', body }),
   remove: (id: string) => apiFetch<void>(`/api/v1/calendar/${id}`, { method: 'DELETE' }),
+}
+
+// --- expenses --------------------------------------------------------------
+
+export const expenseCategories = {
+  list: (signal?: AbortSignal) =>
+    apiFetch<{ categories: ExpenseCategory[]; count: number }>('/api/v1/expense-categories', { signal }),
+  // There is no rename and no delete: the API does not offer either, because
+  // both rewrite spending history through a door marked "categories".
+  create: (name: string) =>
+    apiFetch<ExpenseCategory>('/api/v1/expense-categories', { method: 'POST', body: { name } }),
+}
+
+type ExpenseFilter = {
+  start?: string
+  end?: string
+  category_id?: string
+  q?: string
+  sort?: string
+  limit?: number
+  offset?: number
+}
+
+export const expenses = {
+  // start and end are optional here, unlike the calendar: "what have I spent on
+  // this" over the whole history is a question with an answer, and the paging
+  // is what bounds the read. Both bounds are inclusive days.
+  list: (p: ExpenseFilter, signal?: AbortSignal) => apiFetch<ExpensePage>(`/api/v1/expenses${qs(p)}`, { signal }),
+  // The same filter as the list, with the paging ignored: a summary of the
+  // first page would not be a summary.
+  summary: (p: Omit<ExpenseFilter, 'limit' | 'offset' | 'sort'>, signal?: AbortSignal) =>
+    apiFetch<ExpenseSummary>(`/api/v1/expenses/summary${qs(p)}`, { signal }),
+  get: (id: string) => apiFetch<Expense>(`/api/v1/expenses/${id}`),
+  create: (body: Partial<ExpenseInput> & { amount: string; expense_date: string }) =>
+    apiFetch<Expense>('/api/v1/expenses', { method: 'POST', body }),
+  update: (id: string, body: Partial<ExpenseInput>) =>
+    apiFetch<Expense>(`/api/v1/expenses/${id}`, { method: 'PATCH', body }),
+  remove: (id: string) => apiFetch<void>(`/api/v1/expenses/${id}`, { method: 'DELETE' }),
 }
 
 // --- documents -------------------------------------------------------------

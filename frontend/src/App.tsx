@@ -10,6 +10,7 @@ import { CalendarPage } from './pages/CalendarPage'
 import { ChatPage } from './pages/ChatPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { DocumentsPage } from './pages/DocumentsPage'
+import { FinancePage } from './pages/FinancePage'
 import { GraphPage } from './pages/GraphPage'
 import { MemoriesPage } from './pages/MemoriesPage'
 import { NotFoundPage } from './pages/NotFoundPage'
@@ -72,6 +73,7 @@ function Root() {
 function Routes({ path }: { path: string }) {
   if (path === '/' || path === '/login' || path === '/register') return <DashboardPage />
   if (path === '/calendar') return <CalendarPage />
+  if (path === '/finance') return <FinancePage />
   if (path === '/documents') return <DocumentsPage />
   if (path === '/memories') return <MemoriesPage />
   if (path === '/approvals') return <ApprovalsPage />

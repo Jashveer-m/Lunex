@@ -126,3 +126,9 @@ export const IconPin = base(
     <circle cx="12" cy="10" r="2.3" />
   </>,
 )
+export const IconWallet = base(
+  <>
+    <path d="M4 7.5v10A2.5 2.5 0 0 0 6.5 20H18a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2H6.5A2.5 2.5 0 0 1 4 7.5 2.5 2.5 0 0 1 6.5 5H17" />
+    <circle cx="16" cy="14" r="1.1" />
+  </>,
+)

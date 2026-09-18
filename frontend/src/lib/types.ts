@@ -285,3 +285,75 @@ export type DoneFrame = {
   linked: { from_node_id: string; to_node_id: string; relationship: string; confidence: number }[]
   actions: Action[]
 }
+
+// --- expenses --------------------------------------------------------------
+
+export type ExpenseCategory = {
+  id: string
+  name: string
+  created_at: string
+}
+
+/**
+ * `amount` is an unquoted JSON number with two decimal places -- see
+ * lib/money.ts for why nothing on this side adds two of them up. `category` is
+ * the name joined on read beside `category_id`, and both are null for an
+ * expense filed under nothing (including one whose category was deleted).
+ * `expense_date` is a bare "yyyy-mm-dd", not a timestamp.
+ */
+export type Expense = {
+  id: string
+  amount: number
+  currency: string
+  category_id: string | null
+  category: string | null
+  description: string | null
+  expense_date: string
+  related_document_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * The write shape. `amount` is a decimal string rather than a number: the API
+ * accepts one and parses it exactly, so the digits the user typed are the
+ * digits that get stored.
+ */
+export type ExpenseInput = {
+  amount: string
+  currency: string
+  category_id: string | null
+  description: string | null
+  expense_date: string
+}
+
+export type ExpensePage = {
+  expenses: Expense[]
+  count: number
+  start: string | null
+  end: string | null
+  limit: number
+  offset: number
+}
+
+export type CategoryTotal = {
+  category_id: string | null
+  category: string | null
+  total: number
+  count: number
+}
+
+/** Totals are per currency, largest first. There is no grand total across them. */
+export type CurrencyTotal = {
+  currency: string
+  total: number
+  count: number
+  categories: CategoryTotal[]
+}
+
+export type ExpenseSummary = {
+  start: string | null
+  end: string | null
+  count: number
+  currencies: CurrencyTotal[]
+}
