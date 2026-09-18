@@ -116,6 +116,45 @@ export type Note = {
 
 export type NoteInput = { title: string; content: string; tags: string[] }
 
+// --- calendar --------------------------------------------------------------
+
+/**
+ * An event occupies [start_time, end_time). An all-day event runs midnight to
+ * midnight UTC and is shown by its UTC dates; a timed one in local time.
+ */
+export type CalendarEvent = {
+  id: string
+  title: string
+  description: string | null
+  start_time: string
+  end_time: string
+  all_day: boolean
+  location: string | null
+  recurrence_rule: string | null
+  related_task_id: string | null
+  related_goal_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type CalendarEventInput = {
+  title: string
+  description: string | null
+  start_time: string
+  end_time: string
+  all_day: boolean
+  location: string | null
+}
+
+export type CalendarPage = {
+  events: CalendarEvent[]
+  count: number
+  start: string
+  end: string
+  limit: number
+  offset: number
+}
+
 // --- documents -------------------------------------------------------------
 
 export type DocumentStatus = 'processing' | 'ready' | 'failed'

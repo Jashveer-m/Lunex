@@ -4,6 +4,9 @@ import { apiFetch, qs } from './api'
 import type {
   Action,
   AuthResponse,
+  CalendarEvent,
+  CalendarEventInput,
+  CalendarPage,
   Conversation,
   ConversationDetail,
   Goal,
@@ -43,6 +46,7 @@ export const getHealth = () =>
 export const tasks = {
   list: (p: ListParams & { status?: string; q?: string; tag?: string; category?: string }) =>
     apiFetch<Page<'tasks', Task>>(`/api/v1/tasks${qs(p)}`),
+  get: (id: string) => apiFetch<Task>(`/api/v1/tasks/${id}`),
   create: (body: Partial<TaskInput> & { title: string }) =>
     apiFetch<Task>('/api/v1/tasks', { method: 'POST', body }),
   update: (id: string, body: Partial<TaskInput>) =>
@@ -60,6 +64,7 @@ export const tasks = {
 export const goals = {
   list: (p: ListParams & { status?: string; type?: string; q?: string }) =>
     apiFetch<Page<'goals', Goal>>(`/api/v1/goals${qs(p)}`),
+  get: (id: string) => apiFetch<Goal>(`/api/v1/goals/${id}`),
   create: (body: Partial<GoalInput> & { title: string; type: string }) =>
     apiFetch<Goal>('/api/v1/goals', { method: 'POST', body }),
   update: (id: string, body: Partial<GoalInput>) =>
@@ -81,6 +86,20 @@ export const notes = {
   update: (id: string, body: Partial<NoteInput>) =>
     apiFetch<Note>(`/api/v1/notes/${id}`, { method: 'PATCH', body }),
   remove: (id: string) => apiFetch<void>(`/api/v1/notes/${id}`, { method: 'DELETE' }),
+}
+
+// --- calendar --------------------------------------------------------------
+
+export const calendar = {
+  // start and end are required: the API has no unbounded read of events.
+  list: (p: { start: string; end: string; limit?: number; offset?: number; sort?: string }, signal?: AbortSignal) =>
+    apiFetch<CalendarPage>(`/api/v1/calendar${qs(p)}`, { signal }),
+  get: (id: string) => apiFetch<CalendarEvent>(`/api/v1/calendar/${id}`),
+  create: (body: Partial<CalendarEventInput> & { title: string; start_time: string }) =>
+    apiFetch<CalendarEvent>('/api/v1/calendar', { method: 'POST', body }),
+  update: (id: string, body: Partial<CalendarEventInput>) =>
+    apiFetch<CalendarEvent>(`/api/v1/calendar/${id}`, { method: 'PATCH', body }),
+  remove: (id: string) => apiFetch<void>(`/api/v1/calendar/${id}`, { method: 'DELETE' }),
 }
 
 // --- documents -------------------------------------------------------------

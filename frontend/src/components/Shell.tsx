@@ -5,11 +5,12 @@ import { useAuth, useUser } from '../lib/auth'
 import { actions } from '../lib/endpoints'
 import { onActionsChanged } from '../lib/events'
 import { Link, useLocation } from '../lib/router'
-import { IconBrain, IconChat, IconFile, IconGraph, IconHome, IconInbox, IconLogout } from './icons'
+import { IconBrain, IconCalendar, IconChat, IconFile, IconGraph, IconHome, IconInbox, IconLogout } from './icons'
 import { cx } from './ui'
 
 const NAV = [
   { to: '/', label: 'Today', icon: IconHome, match: (p: string) => p === '/' },
+  { to: '/calendar', label: 'Calendar', icon: IconCalendar, match: (p: string) => p.startsWith('/calendar') },
   { to: '/chat', label: 'Assistant', icon: IconChat, match: (p: string) => p.startsWith('/chat') },
   { to: '/documents', label: 'Documents', icon: IconFile, match: (p: string) => p.startsWith('/documents') },
   { to: '/memories', label: 'Memories', icon: IconBrain, match: (p: string) => p.startsWith('/memories') },
@@ -109,7 +110,7 @@ export function Shell({ children }: { children: ReactNode }) {
   )
 }
 
-/** The standard page column. The chat screen opts out and fills the space. */
-export function PageContainer({ children }: { children: ReactNode }) {
-  return <div className="mx-auto w-full max-w-4xl px-10 py-10">{children}</div>
+/** The standard page column. The chat screen opts out and fills the space; the calendar asks for a wider one. */
+export function PageContainer({ children, wide }: { children: ReactNode; wide?: boolean }) {
+  return <div className={cx('mx-auto w-full px-10 py-10', wide ? 'max-w-6xl' : 'max-w-4xl')}>{children}</div>
 }

@@ -114,3 +114,15 @@ export const IconBrain = base(
     <path d="M14.5 4.5a3 3 0 0 1 3 3 3 3 0 0 1 2 5.2 3 3 0 0 1-2.5 4.8 2.5 2.5 0 0 1-5 .5" />
   </>,
 )
+export const IconCalendar = base(
+  <>
+    <rect x="4" y="5.5" width="16" height="14.5" rx="2" />
+    <path d="M4 10h16M8.5 3.5v4M15.5 3.5v4" />
+  </>,
+)
+export const IconPin = base(
+  <>
+    <path d="M12 21s6.5-5.6 6.5-11a6.5 6.5 0 0 0-13 0c0 5.4 6.5 11 6.5 11z" />
+    <circle cx="12" cy="10" r="2.3" />
+  </>,
+)
