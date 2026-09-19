@@ -30,7 +30,8 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 // partition a named-agent layer can compose, rather than labels.
 func TestGeneralIsTheUnionOfTheDomainAgents(t *testing.T) {
 	owner := map[string]string{}
-	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent, FinanceAgent} {
+	for _, a := range []Agent{TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent,
+		FinanceAgent, StudyAgent} {
 		for _, name := range a.Tools {
 			if prev, dup := owner[name]; dup {
 				t.Fatalf("%s belongs to both %s and %s", name, prev, a.Name)

@@ -182,7 +182,7 @@ func TestPrepareNeverWrites(t *testing.T) {
 
 // --- declarations ---------------------------------------------------------------
 
-func TestStandardToolsAreTheBriefsThirteen(t *testing.T) {
+func TestStandardToolsAreTheBriefsSixteen(t *testing.T) {
 	w := newWorld()
 	var reads, writes []string
 	for _, tool := range w.reg.Tools() {
@@ -196,11 +196,11 @@ func TestStandardToolsAreTheBriefsThirteen(t *testing.T) {
 	sort.Strings(reads)
 	sort.Strings(writes)
 	if want := []string{AnalyzeSpending, SearchCalendar, SearchDocuments, SearchExpenses,
-		SearchGoals, SearchNotes, SearchTasks}; !slices.Equal(reads, want) {
+		SearchGoals, SearchNotes, SearchStudyPlans, SearchTasks}; !slices.Equal(reads, want) {
 		t.Fatalf("read tools = %v, want %v", reads, want)
 	}
 	if want := []string{CreateCalendarEvent, CreateExpense, CreateGoal, CreateNote,
-		CreateTask, UpdateTask}; !slices.Equal(writes, want) {
+		CreateStudyPlan, CreateTask, GenerateFlashcards, UpdateTask}; !slices.Equal(writes, want) {
 		t.Fatalf("write tools = %v, want %v", writes, want)
 	}
 	// Deletion is deferred. Nothing may be registered that sounds like it.
@@ -218,11 +218,27 @@ func TestStandardToolsAreTheBriefsThirteen(t *testing.T) {
 }
 
 // Every tool's input and output schemas are real JSON Schema objects, and the
-// input one is exactly its params.
+// input one is exactly the params a model may write -- which since Phase 10a
+// is the params minus the derived ones. A derived key is filled in by the tool
+// itself, and offering it in the schema would invite a provider with native
+// tool calling to write it instead; see tools.Param.Derived.
 func TestSchemasDescribeEveryTool(t *testing.T) {
 	for _, tool := range newWorld().reg.Tools() {
 		in := tool.InputSchema()
-		if in.Type != "object" || len(in.Properties) != len(tool.Params) {
+		offered := 0
+		for _, p := range tool.Params {
+			if p.Offered() {
+				offered++
+			}
+			if p.Derived && p.MustBeGrounded() {
+				t.Fatalf("%s declares %s as both derived and grounded", tool.Name, p.Name)
+			}
+			if _, described := in.Properties[p.Name]; described == p.Derived {
+				t.Fatalf("%s input schema %s %q", tool.Name,
+					map[bool]string{true: "offers the derived param", false: "omits"}[p.Derived], p.Name)
+			}
+		}
+		if in.Type != "object" || len(in.Properties) != offered {
 			t.Fatalf("%s input schema = %+v", tool.Name, in)
 		}
 		for _, r := range in.Required {
@@ -255,7 +271,12 @@ func TestCanonicalInputOnlyCarriesDeclaredParams(t *testing.T) {
 		"type": "career", "content": "body", "task": "scheduler",
 		"start": "2026-09-30 14:00", "end": "2026-09-30 15:00", "location": "the shed",
 		"amount": "500", "currency": "INR",
-		"user_id": uuid.NewString(), "id": "ignored",
+		// A document the fake study service has, so create_study_plan and
+		// generate_flashcards both resolve rather than refusing -- the latter
+		// is the one tool whose canonical input carries a key no model wrote,
+		// which is exactly what this test has to see.
+		"document": "field-notes.txt",
+		"user_id":  uuid.NewString(), "id": "ignored",
 	}
 	for _, tool := range w.reg.Tools() {
 		call, err := w.reg.Prepare(context.Background(), w.user, tool.Name, everything)

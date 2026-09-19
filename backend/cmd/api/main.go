@@ -28,6 +28,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 	"github.com/jashveer/lifeos/backend/internal/tools"
 	"github.com/jashveer/lifeos/backend/internal/users"
@@ -137,6 +138,31 @@ func run(logger *slog.Logger) error {
 	calendarSvc := calendar.NewService(calendar.NewRepository(pool), calendar.WithNodeSync(graphSvc))
 	financeSvc := finance.NewService(finance.NewRepository(pool), finance.WithNodeSync(graphSvc))
 
+	// Phase 10a. It takes the document service rather than a repository,
+	// because what it needs from documents is the *text* of one -- the
+	// passages a flashcard has to be grounded in -- and that is a service
+	// read, owner-scoped, exactly as the chat orchestrator gets it. It shares
+	// the chat provider for the same reason memory and the graph do: a card is
+	// written by the same kind of model that answers.
+	studySvc := study.NewService(study.Deps{
+		Store:    study.NewRepository(pool),
+		Library:  docSvc,
+		Provider: provider,
+		Graph:    graphSvc,
+		Logger:   logger,
+		Options: study.Options{
+			Model:       cfg.StudyModel,
+			Temperature: cfg.StudyTemperature,
+			MaxTokens:   cfg.StudyMaxTokens,
+			Timeout:     cfg.StudyGenerateTimeout,
+			JSONMode:    cfg.StudyJSONMode,
+		},
+	})
+	logger.Info("study configured",
+		"model", orElse(cfg.StudyModel, provider.Model()),
+		"generate_timeout", cfg.StudyGenerateTimeout,
+		"cards_per_batch", study.DefaultCardsPerBatch)
+
 	// The memory system. It shares the chat provider and the embedder: a fact
 	// is extracted by the same kind of model that answered, and embedded by the
 	// same one that embedded the documents -- which it has to be, since both
@@ -189,7 +215,7 @@ func run(logger *slog.Logger) error {
 	actionRepo := actions.NewRepository(pool)
 	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
 		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
-		Calendar: calendarSvc, Finance: financeSvc,
+		Calendar: calendarSvc, Finance: financeSvc, Study: studySvc,
 		DocumentMinSimilarity: cfg.ChatMinSimilarity,
 	})...)
 	if err != nil {
@@ -260,6 +286,7 @@ func run(logger *slog.Logger) error {
 		Notes:       notes.NewHandler(noteSvc, logger),
 		Calendar:    calendar.NewHandler(calendarSvc, logger),
 		Finance:     finance.NewHandler(financeSvc, logger),
+		Study:       study.NewHandler(studySvc, logger),
 		Documents:   documents.NewHandler(docSvc, logger, cfg.MaxUploadBytes),
 		Chat:        chat.NewHandler(chatSvc, logger),
 		Memories:    memories.NewHandler(memorySvc, logger),

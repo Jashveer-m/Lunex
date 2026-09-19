@@ -15,6 +15,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
@@ -436,6 +437,157 @@ func (f *fakeDocs) Search(_ context.Context, userID uuid.UUID, q documents.Searc
 	return f.byUser[userID], nil
 }
 
+// fakeStudy stands in for the study service. Generation is the interesting
+// part: `propose` decides what ProposeFlashcards returns, so a test can say
+// "the model wrote these cards" without a model, and `proposals` records that
+// generation happened exactly when it should -- during Prepare and not again
+// on approval.
+type fakeStudy struct {
+	mu         sync.Mutex
+	plans      map[uuid.UUID][]study.Plan
+	docs       map[uuid.UUID][]documents.Document
+	cards      [][]study.CreateCardInput
+	creates    []study.CreatePlanInput
+	filters    []study.Filter
+	proposals  []study.GenerateInput
+	propose    []study.NewCard
+	proposeErr error
+	err        error
+}
+
+func newFakeStudy() *fakeStudy {
+	return &fakeStudy{
+		plans: map[uuid.UUID][]study.Plan{},
+		docs:  map[uuid.UUID][]documents.Document{},
+		propose: []study.NewCard{
+			{Front: "How long did the aurora last?", Back: "About forty minutes."},
+			{Front: "What does the generator need?", Back: "A new fuel filter."},
+		},
+	}
+}
+
+func (f *fakeStudy) seedPlan(owner uuid.UUID, title string) study.Plan {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := study.Plan{ID: uuid.New(), UserID: owner, Title: title, Status: study.StatusActive}
+	f.plans[owner] = append(f.plans[owner], p)
+	return p
+}
+
+func (f *fakeStudy) seedDocument(owner uuid.UUID, filename string) documents.Document {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := documents.Document{
+		ID: uuid.New(), UserID: owner, Filename: filename,
+		Status: documents.StatusReady, ChunkCount: 3,
+	}
+	f.docs[owner] = append(f.docs[owner], d)
+	return d
+}
+
+func (f *fakeStudy) writes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.creates) + len(f.cards)
+}
+
+func (f *fakeStudy) Plans(_ context.Context, userID uuid.UUID, filter study.Filter) ([]study.Plan, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.filters = append(f.filters, filter)
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []study.Plan
+	for _, p := range f.plans[userID] {
+		if filter.Status != "" && p.Status != filter.Status {
+			continue
+		}
+		if filter.Query != "" && !strings.Contains(strings.ToLower(p.Title), strings.ToLower(filter.Query)) {
+			continue
+		}
+		out = append(out, p)
+	}
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStudy) CreatePlan(_ context.Context, userID uuid.UUID, in study.CreatePlanInput) (study.Plan, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creates = append(f.creates, in)
+	if f.err != nil {
+		return study.Plan{}, f.err
+	}
+	p := study.Plan{
+		ID: uuid.New(), UserID: userID, Title: in.Title, DocumentID: in.DocumentID,
+		Status: study.StatusActive,
+	}
+	f.plans[userID] = append(f.plans[userID], p)
+	return p, nil
+}
+
+func (f *fakeStudy) ProposeFlashcards(_ context.Context, _ uuid.UUID, in study.GenerateInput) (study.Proposal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.proposals = append(f.proposals, in)
+	if f.proposeErr != nil {
+		return study.Proposal{}, f.proposeErr
+	}
+	cards := f.propose
+	if in.Count > 0 && len(cards) > in.Count {
+		cards = cards[:in.Count]
+	}
+	return study.Proposal{
+		DocumentID: in.DocumentID, StudyPlanID: in.StudyPlanID, Topic: in.Topic,
+		Cards: append([]study.NewCard(nil), cards...),
+	}, nil
+}
+
+func (f *fakeStudy) CreateFlashcards(_ context.Context, userID uuid.UUID, in []study.CreateCardInput) ([]study.Flashcard, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cards = append(f.cards, in)
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]study.Flashcard, 0, len(in))
+	for _, c := range in {
+		out = append(out, study.Flashcard{
+			ID: uuid.New(), UserID: userID, StudyPlanID: c.StudyPlanID,
+			DocumentID: c.DocumentID, Front: c.Front, Back: c.Back,
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeStudy) ResolveDocument(_ context.Context, userID uuid.UUID, ref string) (documents.Document, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var partial []documents.Document
+	for _, d := range f.docs[userID] {
+		if d.ID.String() == ref || strings.EqualFold(d.Filename, ref) {
+			return d, nil
+		}
+		if strings.Contains(strings.ToLower(d.Filename), strings.ToLower(ref)) {
+			partial = append(partial, d)
+		}
+	}
+	switch len(partial) {
+	case 1:
+		return partial[0], nil
+	case 0:
+		return documents.Document{}, study.ErrNotFound
+	}
+	names := make([]string, 0, len(partial))
+	for _, d := range partial {
+		names = append(names, d.Filename)
+	}
+	return documents.Document{}, &study.AmbiguousDocumentError{Ref: ref, Matches: names}
+}
+
 // fakeLedger is the actions table's approval gate, in memory. It keeps the
 // real one's contract: owner-scoped, atomic, single-use.
 type fakeLedger struct {
@@ -490,6 +642,7 @@ type world struct {
 	docs     *fakeDocs
 	calendar *fakeCalendar
 	finance  *fakeFinance
+	study    *fakeStudy
 	ledger   *fakeLedger
 	user     uuid.UUID
 }
@@ -502,13 +655,15 @@ func newWorld() *world {
 		docs:     &fakeDocs{byUser: map[uuid.UUID][]documents.SearchResult{}},
 		calendar: newFakeCalendar(),
 		finance:  newFakeFinance(),
+		study:    newFakeStudy(),
 		ledger:   newFakeLedger(),
 		user:     uuid.New(),
 	}
 	w.finance.seedCategories(w.user)
+	w.study.seedDocument(w.user, "field-notes.txt")
 	reg, err := NewRegistry(w.ledger, Standard(Services{
 		Tasks: w.tasks, Goals: w.goals, Notes: w.notes, Documents: w.docs,
-		Calendar: w.calendar, Finance: w.finance,
+		Calendar: w.calendar, Finance: w.finance, Study: w.study,
 		DocumentMinSimilarity: 0.5, Now: func() time.Time { return testNow },
 	})...)
 	if err != nil {
@@ -532,5 +687,5 @@ func (w *world) totalWrites() int {
 	w.finance.mu.Lock()
 	f := len(w.finance.creates)
 	w.finance.mu.Unlock()
-	return w.tasks.writes() + g + n + c + f
+	return w.tasks.writes() + g + n + c + f + w.study.writes()
 }

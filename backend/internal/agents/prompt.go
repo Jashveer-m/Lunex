@@ -118,6 +118,12 @@ func renderTools(offered []tools.Tool) string {
 		}
 		b.WriteString("- " + t.Name + ": " + t.Description)
 		for _, p := range t.Params {
+			// A derived parameter is not an argument: the tool works it out
+			// while the call is prepared, and offering it here would invite
+			// the model to write one. See tools.Param.Derived.
+			if !p.Offered() {
+				continue
+			}
 			b.WriteString("\n    " + p.Name)
 			if p.Required {
 				b.WriteString(" (required)")

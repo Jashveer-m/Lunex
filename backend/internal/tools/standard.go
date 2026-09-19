@@ -13,6 +13,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
@@ -60,6 +61,25 @@ type (
 		CategoryByName(ctx context.Context, userID uuid.UUID, name string) (finance.Category, error)
 		Create(ctx context.Context, userID uuid.UUID, in finance.CreateInput) (finance.Expense, error)
 	}
+	// StudyService is Phase 10a's study plans and flashcards.
+	//
+	// ProposeFlashcards is the interesting one, and the shape of the interface
+	// is the phase's approval story in miniature: it *proposes* cards and
+	// writes nothing, and CreateFlashcards -- the write -- takes the cards
+	// rather than a document and a count, so there is no method here that
+	// generates and stores in one step. A write tool cannot regenerate on
+	// approval even by mistake, because the service offers no way to.
+	//
+	// There is no UpdatePlan and no delete of anything, so no tool can reach
+	// one; and ResolveDocument is a read, which is what lets a proposal name a
+	// file by the name the user used.
+	StudyService interface {
+		Plans(ctx context.Context, userID uuid.UUID, f study.Filter) ([]study.Plan, error)
+		CreatePlan(ctx context.Context, userID uuid.UUID, in study.CreatePlanInput) (study.Plan, error)
+		ProposeFlashcards(ctx context.Context, userID uuid.UUID, in study.GenerateInput) (study.Proposal, error)
+		CreateFlashcards(ctx context.Context, userID uuid.UUID, in []study.CreateCardInput) ([]study.Flashcard, error)
+		ResolveDocument(ctx context.Context, userID uuid.UUID, ref string) (documents.Document, error)
+	}
 )
 
 // Services is what the standard tools are built over.
@@ -70,6 +90,7 @@ type Services struct {
 	Documents DocumentSearcher
 	Calendar  CalendarService
 	Finance   FinanceService
+	Study     StudyService
 	// DocumentMinSimilarity is search_documents' floor. It is the chat
 	// retrieval floor, passed in rather than defaulted here, so a document the
 	// assistant finds by searching is held to the same bar as one it retrieves
@@ -110,6 +131,14 @@ const (
 	// update_expense and no delete, so a number the assistant recorded can be
 	// corrected through the API or the UI and not by asking it again.
 	CreateExpense = "create_expense"
+	// SearchStudyPlans and the two writes below are Phase 10a.
+	SearchStudyPlans = "search_study_plans"
+	CreateStudyPlan  = "create_study_plan"
+	// GenerateFlashcards is the one write in this codebase whose proposal is
+	// *content* rather than a restatement of what the user said: the cards are
+	// written by a model during preparation and are what the approval card
+	// shows. See generateFlashcardsInput.
+	GenerateFlashcards = "generate_flashcards"
 )
 
 // Standard returns the tools, read tools first.
@@ -130,12 +159,15 @@ func Standard(s Services) []Tool {
 		searchCalendarTool(s),
 		searchExpensesTool(s),
 		analyzeSpendingTool(s),
+		searchStudyPlansTool(s),
 		createTaskTool(s),
 		updateTaskTool(s),
 		createGoalTool(s),
 		createNoteTool(s),
 		createCalendarEventTool(s),
 		createExpenseTool(s),
+		createStudyPlanTool(s),
+		generateFlashcardsTool(s),
 	}
 }
 
@@ -150,6 +182,7 @@ var searchStopWords = map[string]struct{}{
 	"task": {}, "tasks": {}, "goal": {}, "goals": {}, "note": {}, "notes": {},
 	"todo": {}, "item": {}, "items": {}, "event": {}, "events": {}, "calendar": {},
 	"expense": {}, "expenses": {}, "spending": {}, "spent": {}, "cost": {}, "costs": {},
+	"plan": {}, "plans": {}, "study": {}, "flashcard": {}, "flashcards": {}, "card": {}, "cards": {},
 }
 
 // searchTerms is the whole phrase first, then -- as a fallback -- up to three of

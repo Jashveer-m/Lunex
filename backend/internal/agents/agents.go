@@ -9,9 +9,10 @@
 // an agent is the argument it is called with.
 //
 // There is exactly one agent the orchestrator uses, General, and it is
-// composed out of six domain agents -- TaskAgent, GoalAgent, NoteAgent,
-// DocumentAgent, CalendarAgent and FinanceAgent -- that each wrap one module's
-// tools. They are not personas and nothing routes to them individually yet. They exist so that the named-agent
+// composed out of seven domain agents -- TaskAgent, GoalAgent, NoteAgent,
+// DocumentAgent, CalendarAgent, FinanceAgent and StudyAgent -- that each wrap
+// one module's tools. They are not personas and nothing routes to them
+// individually yet. They exist so that the named-agent
 // layer the spec describes (a Study agent, a Career agent) is an addition
 // rather than a rework: a later phase puts a first step in front of Decide that
 // picks an agent, composes it from the domain agents and whatever new modules
@@ -84,9 +85,19 @@ var (
 		Name: "finance", Purpose: "looking at what the user spent, adding it up, and recording new expenses",
 		Tools: []string{tools.SearchExpenses, tools.AnalyzeSpending, tools.CreateExpense},
 	}
+	// StudyAgent is Phase 10a. It is the first of the *named specialist*
+	// agents the spec describes -- a Study agent -- and it arrives exactly as
+	// this package said it would: a seventh entry in this list, composed into
+	// General, with nothing about the router, the tools or the action engine
+	// changing. It is still not routed to individually; that is the step a
+	// later phase puts in front of Decide.
+	StudyAgent = Agent{
+		Name: "study", Purpose: "looking at what the user is studying and making flashcards from their documents",
+		Tools: []string{tools.SearchStudyPlans, tools.CreateStudyPlan, tools.GenerateFlashcards},
+	}
 )
 
 // General is the one agent the orchestrator uses: all of the domain agents'
 // tools.
 var General = Compose("general", "anything the assistant can do with the user's data",
-	TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent, FinanceAgent)
+	TaskAgent, GoalAgent, NoteAgent, DocumentAgent, CalendarAgent, FinanceAgent, StudyAgent)

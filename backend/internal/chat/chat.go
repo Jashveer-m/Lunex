@@ -124,6 +124,12 @@ const (
 	// covers both what the figures mean and what the assistant must not do
 	// with them.
 	SourceSpending = "spending"
+	// SourceStudyPlan is one of the user's study plans: what they are
+	// studying, what it is built from and how big the deck is. The cards
+	// themselves are not a source -- a deck is hundreds of one-line answers,
+	// and putting them in front of the model would spend the whole context
+	// budget restating a document it can retrieve properly.
+	SourceStudyPlan = "study_plan"
 )
 
 // Source is one retrieved item, recorded on the assistant message that was

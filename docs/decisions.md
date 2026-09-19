@@ -2288,7 +2288,7 @@ recorded as failed, rather than quietly filing the money under nothing.
 ## The financial-advice boundary is a prompt rule, in every prompt
 
 The master spec requires that spending analysis be framed as informational
-rather than as professional financial advice. That is rule 9 of the chat system
+rather than as professional financial advice. That is rule 10 of the chat system
 prompt, and three things about how it is written were deliberate.
 
 **It is in every prompt, not only the ones a finance tool ran for.** The
@@ -2442,3 +2442,337 @@ The web UI gained nothing this phase. An expense reaches the user through the
 API, through an approved proposal, or as a citation in an answer;
 `GET /expenses/summary` exists in the shape a dashboard would want, and is not
 drawn by one yet.
+
+# Phase 10a decisions
+
+## A generated flashcard is checked against the document, not trusted to the prompt
+
+This is the phase. Everything else in it is a CRUD resource.
+
+The generation prompt says, three times, that every answer must be stated in
+the passages. A 3B model does not always comply — the measured Phase 5 failure
+was llama3.2:3b answering from its own knowledge when the retrieved text was
+thin, confidently and in exactly the register of a real answer. So the prompt
+is the request and `internal/study/grounding.go` is the guarantee: after
+parsing, every proposed card is compared against the same passages the model
+was shown, and one whose answer is not in them is dropped before the user ever
+sees it.
+
+The rule, precisely:
+
+- the **back** must be `GroundedIn` the passages: at least two thirds of its
+  content words have to appear in them;
+- a **figure** on the back that the passages do not contain sinks the card
+  outright, whatever the share works out to;
+- the **front** only has to `MentionsAny` — name at least one thing the
+  passages talk about.
+
+The two sides differ because they do different jobs. The back is the claim; it
+is what the learner ends up believing. The front is mostly the words of asking,
+which say nothing about the source — "What did the aurora do, and for how
+long?" is four content words of which one is the document's, and holding a
+question to the answer's share would reject a model for writing English. What
+the weaker test still catches is the card that is about something else
+entirely: a question about photosynthesis with an answer stitched out of a
+networking paper.
+
+Two thirds rather than all of it, because an answer written as a sentence
+carries some of the model's own glue. The number is a judgement, and the thing
+it trades off is stated below.
+
+## Why a number is exact and a word is not
+
+`sameWord` allows an inflection — "last" matches "lasted", "filter" matches
+"filters" — because a restatement introduces them and rejecting one would be
+rejecting English. A token with a digit in it has to match exactly, and an
+unsupported one disqualifies the answer rather than counting against a share.
+
+Both halves of that come from the same case. "400 volts after 12 seconds",
+against a passage that says 40 volts after 12 seconds, is three quarters the
+document's words and entirely wrong; and "40" is a prefix of "400", so the
+inflection rule would have matched it. A figure is the part of a flashcard a
+learner is least able to check and most likely to memorise, so it gets the
+strict rule and the veto.
+
+The cost is stated rather than hidden: a card answering "40 minutes" from a
+passage that says "forty minutes" is dropped. That is the right direction.
+
+## The grounding check is the inverse of the memory one
+
+`memories.RestatesRetrieved` throws away a "fact about the user" that turned out
+to be the content of a retrieved document. `study.CardGrounded` throws away a
+flashcard whose answer is *not* the content of one. Same machinery — content
+words, stop words, prefix matching — opposite sign, because the two callers want
+opposite things out of the same model.
+
+They are separate files rather than a shared package, and that is deliberate.
+The stop-word lists differ: study's drops the vocabulary of asking ("define",
+"explain", "according", "question") so a card is judged on its subject rather
+than on the asking, and memory's drops the vocabulary of attribution ("knows",
+"read", "mentioned") for the mirror-image reason. Study keeps short tokens with
+digits in them; memory has no use for them. A shared implementation would be one
+whose parameters had to be tuned for two jobs that pull in opposite directions.
+
+## Generation happens when the call is prepared, not when it is approved
+
+`generate_flashcards` writes its cards during `Registry.Prepare` — which may
+read and never writes — stores them in the canonical input, and writes exactly
+those rows on approval. `study.Service` offers no method that generates and
+stores in one step, so a write tool cannot regenerate even by mistake.
+
+The alternative was to store the document and the count and generate on
+approval. That would mean the user approved "8 flashcards from lecture-3.pdf"
+and got eight sentences nobody had read — for content whose entire purpose is
+to be rehearsed until it is believed, the wrong way round. It also makes the
+proposal reproducible: the same stored input always writes the same cards, so
+an approval is not a second roll of the dice, and a re-read of the action log
+shows what was actually agreed to.
+
+What it costs is that a pending proposal could go stale if its document
+changed. It cannot: a document cannot be edited in this version, only deleted,
+and a deleted one is caught when the approval runs.
+
+## The approval card shows the cards, so `Param` grew a `Derived` flag
+
+The canonical input for `generate_flashcards` carries a `cards` key the model
+never wrote. That collided with an invariant the tool registry has had since
+Phase 7 and a test that pins it: every key in a stored input is a declared
+parameter, so what the user is shown, what the schema promises and what runs
+are one document.
+
+Rather than weaken the invariant, `Param` gained `Derived`. A derived parameter
+*is* declared — so the stored input is still exactly the declaration — and is
+left out of `Tool.InputSchema` and of the routing prompt, so the model is never
+offered it and never asked to invent one. It is the only one in the codebase,
+and `registry_test.go` also pins that a derived parameter is never `Filter` or
+`Grounded`: the grounding check is about values a model read out of a message,
+and this is a value no model wrote.
+
+## The prompt's worked example is about bread
+
+The generation prompt needs a worked example — without one, llama3.2:3b writes
+a prose summary and no cards, the same finding Phase 5 recorded for extraction.
+But an example inside the prompt is text the model can copy, and a copied card
+would sail through the grounding check if the example's subject overlapped the
+document being studied. The check would then be measuring nothing.
+
+So the example is about sourdough, it is pulled out into its own constants, and
+`TestTheWorkedExampleIsAboutSomethingElse` fails if it ever shares a content
+word with the documents the tests and `scripts/e2e.sh` upload.
+
+## A topic that matches nothing is refused, not silently widened
+
+`generate_flashcards` takes an optional `topic`, which narrows generation to the
+passages a vector search over that one document returns. When the search returns
+nothing the call fails with `ErrNoPassages` and the assistant asks which part of
+the document the user means.
+
+Falling back to the start of the document was the obvious alternative and is
+worse in the way this codebase cares about: the user asked for cards about
+chapter nine, would have got cards about chapter one, and would have had no way
+to see that it had happened. It is the same rule the hardening pass applied to
+invented filters — a read that answers a question nobody asked is worse than
+one that says it cannot.
+
+The search runs with **no** similarity floor, unlike chat retrieval. The floor
+exists to stop an unrelated question citing a distant chunk; here the search is
+already restricted to one document the user named by name, so there is nothing
+for it to protect against, and applying it would make "cards about the appendix"
+fail on a document whose appendix is not worded like the word "appendix".
+
+## A study plan is a `project` node, and no eighth node type was added
+
+`study_plans` joins the mirrored tables, and its node type is `project` —
+introduced by migration 000006 for "a piece of work being worked towards",
+which is what a study plan is.
+
+`skill` was the other candidate and is wrong: a plan is not the subject it is
+about, and a node labelled "Linear algebra" standing for a plan would collide
+with the `skill` node an extraction writes for the subject itself. A new
+`study_plan` type would be a new kind of node for something the graph already
+has a word for.
+
+The consequence is worth naming, because it is the first time it is true:
+`project` is now both a mirrored type and an extracted one. So "may this node be
+deleted directly" is `Node.Extracted` — does it have a `ref_table` — and never
+the type. `DeleteNode` already asked it that way; `graph.ExtractedTypes` is now
+documented as "what a conversation can create", which is not the same list, and
+the HTTP `409` is asserted for a mirrored `project` in both
+`internal/db/phase10_integration_test.go` and `internal/api/study_isolation_test.go`.
+
+## The study rule is in every prompt, and it is about what is *not* there
+
+Rule 9 is the study rule; the money rule moved to 10 and the action rule to 11.
+
+Most of the source rules explain what a source carries. This one mostly
+explains what it does not: a `study_plan` source names the plan, its status,
+its document and *how many* flashcards are filed under it, and says nothing
+about any of them.
+
+That is the shape that invites an invention. Rule 3 already forbids claiming
+something is in the user's data when it is not, but here the thing being
+invented is *known to exist* — the context says "24 flashcards" — and a model
+asked "what is on my linear algebra cards" will produce three of them. So the
+rule names it: never state, quote, summarise or guess what a card says, and
+tell the user to open the plan instead.
+
+It is in every prompt rather than only the ones a study tool ran for, for the
+reason the finance rule is: "read me my flashcards" from a user with no
+matching plan retrieves nothing at all, and that is exactly the turn where a
+model with no rule in front of it invents a deck.
+
+The second half is subtler. A saved card's answer *is* the document's — the
+grounding check made sure of it — so the assistant must not go further and
+vouch for it as fact, or quietly correct one it disagrees with. The card is the
+user's material, not the assistant's opinion.
+
+## Flashcards get no node
+
+A deck is hundreds of rows of one or two sentences. A node per card would swamp
+the graph, and the mention scan — which matches a node whose label occurs in the
+user's message — would fire on any question sharing a word with an answer. The
+plan is the thing worth connecting, and the cards hang off it. It is the same
+call Phase 9 made for expense categories.
+
+## The study module depends on `internal/documents`, plainly
+
+`study.Library` is declared over `documents.Document`, `documents.Passage` and
+`documents.SearchQuery`, rather than over strings the way `NodeSyncer` is.
+
+What study needs from documents is the *text of a document*, and there is no way
+to say that in this package's own vocabulary that would not be
+`documents.Passage` with a different name on it. "Document-grounded flashcards"
+is the feature, so the dependency is the phase; laundering it through a
+translation layer would hide it rather than remove it. The ownership *probe* on
+`document_id` still reads the table directly from this module's repository, the
+same considered exception `calendar` and `finance` make.
+
+## `documents.Passages` is a new read, and it is not `Search`
+
+Generating from a document with no topic needs its text, in order, with nothing
+to rank against. `Service.Search` cannot answer that: it embeds a query and
+sorts by distance.
+
+So `documents` gained `Passages(ctx, userID, documentID, limit)` — one indexed
+scan of `document_chunks`, owner-scoped on the chunk as well as the document. It
+returns a new `documents.Passage` rather than a `SearchResult`, because a
+`SearchResult` with `Similarity: 0` reads exactly like "no resemblance at all"
+when what is meant is "nothing measured it".
+
+`PromptPassages` bounds what goes into one prompt — 8 chunks, 6,000 characters
+— and the *same* function's output is what the grounding check runs against. The
+text a card is checked against is exactly the text the model was shown; checking
+against the whole document would only ever mean the check was measuring
+something else.
+
+## A hand-written card claims no source
+
+`POST /study-plans/{id}/flashcards` writes a card with `document_id: null`, even
+when the plan it is filed under names a document. Borrowing the plan's document
+would assert a provenance the card does not have, and that column exists for
+exactly one purpose: to say "this answer came from there".
+
+That endpoint also takes no approval. Approval stands between the assistant and
+the user's data, not between the user and their own.
+
+## A deck reads back in the order it was written, which needed `clock_timestamp()`
+
+A batch of cards is one transaction, `now()` is the transaction's start time,
+and `ORDER BY created_at, id` then falls to a tie-break on a random uuid. The
+first end-to-end run produced eight correct cards in a shuffled order — and
+nothing about the API would have said so, because every card was right.
+
+`CreateFlashcards` stamps each row with `clock_timestamp()` instead, which is
+the call `chat.Repository` already makes for the two messages of a turn and for
+the same reason. `TestADeckReadsBackInTheOrderItWasWritten` inserts twelve
+cards and fails without it.
+
+It matters because the order is the document's: a generated deck walks the
+passages front to back, so reading it in order is reading the source in order.
+
+## `CHAT_TIMEOUT` defaults to twenty-four minutes now
+
+A flashcard generation is a model call on the path to the *proposal*, so it
+happens before the first token, like the routing call, and out of the same turn
+budget. `config.Load` counts it in the `MaxExtractionShare` check, and the
+default turn budget grew by the same 180s × 2 that every previous model call
+added: 4 × 180s × 2 = 24 minutes.
+
+There is a second-order effect worth recording because it is not obvious and it
+is what actually broke the first end-to-end run: the routing prompt renders
+every offered tool, and this phase added three. At sixteen tools the prompt is
+about 8,300 characters, and one routing decision on a 2019 Intel Mac was
+measured at **3m08s** — over the 180s default, so the turn failed as
+`model_unavailable` before anything about study ran at all. The decision itself
+was correct. `docs/testing.md` records the budgets a slow machine needs.
+
+# Phase 10a — explicitly deferred
+
+## 60. No quizzes
+
+10b. There is no quiz table, no question type beyond front/back, no scoring and
+no multiple choice.
+
+## 61. No review state on a card
+
+A flashcard has a front, a back and a source. There is no `correct`/`incorrect`
+counter, no last-reviewed timestamp, no ease factor, no interval and no due
+date, and nothing in this phase records that a card was ever looked at. Weak-
+topic tracking is 10c and spaced repetition is 10d; a column added now would
+either sit unread for three phases or be the wrong column when they arrive.
+
+The API has no "I got this right" endpoint for the same reason — it is the
+interaction that *produces* review state, and building it before the state it
+feeds would be building half a feature twice.
+
+## 62. No study sessions and no streaks
+
+10e. Nothing records when a study session started or ended, and nothing counts
+consecutive days.
+
+## 63. No `update_flashcard`, no delete tools, no `update_study_plan` tool
+
+The assistant can propose a plan and propose cards, and that is all. There is
+no tool that edits or removes either, on the same terms as
+`create_calendar_event` (item 47) and `create_expense` (item 55): a card the
+assistant wrote wrongly is deleted through `DELETE /flashcards/{id}` or the UI,
+not by asking it again. `tools.StudyService` has no method for it, so no tool
+can reach one.
+
+## 64. A card cannot be edited at all, by anyone
+
+There is no `PATCH /flashcards/{id}`. There is nothing to change on a card that
+is not "write a different card", and adding the endpoint would mean deciding
+what happens to `document_id` when a user rewrites an answer the document no
+longer supports — which is the grounding question again, in a place with no
+document in front of it.
+
+## 65. No cap on cards per plan
+
+A batch is capped at 20 and a generation defaults to 8, but nothing bounds how
+many cards a plan accumulates over time. `goals` caps milestones at 100; this
+does not, because a deck legitimately grows to hundreds and the number at which
+it stops being legitimate is not knowable yet. The paging bounds (500) are what
+protect a read in the meantime.
+
+## 66. Generation is not exposed as an HTTP endpoint
+
+There is no `POST /study-plans/{id}/flashcards/generate`. Generating costs a
+model call and produces content the user has to read before approving, which is
+the approval flow's whole job — so it goes through the assistant. A UI that
+wants a "generate" button will drive it through a conversation, which is also
+where the user will read the proposal.
+
+## 67. No re-generation, and no "make me more like this one"
+
+Asking twice makes two independent proposals. Nothing deduplicates a card
+against the deck it is about to join, so approving two similar generations
+gives a deck with near-duplicates in it. Deduplicating needs a similarity
+measure over cards — an embedding per card, a threshold, a decision about which
+of two near-duplicates to keep — and that is the machinery 10d will need
+anyway.
+
+## 68. Study has no screen
+
+The web UI gained nothing this phase. A plan reaches the user through the API,
+through an approved proposal, or as a citation in an answer.

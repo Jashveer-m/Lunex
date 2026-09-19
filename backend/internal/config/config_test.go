@@ -130,9 +130,12 @@ func TestChatKnobsAreBounded(t *testing.T) {
 	// short has to bring them down with it; see
 	// TestChatTimeoutMustLeaveRoomToGenerate.
 	t.Setenv("CHAT_TIMEOUT", "90s")
-	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "20s")
-	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "20s")
+	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "15s")
+	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "15s")
 	t.Setenv("AGENT_TIMEOUT", "5s")
+	// And since Phase 10a a flashcard generation as well, which is the fourth
+	// model call a turn can make inside the same budget.
+	t.Setenv("STUDY_GENERATE_TIMEOUT", "5s")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -150,10 +153,12 @@ func TestChatKnobsAreBounded(t *testing.T) {
 // halves of that message would be false.
 //
 // Since Phase 7 the routing call counts too: it runs before the answer rather
-// than after it, but on the same context and out of the same budget.
+// than after it, but on the same context and out of the same budget -- and
+// since Phase 10a so does one flashcard generation, which is the other model
+// call that can run before the first token.
 //
 // The default configuration has to satisfy the rule, which is the other half
-// of what this pins: it is why DefaultChatTimeout is eighteen minutes.
+// of what this pins: it is why DefaultChatTimeout is twenty-four minutes.
 func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/lifeos")
 	t.Setenv("JWT_SECRET", validSecret)
@@ -162,7 +167,8 @@ func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the default configuration does not satisfy its own rule: %v", err)
 	}
-	tail := defaults.MemoryExtractTimeout + defaults.GraphExtractTimeout + defaults.AgentTimeout
+	tail := defaults.MemoryExtractTimeout + defaults.GraphExtractTimeout +
+		defaults.AgentTimeout + defaults.StudyGenerateTimeout
 	if left := defaults.ChatTimeout - tail; left < tail {
 		t.Fatalf("the defaults leave %s for generation against %s of extraction", left, tail)
 	}
@@ -179,6 +185,7 @@ func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 			t.Setenv("CHAT_TIMEOUT", tc.chat)
 			t.Setenv("MEMORY_EXTRACT_TIMEOUT", tc.mem)
 			t.Setenv("GRAPH_EXTRACT_TIMEOUT", tc.graph)
+			t.Setenv("STUDY_GENERATE_TIMEOUT", "5s")
 			_, err := Load()
 			if err == nil {
 				t.Fatal("a budget with no room to generate was accepted")
@@ -192,20 +199,22 @@ func TestChatTimeoutMustLeaveRoomToGenerate(t *testing.T) {
 	// Lowering the extractions to match is the other way out, and it works --
 	// which is what makes the rule a coherence check rather than a floor under
 	// how fast an operator's model is allowed to be.
-	t.Setenv("CHAT_TIMEOUT", "30s")
+	t.Setenv("CHAT_TIMEOUT", "40s")
 	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "5s")
 	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "5s")
 	t.Setenv("AGENT_TIMEOUT", "5s")
+	t.Setenv("STUDY_GENERATE_TIMEOUT", "5s")
 	if _, err := Load(); err != nil {
 		t.Fatalf("a budget that does leave room was refused: %v", err)
 	}
 
-	// With tools off there is no routing call, and its timeout is not charged
-	// against the turn.
+	// With tools off there is neither a routing call nor a generation, and
+	// neither timeout is charged against the turn.
 	t.Setenv("CHAT_TIMEOUT", "5m")
 	t.Setenv("MEMORY_EXTRACT_TIMEOUT", "60s")
 	t.Setenv("GRAPH_EXTRACT_TIMEOUT", "60s")
 	t.Setenv("AGENT_TIMEOUT", "60s")
+	t.Setenv("STUDY_GENERATE_TIMEOUT", "3m")
 	t.Setenv("AGENT_TOOLS", "false")
 	if _, err := Load(); err != nil {
 		t.Fatalf("a budget that fits without the routing call was refused with tools off: %v", err)

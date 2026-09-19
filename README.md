@@ -41,9 +41,20 @@ Personal life-operating-system.
 - **UI phase** — the web app over all of it: sign-in, tasks/goals/notes,
   document upload, a streaming chat with inline citations and Approve/Reject
   cards for proposed changes, and a memory manager.
+- **Phase 10a** — the study module, first slice: study plans, and flashcards
+  written *from* your own uploaded documents. The assistant can look at what
+  you are studying (`search_study_plans`), propose a plan
+  (`create_study_plan`) and propose a deck (`generate_flashcards`) under the
+  same approval rule — and the proposal is the cards themselves, both sides of
+  every one, because what is being approved here is content a model wrote
+  rather than a restatement of something you said. Every card is then checked
+  against the document before you are shown it: an answer that is not in the
+  text does not become a card, and an unsupported number never does. That check
+  is the inverse of the one memory extraction runs, and it is the phase.
 
-Named specialist agents (Study, Career, …) and deleting through the chat belong
-to later phases and are deliberately absent. The assistant can change your data
+Quizzes, weak-topic tracking, spaced repetition and study sessions are 10b–10e
+and are deliberately absent; so is any review state on a card. Deleting through
+the chat belongs to a later phase. The assistant can change your data
 only by proposing a change you then approve, and nothing — including asking it
 to skip the approval — relaxes that.
 
@@ -87,14 +98,15 @@ lunex/
 │   │   ├── notes/         # notes: model, service, handlers
 │   │   ├── optional/      # the three-state field a PATCH body needs
 │   │   ├── tasks/         # tasks + dependencies: model, service, handlers
-│   │   ├── tools/         # the tool registry: ten fixed tools, the approval gate
+│   │   ├── study/         # study plans and document-grounded flashcards
+│   │   ├── tools/         # the tool registry: sixteen fixed tools, the approval gate
 │   │   ├── users/         # user + profile model and repository
 │   │   └── validate/      # field rules shared by the modules
 │   ├── migrations/        # embedded .sql migrations
 │   └── go.mod
 ├── frontend/              # the web UI (Vite + React)
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule -> spend -> study -> ground, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -398,8 +410,52 @@ something you said.
 
 Asked how much you spent, it reports what your own records add up to. It is not
 a financial adviser, does not claim to be, and does not tell you what to do with
-your money — rule 9 of the system prompt, with a test that checks the framing
+your money — rule 10 of the system prompt, with a test that checks the framing
 reaches the model.
+
+### Study plans and flashcards
+
+A plan is something you are studying, optionally built from a document you have
+uploaded. Cards are written *from* that document:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/study-plans -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Kestrel relay handbook","document_id":"'"$DOC_ID"'"}'
+# {"title":"Kestrel relay handbook","document":"relay-handbook.txt",
+#  "status":"active","card_count":0,…}
+```
+
+Generating is not an endpoint — it costs a model call and produces content you
+have to read before it is yours, so it goes through the assistant under the
+same approval rule as everything else. What is different is *what* the proposal
+is:
+
+```sh
+# "Make flashcards from relay-handbook.txt for my Kestrel relay handbook plan."
+# event: action
+# data: {"tool_name":"generate_flashcards","status":"proposed","summary":
+#        "Save 8 flashcards made from \"relay-handbook.txt\" under \"Kestrel relay handbook\":
+#         1. How long does it take to switch the mast feed? — Eleven seconds.
+#         2. What is the voltage of the equalisation charge? — 58.4 volts.
+#         …",…}
+
+curl -s -X POST localhost:8080/api/v1/actions/$ACTION_ID/approve -H "$AUTH"
+curl -s "localhost:8080/api/v1/study-plans/$PLAN_ID/flashcards" -H "$AUTH"
+```
+
+The cards are in the proposal, both sides of every one, because here the thing
+being approved is content a model wrote rather than a restatement of something
+you said — and because it is written *before* the approval, approving stores
+exactly what you read rather than rolling the dice again.
+
+Every card is checked against the document first. At least two thirds of an
+answer's words have to be in the passages the model was shown, and a figure
+that is not in them drops the card outright — so a plausible invention produces
+no card instead of one you cannot tell from a real one. If nothing survives,
+nothing is proposed and the assistant says the document does not have enough on
+it. That check is the inverse of the one memory extraction runs, and it is the
+phase.
 
 ## The web UI
 
@@ -435,7 +491,7 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 | `MAX_UPLOAD_BYTES` | no | `10485760` | 10 MB; rejected before the file is read |
 | `DOCUMENT_PROCESS_TIMEOUT` | no | `2m` | Budget for one synchronous upload; also sets the server's read/write timeout |
 | `CHAT_MODEL` | no | `llama3.2:3b` | The Ollama chat model |
-| `CHAT_TIMEOUT` | no | `18m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions, which run inside it. The process refuses to start if the two extraction timeouts and `AGENT_TIMEOUT` exceed half of this |
+| `CHAT_TIMEOUT` | no | `24m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions and a flashcard generation, which run inside it. The process refuses to start if the two extraction timeouts, `AGENT_TIMEOUT` and `STUDY_GENERATE_TIMEOUT` exceed half of this |
 | `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
 | `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
 | `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
@@ -457,6 +513,11 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 | `AGENT_TIMEOUT` | no | `180s` | Bounds one routing decision. Spent *before* the first token, and counted inside `CHAT_TIMEOUT` |
 | `AGENT_TEMPERATURE` | no | `0.1` | 0–2. Near zero: it is a classification |
 | `AGENT_MAX_TOKENS` | no | `200` | Routing reply cap; a decision is one short JSON object |
+| `STUDY_MODEL` | no | `CHAT_MODEL` | Which model writes flashcards. A *bigger* one is the reasonable override, unlike the extractions: this output is read by a person, repeatedly |
+| `STUDY_GENERATE_TIMEOUT` | no | `180s` | Bounds one flashcard generation. Spent *before* the first token, like the routing call, and counted inside `CHAT_TIMEOUT` |
+| `STUDY_TEMPERATURE` | no | `0.1` | 0–2. Near zero: writing a card from a passage is a reading task |
+| `STUDY_MAX_TOKENS` | no | `1024` | Generation reply cap; twenty short cards as JSON |
+| `STUDY_JSON_MODE` | no | `false` | As `MEMORY_JSON_MODE`, and off for the same measured reason |
 
 ## Common commands
 
@@ -464,7 +525,7 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve, against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> study -> ground, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -648,3 +709,23 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     through a door that cannot show you what would change.
 50. **Finance has no screen of its own.** `GET /expenses/summary` exists in the
     shape a dashboard would want, and nothing draws it yet.
+51. **A flashcard has no review state.** Front, back and the document it came
+    from, and that is all: no due date, no interval, no ease factor and no
+    record that a card was ever looked at. Quizzes, weak-topic tracking, spaced
+    repetition and sessions are 10b–10e, and a column added now would be the
+    wrong column when they arrive.
+52. **The grounding check drops good cards as well as bad ones.** A correct
+    answer phrased entirely in words the document does not use is dropped, and
+    so is "40 minutes" from a passage that says "forty minutes". That is the
+    trade: a plausible invention on a card that will be rehearsed until it is
+    believed costs more than a missing card. The count of what was dropped is
+    logged, and the assistant says when a generation produced nothing.
+53. **Generation is not deduplicated.** Asking twice makes two independent
+    proposals, and nothing compares a new card against the deck it is about to
+    join — so approving two similar generations leaves near-duplicates. It
+    needs an embedding per card, which is machinery 10d will want anyway.
+54. **A card cannot be edited, by anyone.** There is no `PATCH /flashcards/{id}`
+    and no tool that changes one; the fix for a bad card is to delete it and
+    write another.
+55. **Study has no screen of its own.** A plan reaches the web UI as a proposal
+    card in the chat or as a citation in an answer, and nothing lists a deck.

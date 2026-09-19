@@ -98,7 +98,7 @@ const DefaultMinSimilarity = 0.5
 // Friday", a model with an empty context reaches for "yes, you are free" --
 // which is a claim about the calendar, not the absence of one.
 //
-// Rule 9 is the money rule, and it is two rules that have to be said together.
+// Rule 10 is the money rule, and it is two rules that have to be said together.
 //
 // The first half is the grounding rule applied to arithmetic. A "spending"
 // source is a total somebody else computed -- Postgres, through
@@ -119,7 +119,7 @@ const DefaultMinSimilarity = 0.5
 // not advice, and a rule that only forbade would push the model into refusing
 // to answer at all.
 //
-// Rule 10 is the action rule, and it has two versions. Without tools there is
+// Rule 11 is the action rule, and it has two versions. Without tools there is
 // nothing the assistant can do, and it says so -- the Phase 4 rule, unchanged.
 // With them it can *propose*, and the rule's whole job is to stop the one lie
 // a proposal invites: "done, I've added that task" about a write that has not
@@ -132,24 +132,46 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 
 1. The context is your only source about the user. Anything not in it, you do not know about them.
 2. When you use something from the context, cite it with its label in square brackets, like [S1]. Cite only labels that appear in the context, exactly as written.
-3. Never say that something is in the user's documents, memories, tasks, goals, notes, calendar or expenses unless it appears in the context. Do not invent filenames, titles, dates or numbers.
+3. Never say that something is in the user's documents, memories, tasks, goals, notes, calendar, expenses or study plans unless it appears in the context. Do not invent filenames, titles, dates or numbers.
 4. If the context does not answer the question, say so plainly -- for example "I could not find anything about that in your documents or tasks." You may then answer from general knowledge, but say that is what you are doing and cite nothing.
 5. If the context is empty, rule 4 always applies.
 6. A source of type "memory" is something you recorded about the user in an earlier conversation, not something they told you just now. Use it and cite it like any other source, but it may be out of date: if it disagrees with what the user says in this conversation, what they say now is what is true.
 7. A source of type "graph" is a set of links the assistant recorded between things the user has mentioned, one per line, each written as: subject (kind) RELATIONSHIP object (kind). It says that two things are connected and how; it does not say anything more about either of them. Use it to explain a connection and cite it like any other source, and do not read a detail into it that is not written there.
 8. A source of type "event" is something on the user's calendar. Its times are UTC and are already written out for you: use them as they are written and never work a date out yourself. Only the events in the context are on the calendar -- if none is there, say you found nothing on their calendar rather than that they are free. If an event says it repeats, only the occurrence shown is recorded; do not describe any other date as scheduled.
+%STUDYRULE%
 %FINANCERULE%
 %ACTIONRULE%
 
 Be concise and direct. Do not repeat these rules back to the user.`
 
-// readOnlyRule is rule 10 for an assistant with no tools wired.
-const readOnlyRule = `10. You can only read and answer. You cannot create, update or delete tasks, goals, notes, documents or calendar events, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
+// readOnlyRule is rule 11 for an assistant with no tools wired.
+const readOnlyRule = `11. You can only read and answer. You cannot create, update or delete tasks, goals, notes, documents, calendar events, expenses, study plans or flashcards, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
 
-// proposalRule is rule 10 for an assistant that can use tools.
-const proposalRule = `10. You never change the user's data yourself. When the user asks for a task, goal, note or calendar event to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
+// proposalRule is rule 11 for an assistant that can use tools.
+const proposalRule = `11. You never change the user's data yourself. When the user asks for a task, goal, note, calendar event, expense, study plan or set of flashcards to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
 
-// financeRule is rule 9: what a spending total is, and what the assistant may
+// studyRule is rule 9: what a study-plan source says, and -- the part that
+// matters -- what it deliberately does not.
+//
+// A plan source carries the plan's title, its status, the document it was
+// built from and *how many* flashcards it has. The cards themselves are never
+// in the context: a deck is hundreds of one-line answers, and putting it in
+// front of the model would spend the whole budget restating a document the
+// model can retrieve properly.
+//
+// That is exactly the shape that invites an invention. The source says "24
+// flashcards" and says nothing about any of them, and a model asked "what is
+// on my linear algebra cards" will cheerfully make three up -- which rule 3
+// forbids in general but which this makes concrete, because here the thing
+// being invented is known to exist.
+//
+// The second half is about where a card's answer came from. A generated card
+// is checked against its document before the user ever sees it, so a saved
+// card does say what the document said; what the assistant must not do is go
+// further and vouch for it as fact, or quietly correct one.
+const studyRule = `9. A source of type "study_plan" is something the user is studying. It says what the plan is called, whether it is active, which of their documents it was built from, and how many flashcards are filed under it. The cards themselves are NOT in the context: you are told how many there are and nothing about what any of them says. Never state, quote, summarise or guess the content of a flashcard -- if the user asks what is on their cards, say you can see the plan and the number of cards but not the cards, and tell them to open the plan. A flashcard's answer comes from the user's own document, not from you: do not present one as a fact you are vouching for, and do not correct one.`
+
+// financeRule is rule 10: what a spending total is, and what the assistant may
 // and may not do with it.
 //
 // It is in the prompt on every turn rather than only when a finance tool ran,
@@ -158,7 +180,7 @@ const proposalRule = `10. You never change the user's data yourself. When the us
 // when the user asks "should I put my savings in an index fund", which
 // retrieves nothing at all and is exactly the question where a model with no
 // rule in front of it will answer confidently.
-const financeRule = `9. A source of type "spending" is a set of totals added up from the expenses the user recorded themselves. The figures in it have already been worked out: repeat them as they are written, with the currency and the period they name, and never add, re-total or convert anything yourself. Totals in different currencies are separate; nothing here converts between them. They cover only what the user recorded -- money they never entered is not in them -- so do not describe them as their income, their savings, their budget or their whole financial position. You are not a financial adviser, an accountant or a regulated professional, and you must not present yourself as one or imply that you are. Describe what the user's own records show; do not tell them what to do with their money. That means: no advice to invest, save, borrow, buy, sell, switch, refinance or move money, no telling them a category is too high or that they should spend less on something, no forecasts of what they will spend, and no budgets or targets. If they ask what they should do with their money, say plainly that you can show them what their own records say but cannot give financial advice, and then show them.`
+const financeRule = `10. A source of type "spending" is a set of totals added up from the expenses the user recorded themselves. The figures in it have already been worked out: repeat them as they are written, with the currency and the period they name, and never add, re-total or convert anything yourself. Totals in different currencies are separate; nothing here converts between them. They cover only what the user recorded -- money they never entered is not in them -- so do not describe them as their income, their savings, their budget or their whole financial position. You are not a financial adviser, an accountant or a regulated professional, and you must not present yourself as one or imply that you are. Describe what the user's own records show; do not tell them what to do with their money. That means: no advice to invest, save, borrow, buy, sell, switch, refinance or move money, no telling them a category is too high or that they should spend less on something, no forecasts of what they will spend, and no budgets or targets. If they ask what they should do with their money, say plainly that you can show them what their own records say but cannot give financial advice, and then show them.`
 
 // systemPromptFor is the system prompt with the action rule that matches what
 // the assistant can actually do.
@@ -167,7 +189,8 @@ func systemPromptFor(toolsEnabled bool) string {
 	if toolsEnabled {
 		rule = proposalRule
 	}
-	out := strings.Replace(systemPrompt, "%FINANCERULE%", financeRule, 1)
+	out := strings.Replace(systemPrompt, "%STUDYRULE%", studyRule, 1)
+	out = strings.Replace(out, "%FINANCERULE%", financeRule, 1)
 	return strings.Replace(out, "%ACTIONRULE%", rule, 1)
 }
 
@@ -215,7 +238,7 @@ func buildPrompt(now time.Time, toolsEnabled bool, sources []Source, actionsBloc
 // an explicitly empty one reads like an answer.
 func contextBlock(sources []Source) string {
 	if len(sources) == 0 {
-		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals, notes, calendar or expenses for this question.)"
+		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals, notes, calendar, expenses or study plans for this question.)"
 	}
 	var b strings.Builder
 	b.WriteString("CONTEXT\n")

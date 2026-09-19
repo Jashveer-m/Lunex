@@ -14,6 +14,8 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/agents"
 	"github.com/jashveer/lifeos/backend/internal/ai"
 	"github.com/jashveer/lifeos/backend/internal/documents"
+	"github.com/jashveer/lifeos/backend/internal/graph"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 	"github.com/jashveer/lifeos/backend/internal/tools"
 )
@@ -130,6 +132,37 @@ func TestAnExecutedActionIsReadAgainAnchoredToItsRecord(t *testing.T) {
 		t.Fatalf("read in the wrong scope: %+v", last)
 	case len(last.unconfirmed) != 0:
 		t.Fatalf("an executed change was still unconfirmed: %v", last.unconfirmed)
+	}
+}
+
+// An approved study plan anchors on `study_plans`, which the graph mirrors as
+// a `project`. It is worth its own case because the node type is not the
+// table's name -- the one mirrored table where those differ -- so an anchor
+// that got it wrong would be a write the graph refuses at run time rather than
+// anything the compiler catches.
+func TestAnApprovedStudyPlanAnchorsOnItsTable(t *testing.T) {
+	h, _, ln := extractingToolHarness(t, routingReply(
+		`{"tool": "create_study_plan", "arguments": {"title": "Linear algebra finals"}}`, answerText))
+	if _, _, err := h.send(t, "Create a study plan for my linear algebra finals"); err != nil {
+		t.Fatal(err)
+	}
+	// The recorded proposal, so the timestamp lines up with the message that
+	// produced it -- which is how the approval finds the turn to re-read.
+	executed := h.store.recordedActions()[0]
+	executed.Status = actions.StatusExecuted
+	plan := study.Plan{ID: uuid.New(), Title: "Linear algebra finals"}
+
+	h.svc.ActionExecuted(context.Background(), h.user, executed,
+		`Create a study plan "Linear algebra finals".`, tools.Result{Plans: []study.Plan{plan}})
+
+	calls := ln.seen()
+	last := calls[len(calls)-1]
+	if last.anchor == nil || last.anchor.RefTable != "study_plans" ||
+		last.anchor.RefID != plan.ID || last.anchor.Label != plan.Title {
+		t.Fatalf("anchor = %+v", last.anchor)
+	}
+	if _, mirrored := graph.TypeForRefTable(last.anchor.RefTable); !mirrored {
+		t.Fatalf("the graph does not mirror %q", last.anchor.RefTable)
 	}
 }
 

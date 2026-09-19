@@ -30,6 +30,13 @@
 # time that was proposed; confirm its graph node appeared; and ask what is on
 # that day, which must run search_calendar and cite the event.
 #
+# Then the study check, which is the same rule for Phase 10a and the one where
+# it matters most: upload a handbook, ask for flashcards from it, and confirm
+# the proposal *shows the cards* rather than counting them; confirm nothing was
+# saved; approve, and confirm what was saved is byte for byte what was shown;
+# and then check every saved answer against the uploaded file, because the
+# thing being approved here is content a model wrote.
+#
 # Then the finance check, which is the same rule for Phase 9 with one addition:
 # ask the assistant to log an expense and confirm it was proposed and nothing
 # was recorded; approve it and confirm it is in GET /expenses to the penny;
@@ -39,8 +46,9 @@
 #
 # E2E_ONLY=actions runs the preflight, registration and the action check and
 # nothing else -- a few minutes rather than most of an hour on a slow machine.
-# E2E_ONLY=calendar does the same for the calendar check, and E2E_ONLY=finance
-# for the finance one.
+# E2E_ONLY=calendar does the same for the calendar check, E2E_ONLY=finance for
+# the finance one, and E2E_ONLY=study for the study one -- which uploads its own
+# document, so it stands alone.
 #
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
 # generation, real extraction.
@@ -58,11 +66,11 @@
 # empty; they are passed through to the API:
 #
 #   MEMORY_EXTRACT_TIMEOUT=180s GRAPH_EXTRACT_TIMEOUT=180s AGENT_TIMEOUT=180s \
-#     CHAT_TIMEOUT=18m ./scripts/e2e.sh
+#     STUDY_GENERATE_TIMEOUT=180s CHAT_TIMEOUT=24m ./scripts/e2e.sh
 #
-# CHAT_TIMEOUT has to cover the whole turn including both extractions and the
-# routing call, and the API refuses to start if it does not leave them room --
-# so raise them together or none.
+# CHAT_TIMEOUT has to cover the whole turn including both extractions, the
+# routing call and a flashcard generation, and the API refuses to start if it
+# does not leave them room -- so raise them together or none.
 #
 # The run also holds one access token from registration to the last assertion,
 # and since Phase 6 that span routinely exceeds the 15-minute default TTL --
@@ -145,6 +153,7 @@ BIN="$(mktemp -d)/api"
   MEMORY_EXTRACT_TIMEOUT="${MEMORY_EXTRACT_TIMEOUT:-}" \
   GRAPH_EXTRACT_TIMEOUT="${GRAPH_EXTRACT_TIMEOUT:-}" \
   AGENT_TIMEOUT="${AGENT_TIMEOUT:-}" \
+  STUDY_GENERATE_TIMEOUT="${STUDY_GENERATE_TIMEOUT:-}" \
   exec "${BIN}" >"${LOG}" 2>&1) &
 API_PID=$!
 trap 'kill "${API_PID}" 2>/dev/null || true; wait "${API_PID}" 2>/dev/null || true' EXIT
@@ -242,7 +251,8 @@ ask() {
     > "$3"
 }
 
-# E2E_ONLY=actions, =calendar and =finance skip straight to their own check.
+# E2E_ONLY=actions, =calendar, =finance and =study skip straight to their own
+# check.
 if [ -z "${E2E_ONLY:-}" ]; then
 
 step "Uploading a text file"
@@ -708,11 +718,11 @@ fi # E2E_ONLY
 # claims_done <answer> -- warn when the model says a proposal was carried out.
 # It is a warning rather than a failure: what a 3B model writes is a matter of
 # wording, and the property that matters -- nothing was created -- is asserted
-# separately against the database. But it is exactly the lie rule 9 exists to
+# separately against the database. But it is exactly the lie the action rule exists to
 # prevent, so a run that shows it says so. Both the action check and the
 # calendar check use it, so it is defined outside them.
 # gives_advice <answer> -- warn when the answer tells the user what to do with
-# their money, which rule 9 of the system prompt forbids.
+# their money, which rule 10 of the system prompt forbids.
 #
 # A warning rather than a failure, for the same reason claims_done is one: what
 # a 3B model writes is a matter of wording, and the property that is actually
@@ -1123,9 +1133,237 @@ printf '     %s\n' "$(echo "${ADVICE_ANSWER}" | tr '\n' ' ' | head -c 300)"
 
 fi # E2E_ONLY: finance only
 
+# --- Phase 10a: the study module -------------------------------------------------
+#
+# The brief's end-to-end check, and the one that is not like the others: the
+# thing being approved is *content a model wrote*, so it is not enough to see
+# that a row appeared. Upload a document, ask for flashcards from it, confirm
+# the cards were proposed rather than saved *and that the proposal shows them*,
+# approve, confirm they exist -- and then confirm every answer actually traces
+# back to the uploaded text rather than to what the model happens to know.
+#
+# The document is written for that last check. It is short, factual, and about
+# something a 3B model has no prior opinion about, so a card it invented would
+# stand out: an invented answer cannot accidentally match a station name and a
+# set of made-up figures.
+#
+# This section uploads its own document, so E2E_ONLY=study runs on its own.
+
+if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "study" ]; then
+
+step "Uploading a document to study from"
+STUDY_FILE="$(mktemp -d)/relay-handbook.txt"
+cat > "${STUDY_FILE}" <<'TXT'
+Kestrel Relay Station -- operating handbook, section 4.
+
+The mast feed is switched to the auxiliary dipole whenever the standing wave
+ratio exceeds 2.4, and the changeover takes eleven seconds to complete.
+
+The battery bank is a set of six cells wired in series, and the whole bank is
+equalised every forty days. An equalisation charge runs at 58.4 volts.
+
+The ice shield is retracted before any equalisation charge, because the
+retraction motor draws from the same bus.
+TXT
+
+STUDY_DOC=$(curl -s -X POST "${API}/api/v1/documents" -H "${AUTH}" -F "file=@${STUDY_FILE}")
+STUDY_DOC_ID=$(expect "uploading the handbook" "${STUDY_DOC}" 'd["id"]')
+[ "$(expect "reading the upload" "${STUDY_DOC}" 'd["status"]')" = "ready" ] \
+  || fail "the handbook did not process: ${STUDY_DOC}"
+ok "uploaded relay-handbook.txt as $(echo "${STUDY_DOC}" | json 'd["chunk_count"]') chunk(s)"
+
+# card_count -- how many flashcards the user has under the study plan.
+card_count() {
+  local body
+  body=$(curl -s "${API}/api/v1/study-plans/$1/flashcards" -H "${AUTH}")
+  expect "listing the plan's flashcards" "${body}" 'd["count"]'
+}
+
+step "Creating a study plan for it"
+STUDY_PLAN=$(curl -s -X POST "${API}/api/v1/study-plans" -H "${AUTH}" \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json,sys;print(json.dumps({"title":"Kestrel relay handbook","document_id":sys.argv[1]}))' "${STUDY_DOC_ID}")")
+STUDY_PLAN_ID=$(expect "creating the study plan" "${STUDY_PLAN}" 'd["id"]')
+echo "${STUDY_PLAN}" | python3 -c '
+import sys, json
+p = json.load(sys.stdin)
+assert p["status"] == "active", "a new plan is %r" % p["status"]
+assert p["document"] == "relay-handbook.txt", "document is %r" % p["document"]
+assert p["card_count"] == 0, "a new plan has %r cards" % p["card_count"]
+' || fail "the plan is not what was asked for: ${STUDY_PLAN}"
+ok "created: $(echo "${STUDY_PLAN}" | json 'd["title"]'), built from $(echo "${STUDY_PLAN}" | json 'd["document"]')"
+
+step "Checking the plan's graph node"
+STUDY_NODES=$(curl -s "${API}/api/v1/knowledge-graph?type=project" -H "${AUTH}")
+echo "${STUDY_NODES}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+plans = [n for n in d["nodes"] if n["ref_table"] == "study_plans"]
+assert len(plans) == 1, "%d study-plan nodes, want 1" % len(plans)
+n = plans[0]
+assert n["ref_id"] == sys.argv[1], "the node mirrors %r" % n["ref_id"]
+assert n["type"] == "project", "the node is a %r" % n["type"]
+print("     %s (%s)" % (n["label"], n["type"]))
+' "${STUDY_PLAN_ID}" || fail "the plan has no graph node: ${STUDY_NODES}"
+ok "a study plan is mirrored as a project node, like every other mirrored row"
+
+step "Asking the assistant for flashcards from the document"
+STUDY_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+[ -n "${STUDY_CONV}" ] || fail "conversation was not created"
+[ "$(card_count "${STUDY_PLAN_ID}")" = "0" ] || fail "the plan has cards before any were asked for"
+
+MAKE="$(mktemp)"
+ask "${STUDY_CONV}" "Make flashcards from relay-handbook.txt for my Kestrel relay handbook plan." "${MAKE}"
+sse "${MAKE}" answer >/dev/null || fail "the flashcard turn failed"
+[ "$(sse "${MAKE}" action_frames)" = "1" ] || {
+  fail "the turn announced $(sse "${MAKE}" action_frames) action frame(s), want 1: $(sse "${MAKE}" answer | head -c 300)"
+}
+STUDY_ACTION="$(sse "${MAKE}" action)"
+STUDY_ACTION_ID=$(expect "reading the action frame" "${STUDY_ACTION}" 'd["id"]')
+
+# The proposal has to *be* the cards. Anything that only counted them would
+# leave the user approving sentences they had not read -- which for content
+# whose purpose is to be rehearsed until it is believed is the wrong way round.
+echo "${STUDY_ACTION}" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["tool_name"] == "generate_flashcards", "tool is %r" % a["tool_name"]
+assert a["status"] == "proposed", "status is %r" % a["status"]
+assert a["permission_level"] == "write", "permission is %r" % a["permission_level"]
+assert a["result"] is None, "a proposal has a result: %r" % a
+cards = a["input"].get("cards") or []
+assert cards, "the proposal carries no cards: %r" % a["input"]
+for c in cards:
+    assert c.get("front") and c.get("back"), "a proposed card is half written: %r" % c
+    # Every card is in the summary the user reads, both sides of it.
+    assert c["front"] in a["summary"], "the summary does not show %r" % c["front"]
+    assert c["back"] in a["summary"], "the summary does not show %r" % c["back"]
+print("     %d card(s) proposed" % len(cards))
+' || fail "the proposal does not show the cards it would create: ${STUDY_ACTION}"
+ok "proposed, with the cards in it"
+printf '%s\n' "$(echo "${STUDY_ACTION}" | json 'd["summary"]')" | sed 's/^/     /'
+claims_done "$(sse "${MAKE}" answer)"
+
+step "Checking they were proposed, not saved"
+[ "$(card_count "${STUDY_PLAN_ID}")" = "0" ] || fail "the cards exist before they were approved"
+ok "the plan still has no cards"
+
+step "Approving them"
+STUDY_APPROVED=$(curl -s -X POST "${API}/api/v1/actions/${STUDY_ACTION_ID}/approve" -H "${AUTH}")
+[ "$(expect "approving" "${STUDY_APPROVED}" 'd["status"]')" = "executed" ] \
+  || fail "approval did not execute: ${STUDY_APPROVED}"
+STUDY_CARDS=$(curl -s "${API}/api/v1/study-plans/${STUDY_PLAN_ID}/flashcards" -H "${AUTH}")
+
+# What was saved is exactly what was shown -- not a second generation, which
+# would store cards nobody had read.
+echo "${STUDY_CARDS}" | python3 -c '
+import sys, json
+saved = json.load(sys.stdin)["flashcards"]
+proposed = json.loads(sys.argv[1])["input"]["cards"]
+assert len(saved) == len(proposed), "%d cards saved, %d proposed" % (len(saved), len(proposed))
+for got, want in zip(saved, proposed):
+    assert got["front"] == want["front"], "saved %r, approved %r" % (got["front"], want["front"])
+    assert got["back"] == want["back"], "saved %r, approved %r" % (got["back"], want["back"])
+    assert got["document_id"] == sys.argv[2], "the card does not record its source: %r" % got
+' "${STUDY_ACTION}" "${STUDY_DOC_ID}" || fail "what was saved is not what was approved: ${STUDY_CARDS}"
+
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/actions/${STUDY_ACTION_ID}/approve" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "a second approval returned ${CODE}, want 409"
+[ "$(card_count "${STUDY_PLAN_ID}")" = "$(echo "${STUDY_CARDS}" | json 'd["count"]')" ] \
+  || fail "approving twice saved a second deck"
+ok "saved $(echo "${STUDY_CARDS}" | json 'd["count"]') card(s), byte for byte what was approved; a second approval is 409"
+
+step "Checking the cards actually say what the document says"
+# The point of the phase. Every answer has to trace back to the uploaded text,
+# so this runs the same test the service runs -- over the file on disk, not over
+# anything the API reported -- and fails the run if a card is about something
+# the handbook does not contain.
+# The cards go to a file rather than down a pipe: the heredoc below *is*
+# stdin, so a pipe into python3 is read as part of the script and the JSON
+# never arrives.
+STUDY_CARDS_JSON="$(mktemp)"
+printf '%s' "${STUDY_CARDS}" > "${STUDY_CARDS_JSON}"
+python3 - "${STUDY_FILE}" "${STUDY_CARDS_JSON}" <<'PYEOF' || fail "a saved flashcard is not grounded in the uploaded document"
+import sys, json, re
+
+STOP = set("""the and for with this that these those their they them its our your you has have
+had was were are been being will would can could should not but from into onto over than then
+about some any all also very who what which when where how why there here does did just more
+most such only own same too many much each both other another between under after before define
+definition describe explain name list state give according document passage text mentioned
+mentions says said call called known term mean means meaning answer question""".split())
+
+def words(s):
+    out, seen = [], set()
+    for w in re.findall(r"[0-9a-z']+", s.lower()):
+        w = w.strip("'")
+        if not any(ch.isdigit() for ch in w):
+            if len(w) < 3 or w in STOP:
+                continue
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out
+
+def same(a, b):
+    if a == b:
+        return True
+    if any(ch.isdigit() for ch in a + b):
+        return False
+    short, long = sorted((a, b), key=len)
+    return len(short) >= 4 and long.startswith(short)
+
+source = words(open(sys.argv[1]).read())
+cards = json.load(open(sys.argv[2]))["flashcards"]
+assert cards, "no cards to check"
+
+bad = []
+for c in cards:
+    ws = words(c["back"])
+    found = [w for w in ws if any(same(w, s) for s in source)]
+    # An unsupported figure sinks an answer outright: a wrong number is the
+    # part of a flashcard a learner is least able to check.
+    numbers = [w for w in ws if any(ch.isdigit() for ch in w) and w not in found]
+    if not ws or numbers or len(found) * 3 < len(ws) * 2:
+        bad.append((c, [w for w in ws if w not in found]))
+
+for c in cards:
+    print("     Q: %s" % c["front"])
+    print("     A: %s" % c["back"])
+if bad:
+    for c, missing in bad:
+        print("     NOT IN THE DOCUMENT: %r (words: %s)" % (c["back"], ", ".join(missing)))
+    sys.exit("%d of %d saved cards say something the handbook does not" % (len(bad), len(cards)))
+PYEOF
+ok "every saved answer traces back to relay-handbook.txt"
+
+step "Asking what the assistant is helping study"
+LOOK="$(mktemp)"
+ask "${STUDY_CONV}" "What study plans do I have?" "${LOOK}"
+sse "${LOOK}" answer >/dev/null || fail "the study-plan read turn failed"
+sse "${LOOK}" tool_sources | grep -qi "search_study_plans:.*Kestrel" \
+  || fail "the search did not run or did not find the plan: sources=$(sse "${LOOK}" tool_sources) types=$(sse "${LOOK}" types)"
+[ "$(sse "${LOOK}" action_frames)" = "1" ] || fail "the read was not announced"
+echo "$(sse "${LOOK}" action)" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["permission_level"] == "read" and a["status"] == "executed", "the read is %r" % a
+plans = a["result"]["study_plans"]
+assert any(p["title"] == "Kestrel relay handbook" for p in plans), "the plans found were %r" % plans
+assert any(p["card_count"] > 0 for p in plans), "the plan reports no cards: %r" % plans
+' || fail "the read did not return the plan and its deck size: $(sse "${LOOK}" action)"
+[ "$(card_count "${STUDY_PLAN_ID}")" != "0" ] || fail "a read emptied the deck"
+ok "search_study_plans ran without approval; $(sse "${LOOK}" tool_cited) cited"
+printf '     %s\n' "$(sse "${LOOK}" answer | tr '\n' ' ' | head -c 300)"
+
+fi # E2E_ONLY: study only
+
 case "${E2E_ONLY:-}" in
   actions)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n' ;;
   calendar) printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> on the calendar -> node -> read back\n' ;;
   finance)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> recorded -> node -> totalled -> not advised\n' ;;
-  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total\n' ;;
+  study)    printf '\n\033[32mPASS\033[0m upload -> plan -> node -> generate -> propose (with the cards) -> approve -> saved -> grounded -> read back\n' ;;
+  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total -> study -> generate -> ground\n' ;;
 esac

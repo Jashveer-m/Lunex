@@ -473,6 +473,8 @@ func anchorFor(r tools.Result) *graph.Anchor {
 		return &graph.Anchor{RefTable: "notes", RefID: r.Notes[0].ID, Label: r.Notes[0].Title}
 	case len(r.Events) > 0:
 		return &graph.Anchor{RefTable: "calendar_events", RefID: r.Events[0].ID, Label: r.Events[0].Title}
+	case len(r.Plans) > 0:
+		return &graph.Anchor{RefTable: "study_plans", RefID: r.Plans[0].ID, Label: r.Plans[0].Title}
 	}
 	return nil
 }

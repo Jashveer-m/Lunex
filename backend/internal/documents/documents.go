@@ -85,6 +85,26 @@ type SearchResult struct {
 	Similarity float64
 }
 
+// Passage is one stored chunk read back by position rather than by similarity.
+//
+// It is what a caller wants when the question is "what does this document
+// say", with no query to rank against -- Phase 10a's flashcard generation is
+// the first. It is deliberately not a SearchResult: nothing scored it, and a
+// Similarity field carrying a zero that means "not measured" reads exactly
+// like one meaning "no resemblance at all".
+type Passage struct {
+	ChunkID    uuid.UUID
+	DocumentID uuid.UUID
+	Filename   string
+	ChunkIndex int
+	Content    string
+}
+
+// MaxPassages bounds one read of a document's text. A document can be 800
+// chunks (MaxChunks) and no caller of this wants all of them in a prompt; the
+// caller names how many it needs and this is the ceiling on that.
+const MaxPassages = 50
+
 // UploadInput is a validated file ready to be processed.
 type UploadInput struct {
 	Filename string

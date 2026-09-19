@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -136,6 +137,26 @@ func (f *fakeStore) Search(_ context.Context, userID uuid.UUID, embedding []floa
 	}
 	if len(out) > q.Limit {
 		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+// Passages is the same store read in document order, which is what the
+// no-query read returns.
+func (f *fakeStore) Passages(_ context.Context, userID, documentID uuid.UUID, limit int) ([]Passage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	out := []Passage{}
+	if _, mine := f.byUser[userID][documentID]; !mine {
+		return out, nil
+	}
+	for _, c := range f.chunks[documentID] {
+		out = append(out, Passage{DocumentID: documentID, ChunkIndex: c.Index, Content: c.Content})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ChunkIndex < out[j].ChunkIndex })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

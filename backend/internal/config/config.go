@@ -15,6 +15,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/embeddings"
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
+	"github.com/jashveer/lifeos/backend/internal/study"
 )
 
 type Config struct {
@@ -132,17 +133,37 @@ type Config struct {
 	AgentTimeout     time.Duration
 	AgentMaxTokens   int
 	AgentTemperature float64
+
+	// Phase 10a: the study module.
+	//
+	// StudyModel overrides the chat model for writing flashcards. Empty means
+	// the same model answers and writes them. Unlike the extractions, a bigger
+	// model is the reasonable override here: what this call produces is read
+	// by a person, repeatedly, as a study aid.
+	StudyModel string
+	// StudyGenerateTimeout bounds one flashcard generation. Like the routing
+	// call it is spent *before* the first token -- the cards are written while
+	// the proposal is being prepared -- so it comes out of the same
+	// ChatTimeout budget and is counted by the MaxExtractionShare check below.
+	StudyGenerateTimeout time.Duration
+	StudyMaxTokens       int
+	StudyTemperature     float64
+	// StudyJSONMode asks the provider to constrain generation to well-formed
+	// JSON. Off by default, for the reason MemoryJSONMode is.
+	StudyJSONMode bool
 }
 
 // DefaultChatTimeout is the budget for one whole turn; see Config.ChatTimeout
 // for why it grew from three minutes to six.
 //
-// It is eighteen now, because the three calls in the turn's tail defaulted to
-// 60s each and llama3.2:3b on the development machine measurably needs more
-// than that (one extraction was measured at 79s). They default to 180s, and
-// MaxExtractionShare needs the turn to be at least twice their sum: 3 x 180s x
-// 2 = 18m, which is also what scripts/e2e.sh recommends.
-const DefaultChatTimeout = 18 * time.Minute
+// It is twenty-four now. The calls around the answer default to 180s each --
+// 60s was measurably too short for llama3.2:3b on the development machine, one
+// extraction having been measured at 79s -- and MaxExtractionShare needs the
+// turn to be at least twice their sum. Phase 10a made that four calls rather
+// than three, because writing flashcards from a document is a model call on
+// the path to the proposal: 4 x 180s x 2 = 24m, which is also what
+// scripts/e2e.sh recommends.
+const DefaultChatTimeout = 24 * time.Minute
 
 // MaxExtractionShare is how much of ChatTimeout the model calls that are not
 // the answer -- the two extractions after it and, since Phase 7, the routing
@@ -221,6 +242,10 @@ func Load() (Config, error) {
 		AgentModel:       os.Getenv("AGENT_MODEL"),
 		AgentMaxTokens:   agents.DefaultMaxTokens,
 		AgentTemperature: agents.DefaultTemperature,
+
+		StudyModel:       os.Getenv("STUDY_MODEL"),
+		StudyMaxTokens:   study.DefaultGenerationMaxTokens,
+		StudyTemperature: study.DefaultGenerationTemperature,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -289,6 +314,22 @@ func Load() (Config, error) {
 	if cfg.AgentTemperature, err = floatOr("AGENT_TEMPERATURE", cfg.AgentTemperature, 0, 2); err != nil {
 		return Config{}, err
 	}
+	if cfg.StudyGenerateTimeout, err = durationOr("STUDY_GENERATE_TIMEOUT", study.DefaultGenerationTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.StudyTemperature, err = floatOr("STUDY_TEMPERATURE", cfg.StudyTemperature, 0, 2); err != nil {
+		return Config{}, err
+	}
+	if cfg.StudyJSONMode, err = boolOr("STUDY_JSON_MODE", cfg.StudyJSONMode); err != nil {
+		return Config{}, err
+	}
+	if v := os.Getenv("STUDY_MAX_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("STUDY_MAX_TOKENS: want a positive integer, got %q", v)
+		}
+		cfg.StudyMaxTokens = n
+	}
 	if v := os.Getenv("AGENT_MAX_TOKENS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
@@ -340,17 +381,24 @@ func Load() (Config, error) {
 	// they cannot be allowed to eat all of it. Refusing to boot rather than
 	// degrading is the same choice JWT_SECRET makes: the degraded version of
 	// this is a turn that answers correctly and reports itself as failed.
-	routing := time.Duration(0)
+	//
+	// Both the routing call and one flashcard generation are counted, and only
+	// when the tools are on: they are the two model calls that can run before
+	// the first token, and a turn that routes to generate_flashcards makes
+	// both.
+	routing, generating := time.Duration(0), time.Duration(0)
 	if cfg.AgentTools {
-		routing = cfg.AgentTimeout
+		routing, generating = cfg.AgentTimeout, cfg.StudyGenerateTimeout
 	}
-	if tail := cfg.MemoryExtractTimeout + cfg.GraphExtractTimeout + routing; tail > time.Duration(float64(cfg.ChatTimeout)*MaxExtractionShare) {
+	tail := cfg.MemoryExtractTimeout + cfg.GraphExtractTimeout + routing + generating
+	if tail > time.Duration(float64(cfg.ChatTimeout)*MaxExtractionShare) {
 		return Config{}, fmt.Errorf(
 			"CHAT_TIMEOUT (%s) leaves only %s for retrieval and generation after "+
-				"MEMORY_EXTRACT_TIMEOUT (%s), GRAPH_EXTRACT_TIMEOUT (%s) and AGENT_TIMEOUT (%s), "+
-				"which run inside it; raise CHAT_TIMEOUT to at least %s, or lower the others",
+				"MEMORY_EXTRACT_TIMEOUT (%s), GRAPH_EXTRACT_TIMEOUT (%s), AGENT_TIMEOUT (%s) and "+
+				"STUDY_GENERATE_TIMEOUT (%s), which run inside it; "+
+				"raise CHAT_TIMEOUT to at least %s, or lower the others",
 			cfg.ChatTimeout, cfg.ChatTimeout-tail,
-			cfg.MemoryExtractTimeout, cfg.GraphExtractTimeout, routing, 2*tail)
+			cfg.MemoryExtractTimeout, cfg.GraphExtractTimeout, routing, generating, 2*tail)
 	}
 
 	if v := os.Getenv("LOGIN_RATE_LIMIT_BURST"); v != "" {

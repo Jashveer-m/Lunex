@@ -61,6 +61,8 @@ const (
 	NodeExpense = "expense"
 	NodeSkill   = "skill"
 	NodePerson  = "person"
+	// NodeProject is both: a conversation can name a project that has no row
+	// anywhere, and Phase 10a mirrors a study plan as one. See refTableTypes.
 	NodeProject = "project"
 )
 
@@ -69,13 +71,28 @@ const (
 var NodeTypes = []string{NodeTask, NodeGoal, NodeNote, NodeDocument, NodeEvent, NodeExpense,
 	NodeSkill, NodePerson, NodeProject}
 
-// ExtractedTypes are the node types a conversation can create, and therefore
-// the only ones a user is allowed to delete directly. The rest are mirrors.
+// ExtractedTypes are the node types a conversation can create.
+//
+// It is not the same thing as "the ones a user may delete": since Phase 10a a
+// `project` node may also mirror a study plan, and what makes a node
+// undeletable is that it has a ref_table, not that its type is in this list.
+// DeleteNode asks Node.Extracted.
 var ExtractedTypes = []string{NodeSkill, NodePerson, NodeProject}
 
 // The tables a node can mirror, and the node type each produces. This map is
 // the only place the correspondence is written down, and its keys are the same
-// six strings the ref_table CHECK constraint allows.
+// seven strings the ref_table CHECK constraint allows.
+//
+// `study_plans` is the one entry whose type is not its own: a plan is mirrored
+// as a `project`, which 000006 introduced for "a piece of work being worked
+// towards". Phase 10a deliberately introduces no eighth node type for it --
+// `skill` would be wrong (a plan is not the subject it is about, and would
+// collide with the skill node an extraction writes for that subject), and a
+// `study_plan` type would be a new kind of node for a thing the graph already
+// has a word for. The consequence worth naming: a `project` node may now be
+// mirrored *or* extracted, so "is this node backed by a row" is
+// Node.Extracted -- ref_table -- and never the type. DeleteNode already asks
+// it that way.
 var refTableTypes = map[string]string{
 	"tasks":           NodeTask,
 	"goals":           NodeGoal,
@@ -83,6 +100,7 @@ var refTableTypes = map[string]string{
 	"documents":       NodeDocument,
 	"calendar_events": NodeEvent,
 	"expenses":        NodeExpense,
+	"study_plans":     NodeProject,
 }
 
 // TypeForRefTable reports the node type a mirrored table produces, and whether

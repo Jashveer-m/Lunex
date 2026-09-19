@@ -15,6 +15,11 @@
 | Exact money: parsing, refusals, JSON round trip, arithmetic that does not drift | `internal/finance/validate_test.go` | no |
 | Finance use cases: ownership, per-currency totals, inclusive ranges, categories (fakes) | `internal/finance/service_test.go` | no |
 | Expense node sync, and the label that is never the bare word "expense" (fakes) | `internal/finance/graph_test.go` | no |
+| Study validation: plan fields, the closed status set, both sides of a card, the clamped count | `internal/study/validate_test.go` | no |
+| Study use cases: ownership, decks, and generation that proposes without writing (fakes + MockProvider) | `internal/study/service_test.go` | no |
+| **The grounding rule**: what a flashcard may say, what it may not, and why a number is exact | `internal/study/grounding_test.go` | no |
+| Flashcard parsing, the prompt, and the worked example that shares no words with the document | `internal/study/generate_test.go` | no |
+| Study-plan node sync as a `project`, and flashcards getting no node (fakes) | `internal/study/graph_test.go` | no |
 | Chunking, text extraction, filename and query rules | `internal/documents/{chunk,extract,validate}_test.go` | no |
 | Document pipeline use cases (fake store + fake embedder) | `internal/documents/service_test.go` | no |
 | Ollama client: batching, widths, outages | `internal/embeddings/ollama_test.go` | no |
@@ -38,18 +43,22 @@
 | Routing quality against a real model (opt-in: `LUNEX_ROUTING_EVAL=1`) | `internal/agents/ollama_eval_test.go` | no, but Ollama |
 | Memory extraction against a real model: non-work preferences, proposals, restated documents (opt-in: `LUNEX_MEMORY_EVAL=1`) | `internal/memories/ollama_eval_test.go` | no, but Ollama |
 | Action engine: approve/reject, single use, sanitized failures, strict bodies (in-memory store) | `internal/actions/*_test.go` | no |
-| Orchestrator: proposals, reads as sources, the ACTIONS section, rule 9 (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
+| Orchestrator: proposals, reads as sources, the ACTIONS section, the action rule (fakes + MockProvider) | `internal/chat/tools_test.go` | no |
 | Orchestrator: the calendar heuristic, event sources, proposing an event (fakes + MockProvider) | `internal/chat/calendar_test.go` | no |
 | Orchestrator: the financial-advice framing, spending totals as a source, proposing an expense (fakes + MockProvider) | `internal/chat/finance_test.go` | no |
+| Study tools: the proposal that carries the cards, approval writing exactly them, the derived key (fakes) | `internal/tools/study_tools_test.go` | no |
+| Orchestrator: the study rule, a plan as a source, and cards never being one (fakes + MockProvider) | `internal/chat/study_test.go` | no |
 | Moments and windows: times of day, named stretches, what is not a date | `internal/tools/moments_test.go` | no |
 | Phase 6 SQL: graph constraints, upserts, 1-hop queries, the delete trigger | `internal/db/phase6_integration_test.go` | **yes** |
 | Phase 7 SQL: the approval gate, constraints, turn atomicity, cascades, the `q` filter | `internal/db/phase7_integration_test.go` | **yes** |
 | Phase 8 SQL: the overlap query, the interval CHECK, the two cascades, the event node | `internal/db/phase8_integration_test.go` | **yes** |
 | Phase 9 SQL: the numeric column, the summary GROUP BY, the category seed trigger, cascades, the expense node | `internal/db/phase9_integration_test.go` | **yes** |
+| Phase 10a SQL: the computed card count, the two cascades that differ, the ordered passage read, the plan's `project` node | `internal/db/phase10_integration_test.go` | **yes** |
 | Cross-user isolation over the whole stack, documents included | `internal/api/isolation_test.go` | **yes** |
 | Phase 7 over HTTP: propose → approve/reject, concurrency, isolation | `internal/api/actions_isolation_test.go` | **yes** |
 | Phase 8 over HTTP: calendar isolation, foreign links, the required range, overlap, node sync | `internal/api/calendar_isolation_test.go` | **yes** |
 | Phase 9 over HTTP: expense isolation (totals included), foreign links, exact amounts, the seeded categories, node sync | `internal/api/finance_isolation_test.go` | **yes** |
+| Phase 10a over HTTP: plan and card isolation, foreign document links, the deck cascade, strict bodies, node sync | `internal/api/study_isolation_test.go` | **yes** |
 | The whole pipeline and the assistant against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
 
 ## Running
@@ -294,6 +303,39 @@ the prompt the model was handed — is asserted in
 `E2E_ONLY=finance ./scripts/e2e.sh` runs only the preflight, registration and
 this check.
 
+Since Phase 10a it ends with the study check, and this one is not like the
+others. Everywhere else the thing being approved is a restatement of what the
+user said — a title, an amount, a time — and seeing the row appear is enough.
+Here it is **content a model wrote**, so the check goes further:
+
+- **a document to study from** — the step uploads its own `relay-handbook.txt`,
+  a short factual handbook about a made-up relay station, so a card the model
+  invented cannot accidentally match it;
+- **a plan, and its node** — `POST /study-plans` naming the document, and
+  `GET /knowledge-graph?type=project` must hold one node mirroring it. It is a
+  `project`, which is the one mirrored type whose name is not its table's;
+- **ask for cards** — "Make flashcards from relay-handbook.txt for my Kestrel
+  relay handbook plan." must produce one `action` frame naming
+  `generate_flashcards`, proposed, whose stored input **carries the cards** and
+  whose summary shows both sides of every one. A proposal that only counted
+  them would leave the user approving sentences they had not read;
+- **proposed, not saved** — the plan's deck must still be empty;
+- **approve it** — what is saved must be *byte for byte* what was shown, each
+  card recording the document it came from, and a second approval must be `409`
+  without saving a second deck. Approving must not generate again;
+- **grounded** — every saved answer is checked against the uploaded file, by
+  the same rule `internal/study/grounding.go` applies: at least two thirds of
+  its content words have to be in the handbook, and an unsupported figure sinks
+  it outright. **This one fails the run.** It is the phase's whole claim, and
+  the only place it is measured against a real model rather than a scripted
+  one;
+- **read it back** — "What study plans do I have?" must run
+  `search_study_plans`, surface the plan as a `tool` source with its deck size,
+  and change nothing.
+
+`E2E_ONLY=study ./scripts/e2e.sh` runs only the preflight, registration and
+this check — it uploads its own document, so it stands alone.
+
 The script builds the API and runs the binary directly, and refuses to start if
 anything already answers on its port (`E2E_PORT`, default 8099). Before Phase 7
 it started the server with `go run` and killed the `go run` process on exit,
@@ -305,9 +347,10 @@ contained.
 A run against a cold model takes several minutes: the first turn includes
 loading llama3.2:3b into memory, and since Phase 6 each substantial turn makes
 *three* model calls rather than one (four since Phase 7, when the message looks
-like it asks for a tool) — the answer, the memory extraction and the
-relationship extraction, in that order and in sequence, because they all queue
-behind the same resident model.
+like it asks for a tool, and **five** since Phase 10a when that tool is
+`generate_flashcards`) — the routing call, the generation, the answer, the
+memory extraction and the relationship extraction, in that order and in
+sequence, because they all queue behind the same resident model.
 
 ### When the extraction steps come back empty
 
@@ -318,20 +361,32 @@ for `MEMORY_EXTRACT_TIMEOUT` produces a green chat run and then an empty
 `/memories`, with nothing in the output saying why. The script now greps the
 API log and prints a hint when that is what happened.
 
-The defaults are 60 seconds each. One memory extraction against llama3.2:3b has
-been measured at **79 seconds** on a 2019 Intel Mac — producing perfectly good
-output, just not inside the budget. Both timeouts and the turn budget are
-passed through to the API, so raise all three together:
+The defaults are 180 seconds each. One memory extraction against llama3.2:3b
+has been measured at **79 seconds** on a 2019 Intel Mac — producing perfectly
+good output, just not inside the budget.
+
+The **routing call** is the one to watch since Phase 10a, and it is worth
+naming because it is the least obvious. It got slower without anybody making it
+slower: the routing prompt renders every offered tool, and Phase 10a added
+three, so the prompt is now about 8,300 characters and the model has to
+evaluate all of it before writing a word. Measured on the same machine: one
+routing decision at 16 tools takes **3m08s**, over a 180s default — and it
+fails as `model_unavailable` on the *first* turn of the study check rather than
+as anything about study. The decision itself was correct; it simply did not
+arrive in time.
+
+The timeouts and the turn budget are all passed through to the API, so raise
+them together:
 
 ```sh
-MEMORY_EXTRACT_TIMEOUT=240s GRAPH_EXTRACT_TIMEOUT=240s AGENT_TIMEOUT=240s CHAT_TIMEOUT=24m \
-  ./scripts/e2e.sh
+MEMORY_EXTRACT_TIMEOUT=300s GRAPH_EXTRACT_TIMEOUT=300s AGENT_TIMEOUT=420s \
+  STUDY_GENERATE_TIMEOUT=420s CHAT_TIMEOUT=50m ./scripts/e2e.sh
 ```
 
-`CHAT_TIMEOUT` has to cover the whole turn *including* both extractions and the
-routing call, and `config.Load` refuses to start a process where they would take
-more than half of it — so raising one without the others is a boot error rather than
-a mystery.
+`CHAT_TIMEOUT` has to cover the whole turn *including* both extractions, the
+routing call and a flashcard generation, and `config.Load` refuses to start a
+process where they would take more than half of it — so raising one without the
+others is a boot error rather than a mystery.
 
 One other thing got slower rather than merely longer: the run holds a single
 access token from registration to the last assertion, and that span now

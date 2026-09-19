@@ -24,6 +24,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 	"github.com/jashveer/lifeos/backend/internal/tools"
 	"github.com/jashveer/lifeos/backend/internal/users"
@@ -82,6 +83,15 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	noteSvc := notes.NewService(notes.NewRepository(pool), notes.WithNodeSync(graphSvc))
 	calendarSvc := calendar.NewService(calendar.NewRepository(pool), calendar.WithNodeSync(graphSvc))
 	financeSvc := finance.NewService(finance.NewRepository(pool), finance.WithNodeSync(graphSvc))
+	// Phase 10a runs on the same mock model and the real document service:
+	// what these tests measure is whose plans and cards a request can reach
+	// and whether the approval path writes them, not whether a model wrote a
+	// good flashcard -- which is internal/study's own business and, against a
+	// real model, scripts/e2e.sh's.
+	studySvc := study.NewService(study.Deps{
+		Store: study.NewRepository(pool), Library: docSvc, Provider: provider,
+		Graph: graphSvc, Logger: discard,
+	})
 	// The assistant runs against a mock model for the same reason the document
 	// tests run against a deterministic embedder: what these tests measure is
 	// the routing and the SQL scoping, not whether a model understood a
@@ -100,7 +110,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 	actionRepo := actions.NewRepository(pool)
 	registry, err := tools.NewRegistry(actionRepo, tools.Standard(tools.Services{
 		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Documents: docSvc,
-		Calendar: calendarSvc, Finance: financeSvc,
+		Calendar: calendarSvc, Finance: financeSvc, Study: studySvc,
 		DocumentMinSimilarity: 0.5,
 	})...)
 	if err != nil {
@@ -135,6 +145,7 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Notes:       notes.NewHandler(noteSvc, discard),
 		Calendar:    calendar.NewHandler(calendarSvc, discard),
 		Finance:     finance.NewHandler(financeSvc, discard),
+		Study:       study.NewHandler(studySvc, discard),
 		Documents:   documents.NewHandler(docSvc, discard, 0),
 		Chat:        chat.NewHandler(chatSvc, discard),
 		Memories:    memories.NewHandler(memorySvc, discard),

@@ -270,7 +270,7 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		})
 	case errors.Is(err, ErrNodeIsBacked):
 		httpx.WriteError(w, http.StatusConflict, "node_is_backed",
-			"This node mirrors a task, goal, note or document and follows it. "+
+			"This node mirrors a record you have and follows it. "+
 				"Delete that record instead and the node goes with it.")
 	case errors.Is(err, ErrNotFound):
 		httpx.NotFound(w, "graph node or edge")

@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–9)
+# Lunex API — v1 (Phases 1–10a)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -741,6 +741,171 @@ and `{"description": null}` clears the description; `amount`, `currency` and
 Deleting a **category** an expense was filed under does not delete the expense:
 `category_id` becomes `null` and the money is still spent. The same for a
 receipt.
+
+---
+
+# Phase 10a — study plans and flashcards
+
+A **study plan** is something you are studying, optionally built from a
+document you have uploaded. A **flashcard** is a front and a back, filed under
+a plan or under nothing, and — when it was generated rather than typed —
+carrying the id of the document its answer came from.
+
+That is all a card has this phase. There is no review state, no due date, no
+ease factor and no counter of how it went: reviewing a card is 10c and 10d, and
+a column that nothing reads for two phases would be the wrong column when they
+arrive.
+
+**Generating cards is not an endpoint.** Writing flashcards from a document
+costs a model call and produces content you have to read before it is yours, so
+it happens through the assistant — the `generate_flashcards` tool — and reaches
+the database only through an approval. What the approval card shows is the
+cards themselves, both sides of every one, not "create 8 flashcards". See
+[Actions](#actions) and [decisions.md](decisions.md).
+
+`POST /study-plans/{id}/flashcards` below is the direct path, and it takes a
+card you wrote yourself. It needs no approval: approval stands between the
+assistant and your data, not between you and your own.
+
+## Study plans
+
+### `GET /api/v1/study-plans`
+
+| Parameter | Meaning |
+| --- | --- |
+| `status` | `active`, `completed` or `abandoned` |
+| `document_id` | only the plans built from one document |
+| `q` | plans whose title or description contains this, case-insensitively and literally |
+| `sort` | `created_at`, `updated_at`, `title`, each with a `-` prefix for descending. Default `-created_at` |
+| `limit`, `offset` | default 50, max 200 |
+
+```json
+{
+  "study_plans": [
+    {
+      "id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "title": "Kestrel relay handbook",
+      "description": "section 4, the battery bank",
+      "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "document": "relay-handbook.txt",
+      "status": "active",
+      "card_count": 6,
+      "created_at": "2026-09-19T10:02:11.004Z",
+      "updated_at": "2026-09-19T10:02:11.004Z"
+    }
+  ],
+  "count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`document` is the filename beside the id, so a client renders a row without a
+second request. Both are `null` for a plan built from no document, and **both
+become `null` when the document is deleted** — the plan and its cards survive
+it. `card_count` is counted on read, so it cannot disagree with the cards.
+
+### `POST /api/v1/study-plans`
+
+```json
+{
+  "title": "Kestrel relay handbook",
+  "description": "section 4, the battery bank",
+  "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "active"
+}
+```
+
+Only `title` is required. `status` defaults to `active`. `document_id` must be
+a document **you** own; somebody else's is `404 not_found`, not a validation
+error — a 403 would confirm the id is real.
+
+`201 Created` — the plan object. A new plan gets a knowledge-graph node of type
+`project`, labelled with its title.
+
+### `GET /api/v1/study-plans/{id}`
+
+`200 OK` — the plan object. `404 not_found` for an id that is not yours or does
+not exist, and for a malformed one.
+
+### `PATCH /api/v1/study-plans/{id}`
+
+Any subset of the create fields. `{"description": null}` clears the
+description and `{"document_id": null}` un-links the document; `title` and
+`status` are required columns, so `null` for either is `400`. Renaming a plan
+renames its graph node.
+
+`200 OK` — the updated plan object.
+
+### `DELETE /api/v1/study-plans/{id}`
+
+`204 No Content`. **The plan's flashcards go with it**, and so does its graph
+node. Deleting a plan is how you throw a deck away; a card filed under no plan
+is untouched.
+
+---
+
+## Flashcards
+
+### `GET /api/v1/study-plans/{id}/flashcards`
+
+| Parameter | Meaning |
+| --- | --- |
+| `limit`, `offset` | default 200, max 500 |
+
+The paging is looser than everywhere else on purpose: a deck is meant to be
+read whole, and a client that has to page through 50-card windows will just ask
+four times.
+
+```json
+{
+  "flashcards": [
+    {
+      "id": "d2719b3a-1c9b-4f01-8b2e-27d5c6b4a911",
+      "study_plan_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "front": "How long does the changeover to the auxiliary dipole take?",
+      "back": "Eleven seconds.",
+      "created_at": "2026-09-19T10:04:55.281Z"
+    }
+  ],
+  "count": 1,
+  "limit": 200,
+  "offset": 0
+}
+```
+
+Cards come back oldest first — the order they were made in, which for a
+generated deck is the order of the document they came from.
+
+`document_id` is the card's **provenance**: the document its answer was drawn
+from, or `null` for a card you typed. It is not borrowed from the plan. A plan
+built from a file does not make a hand-written card a claim about that file.
+
+A plan that is not yours is `404 not_found` rather than an empty deck: "no
+cards" and "no such plan" are different answers, and only the first is true of
+an empty plan you own.
+
+### `POST /api/v1/study-plans/{id}/flashcards`
+
+```json
+{ "front": "How long does the changeover take?", "back": "Eleven seconds." }
+```
+
+Both sides are required and neither may be blank: a card with nothing on the
+back is not an incomplete card, it is one that will be shown to somebody trying
+to learn with nothing to learn. Whitespace inside each side is collapsed.
+
+`201 Created` — the card object, with `document_id: null`.
+
+### `DELETE /api/v1/flashcards/{id}`
+
+`204 No Content`. A card is addressed at the top level rather than under its
+plan, because it may belong to no plan.
+
+There is no `PATCH` for a card: there is nothing to change on one that is not
+"write a different card". And there is no unfiltered `GET /flashcards` — the
+only slice of a deck anybody wants is one plan's.
 
 ---
 
@@ -1505,6 +1670,9 @@ none can delete.
 | `analyze_spending` | read | totals over a period, broken down by category and kept separate per currency; this month when the message gave no dates |
 | `create_calendar_event` | write | title and start, and optionally end or duration, all-day, location, description |
 | `create_expense` | write | amount, and optionally currency, category, description, date (today if not stated — shown in the proposal) |
+| `search_study_plans` | read | what you are studying, what each plan is built from, and how big its deck is, optionally by status |
+| `create_study_plan` | write | title, and optionally a description and one of your uploaded documents |
+| `generate_flashcards` | write | writes flashcards from one of your documents and proposes them — **the cards themselves are the proposal** |
 
 **A read runs during the turn.** When a message looks like it asks to find
 something, the model may choose a search; it runs immediately, what it found
@@ -1550,6 +1718,29 @@ can be run again.
 When the assistant reports spending it states what your own records show. It is
 not a financial adviser, does not claim to be one, and does not tell you what to
 do with your money; the rule is in the system prompt and is checked by a test.
+
+`generate_flashcards` is the one write whose proposal is **content** rather
+than a restatement of something you said, and it is built differently because
+of it. The cards are written while the proposal is being prepared, not when you
+approve it, so the summary you read is the actual questions and answers — every
+one of them, both sides. Approving stores exactly those rows; nothing is
+generated a second time, and the same proposal always writes the same cards.
+
+Every card is checked against the document before you are shown it. At least
+two thirds of an answer's content words have to appear in the passages the
+model was given, and a figure that does not appear in them drops the card
+outright — so a plausible invention produces no card rather than one you cannot
+tell apart from a real one. The count of what was dropped is logged. If nothing
+survives, the assistant says the document does not have enough on the subject
+to make cards from, and proposes nothing.
+
+A `topic` the document does not cover is declined with a question rather than
+answered with the start of the file, and a document name matching more than one
+of yours is declined with the candidates: a deck from the wrong lecture looks
+perfectly well made.
+
+The assistant can see that a plan has a deck and how big it is; it cannot see
+what is on any card, and the system prompt forbids it from saying.
 
 ```
 read:   (runs during the turn) ─▶ executed | failed
@@ -1654,6 +1845,8 @@ edited and does not expire. See `docs/decisions.md`.
 | `category` | 100 characters |
 | `name` (expense categories) | 1–100 characters, whitespace collapsed |
 | `description` (expenses) | 1,000 characters |
+| `front`, `back` (flashcards) | 1–1,000 characters each, whitespace collapsed |
+| `topic` (flashcard generation) | 200 characters |
 | `amount` | greater than 0, at most 9,999,999,999.99, at most two decimal places |
 | `currency` | exactly 3 letters |
 | `location` (events) | 500 characters |
@@ -1667,6 +1860,10 @@ edited and does not expire. See `docs/decisions.md`.
 | list `q` (tasks, goals, notes, calendar, expenses) | 200 characters |
 | calendar window (`end` − `start`) | 10 years |
 | expense list paging | default 50, max 200 |
+| study-plan list paging | default 50, max 200 |
+| flashcard list paging | default 200, max 500 |
+| flashcards per generation | default 8, max 20 |
+| passages per generation | 8 chunks, 6,000 characters |
 | chat message `content` | 8,000 characters |
 | memory `content` | 1,000 characters |
 | graph node `label` | 200 characters; an extracted name is also capped at 8 words |

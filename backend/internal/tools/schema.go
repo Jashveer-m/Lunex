@@ -16,9 +16,16 @@ type Schema struct {
 
 // InputSchema is the tool's input as JSON Schema, generated from its Params so
 // the two cannot disagree.
+//
+// It describes what a *model* may write, so a derived parameter is left out:
+// offering a key the tool fills in itself would invite a provider with native
+// tool calling to fill it in instead. See Param.Derived.
 func (t Tool) InputSchema() Schema {
 	s := Schema{Type: "object", Properties: make(map[string]Schema, len(t.Params))}
 	for _, p := range t.Params {
+		if !p.Offered() {
+			continue
+		}
 		prop := Schema{Type: p.Type, Description: p.Description, Enum: p.Enum}
 		if p.Type == "array" {
 			prop.Items = &Schema{Type: "string"}

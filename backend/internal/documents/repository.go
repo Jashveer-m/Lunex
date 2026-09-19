@@ -190,6 +190,48 @@ func (r *Repository) Delete(ctx context.Context, userID, id uuid.UUID) error {
 	return nil
 }
 
+// Passages returns one document's chunks in the order they appear in it,
+// owner-scoped.
+//
+// It is the read behind "what does this document say" -- a question with no
+// query to rank against -- and it is a plain indexed scan of
+// document_chunks.document_id rather than a vector search: there is nothing to
+// be near to, and the first chunks of a document are the ones a reader would
+// start with.
+//
+// The owner is in the WHERE clause on the chunk itself, not only on the
+// document: another user's document produces no rows here for the same
+// structural reason it produces none anywhere else.
+func (r *Repository) Passages(ctx context.Context, userID, documentID uuid.UUID, limit int) ([]Passage, error) {
+	if limit <= 0 || limit > MaxPassages {
+		limit = MaxPassages
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT c.id, c.document_id, d.filename, c.chunk_index, c.content
+		FROM document_chunks c
+		JOIN documents d ON d.id = c.document_id AND d.user_id = c.user_id
+		WHERE c.user_id = $1 AND c.document_id = $2
+		ORDER BY c.chunk_index ASC
+		LIMIT $3`, userID, documentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select document passages: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Passage{}
+	for rows.Next() {
+		var p Passage
+		if err := rows.Scan(&p.ChunkID, &p.DocumentID, &p.Filename, &p.ChunkIndex, &p.Content); err != nil {
+			return nil, fmt.Errorf("scan document passage: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate document passages: %w", err)
+	}
+	return out, nil
+}
+
 // efSearch is how many candidates the HNSW graph walk keeps in flight.
 //
 // It matters more than usual here because every search is filtered by

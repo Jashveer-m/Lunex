@@ -15,15 +15,21 @@ import type { Action } from '../lib/types'
 import { IconCheck, IconSearch, IconShield, IconX } from './icons'
 import { Button, Spinner, cx } from './ui'
 
+// A label per tool, where `humanize` on the name would read oddly. A tool
+// that is not here falls back to it, which is why this list is shorter than
+// the registry.
 const TOOL_LABELS: Record<string, string> = {
   create_task: 'Create task',
   update_task: 'Update task',
   create_goal: 'Create goal',
   create_note: 'Create note',
+  create_study_plan: 'Create study plan',
+  generate_flashcards: 'Save flashcards',
   search_tasks: 'Searched tasks',
   search_goals: 'Searched goals',
   search_notes: 'Searched notes',
   search_documents: 'Searched documents',
+  search_study_plans: 'Searched study plans',
 }
 
 const RESULT_LINKS: Record<string, { to: string; label: string }> = {
@@ -84,7 +90,12 @@ export function ActionCard({
         <span className="ml-auto text-ink-faint">{TOOL_LABELS[action.tool_name] ?? humanize(action.tool_name)}</span>
       </div>
 
-      <p className="mt-2 text-sm font-medium text-ink">{action.summary}</p>
+      {/* whitespace-pre-line, because one summary is a list rather than a
+          sentence: generate_flashcards puts every proposed card in it, both
+          sides, so the user approves the questions and answers rather than a
+          count of them. Collapsing the newlines would take that away exactly
+          where it matters. */}
+      <p className="mt-2 whitespace-pre-line text-sm font-medium text-ink">{action.summary}</p>
 
       <InputDetails input={action.input} />
 
@@ -174,7 +185,18 @@ function formatValue(key: string, value: unknown): string {
 
 /** The canonical input — exactly what runs on approval. */
 function InputDetails({ input }: { input: Record<string, unknown> }) {
-  const entries = Object.entries(input ?? {}).filter(([k, v]) => v !== null && v !== undefined && v !== '' && !k.endsWith('_id'))
+  const entries = Object.entries(input ?? {}).filter(
+    ([k, v]) =>
+      v !== null &&
+      v !== undefined &&
+      v !== '' &&
+      !k.endsWith('_id') &&
+      // `cards` is the generated flashcards, and the summary above already
+      // shows every one of them in full. Repeating them here would be the same
+      // content twice -- and as a flat value it would render as a row of
+      // "[object Object]".
+      k !== 'cards',
+  )
   if (entries.length === 0) return null
   return (
     <dl className="mt-3 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 rounded-lg bg-surface/70 px-3 py-2 text-xs">

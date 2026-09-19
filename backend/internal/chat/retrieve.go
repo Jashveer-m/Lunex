@@ -16,6 +16,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
@@ -469,6 +470,27 @@ func expenseSummary(e finance.Expense) string {
 		parts = append(parts, "has a document attached (its contents are not shown here)")
 	}
 	return withDescription(strings.Join(parts, " · "), e.Description)
+}
+
+// studyPlanSummary renders one study plan as the line the model is shown.
+//
+// The card count is in it because it is the difference between a plan that
+// exists and a plan that has been worked on, and the source document is named
+// because "what am I studying" is very often really "which file was that".
+func studyPlanSummary(p study.Plan) string {
+	parts := []string{"status " + p.Status, plural(p.CardCount, "flashcard")}
+	if p.DocumentName != nil && *p.DocumentName != "" {
+		parts = append(parts, "built from "+*p.DocumentName)
+	}
+	return withDescription(strings.Join(parts, " · "), p.Description)
+}
+
+// plural renders a count with its noun: "1 flashcard", "24 flashcards".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 func taskSummary(t tasks.Task) string {

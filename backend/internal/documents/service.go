@@ -24,6 +24,7 @@ type Store interface {
 	List(ctx context.Context, userID uuid.UUID, f Filter) ([]Document, error)
 	Delete(ctx context.Context, userID, id uuid.UUID) error
 	Search(ctx context.Context, userID uuid.UUID, embedding []float32, q SearchQuery) ([]SearchResult, error)
+	Passages(ctx context.Context, userID, documentID uuid.UUID, limit int) ([]Passage, error)
 }
 
 // NodeSyncer mirrors a document into the personal knowledge graph. Phase 6's
@@ -208,6 +209,19 @@ func (s *Service) Search(ctx context.Context, userID uuid.UUID, q SearchQuery) (
 
 func (s *Service) Get(ctx context.Context, userID, id uuid.UUID) (Document, error) {
 	return s.store.ByID(ctx, userID, id)
+}
+
+// Passages returns a document's chunks in document order, owner-scoped.
+//
+// It is Search's counterpart for a caller that has no query: Phase 10a
+// generates flashcards from a document the user named, and "the start of this
+// document" is what grounds them when they named no topic within it. Like
+// Search it is a plain service method taking a user id, so it is usable from a
+// tool, a job or a test with no HTTP anywhere.
+//
+// It embeds nothing and calls no model, so it costs one indexed scan.
+func (s *Service) Passages(ctx context.Context, userID, documentID uuid.UUID, limit int) ([]Passage, error) {
+	return s.store.Passages(ctx, userID, documentID, limit)
 }
 
 func (s *Service) List(ctx context.Context, userID uuid.UUID, f Filter) ([]Document, error) {

@@ -2,7 +2,7 @@
 // behalf.
 //
 // A tool is a fixed, reviewed Go function over one of the existing services --
-// tasks, goals, notes, documents, calendar, finance -- with a name, a description, an input
+// tasks, goals, notes, documents, calendar, finance, study -- with a name, a description, an input
 // schema, an output schema and a permission level. There is nothing else: no
 // tool runs code the model wrote, builds SQL out of what the model said, or
 // reaches a service method its interface does not name. The model's only power
@@ -42,6 +42,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/finance"
 	"github.com/jashveer/lifeos/backend/internal/goals"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
@@ -134,7 +135,27 @@ type Param struct {
 	// tool reads and the declaration does not name would be a value that
 	// escapes the grounding check entirely.
 	Aliases []string
+	// Derived marks a key the *tool* fills in while the call is prepared,
+	// rather than one the model supplies.
+	//
+	// There is exactly one in this phase: generate_flashcards' `cards`. That
+	// tool's proposal has to show the user the actual questions and answers
+	// before they approve it, so the cards are written during Prepare and
+	// stored in the canonical input -- which means the input carries a key the
+	// model never wrote, and the invariant that every stored key is a declared
+	// param has to be kept some other way. This is that way: the key is
+	// declared, so the input is still exactly the declaration, and the model
+	// is not offered it (Tool.InputSchema and the routing prompt both leave it
+	// out) so it is never asked to invent one.
+	//
+	// A derived param is never Filter or Grounded: the router's grounding
+	// check is about values a model read out of the message, and this is a
+	// value no model wrote.
+	Derived bool
 }
+
+// Offered reports whether the model is shown this parameter and may write it.
+func (p Param) Offered() bool { return !p.Derived }
 
 // Keys are every argument key this parameter is read from, its own name first.
 func (p Param) Keys() []string { return append([]string{p.Name}, p.Aliases...) }
@@ -189,6 +210,7 @@ type Result struct {
 	Notes    []notes.Note
 	Events   []calendar.Event
 	Expenses []finance.Expense
+	Plans    []study.Plan
 	Chunks   []documents.SearchResult
 	// Reports are figures a tool worked out from the user's records rather
 	// than records it found. They exist for analyze_spending, which answers
@@ -216,7 +238,7 @@ type Report struct {
 // one thing the model is shown and one thing it can cite.
 func (r Result) Count() int {
 	return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Events) +
-		len(r.Expenses) + len(r.Chunks) + len(r.Reports)
+		len(r.Expenses) + len(r.Plans) + len(r.Chunks) + len(r.Reports)
 }
 
 // define builds a Tool whose canonical input is the Go type In.

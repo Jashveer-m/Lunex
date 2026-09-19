@@ -22,6 +22,7 @@ import (
 	"github.com/jashveer/lifeos/backend/internal/graph"
 	"github.com/jashveer/lifeos/backend/internal/memories"
 	"github.com/jashveer/lifeos/backend/internal/notes"
+	"github.com/jashveer/lifeos/backend/internal/study"
 	"github.com/jashveer/lifeos/backend/internal/tasks"
 )
 
@@ -34,6 +35,7 @@ type Deps struct {
 	Notes       *notes.Handler
 	Calendar    *calendar.Handler
 	Finance     *finance.Handler
+	Study       *study.Handler
 	Documents   *documents.Handler
 	Chat        *chat.Handler
 	Memories    *memories.Handler
@@ -115,6 +117,15 @@ func NewRouter(d Deps) http.Handler {
 			// ordinary budget.
 			r.Mount("/expenses", d.Finance.ExpenseRoutes())
 			r.Mount("/expense-categories", d.Finance.CategoryRoutes())
+
+			// Phase 10a. Reading and editing a study plan is database work.
+			// The one thing in this module that calls a model -- writing
+			// flashcards from a document -- is deliberately not here: it is a
+			// proposal the assistant makes, so it runs inside the chat turn's
+			// own budget, under /conversations, and reaches the database only
+			// through an approval. See study.Handler.PlanRoutes.
+			r.Mount("/study-plans", d.Study.PlanRoutes())
+			r.Mount("/flashcards", d.Study.FlashcardRoutes())
 
 			// Phase 5. Managing memories is database work: listing, editing
 			// and deleting rows. The model and the embedder are only involved
