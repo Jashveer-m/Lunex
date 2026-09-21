@@ -52,7 +52,21 @@ Personal life-operating-system.
   text does not become a card, and an unsupported number never does. That check
   is the inverse of the one memory extraction runs, and it is the phase.
 
-Quizzes, weak-topic tracking, spaced repetition and study sessions are 10b–10e
+- **Phase 10b** — quizzes: multiple-choice questions written from your own
+  documents, and graded attempts at them. Generating one goes through the same
+  approval rule, and the proposal is the quiz — every question, every option,
+  and **which option will be marked correct**, because a wrong answer key is
+  the one error here you cannot fix by reading more carefully afterwards. Each
+  question's correct answer is checked against the document before you see it;
+  a distractor is not, because a wrong answer is supposed to be wrong. *Taking*
+  a quiz is not an approval flow and not a tool: starting an attempt, answering
+  a question and finishing it are your own actions on your own data, and there
+  is no method on the tool interface that could reach them. The assistant can
+  see what quizzes you have and how you have done (`search_quizzes`) and never
+  the questions or the answers — it cannot spoil a quiz, because it is never
+  shown one.
+
+Weak-topic tracking, spaced repetition and study sessions are 10c–10e
 and are deliberately absent; so is any review state on a card. Deleting through
 the chat belongs to a later phase. The assistant can change your data
 only by proposing a change you then approve, and nothing — including asking it
@@ -98,7 +112,7 @@ lunex/
 │   │   ├── notes/         # notes: model, service, handlers
 │   │   ├── optional/      # the three-state field a PATCH body needs
 │   │   ├── tasks/         # tasks + dependencies: model, service, handlers
-│   │   ├── study/         # study plans and document-grounded flashcards
+│   │   ├── study/         # study plans, document-grounded flashcards and quizzes
 │   │   ├── tools/         # the tool registry: sixteen fixed tools, the approval gate
 │   │   ├── users/         # user + profile model and repository
 │   │   └── validate/      # field rules shared by the modules
@@ -106,7 +120,7 @@ lunex/
 │   └── go.mod
 ├── frontend/              # the web UI (Vite + React)
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule -> spend -> study -> ground, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule -> spend -> study -> ground -> quiz -> take -> score, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -449,6 +463,63 @@ being approved is content a model wrote rather than a restatement of something
 you said — and because it is written *before* the approval, approving stores
 exactly what you read rather than rolling the dice again.
 
+### Quizzes (Phase 10b)
+
+A quiz is written from a document on exactly those terms, with one thing added
+to the proposal: the answer key.
+
+```sh
+# "Make me a multiple-choice quiz from relay-handbook.txt for my Kestrel relay handbook plan."
+# event: action
+# data: {"tool_name":"generate_quiz","status":"proposed","summary":
+#        "Save a quiz \"relay-handbook.txt\" under \"Kestrel relay handbook\", 6 questions:
+#         1. How long does the changeover to the auxiliary dipole take?
+#            - Two seconds
+#            - Eleven seconds (correct)
+#            - A minute
+#            - It is instant
+#         …
+#         The option marked (correct) is the one the quiz will mark right.",…}
+
+curl -s -X POST localhost:8080/api/v1/actions/$ACTION_ID/approve -H "$AUTH"
+```
+
+Each question's *correct* answer is checked against the document before you are
+shown it. The wrong answers are not — a distractor is supposed to be wrong, and
+requiring one to appear in the text would mean every option was something the
+document says.
+
+The check establishes that an answer came from your document, **not that it is
+the right answer to the question** — a model can mark an option that is in the
+text but answers something else. That is why the answer key is on the approval
+card rather than summarised away: you are the check on it.
+
+Taking it is yours, not the assistant's. There is no tool that can start an
+attempt, answer a question or finish one, and reading the quiz does not hand
+you the answer key:
+
+```sh
+curl -s "localhost:8080/api/v1/quizzes/$QUIZ_ID" -H "$AUTH"
+# {"title":"…","question_count":6,"attempt_count":0,"best_score":null,
+#  "questions":[{"id":"…","question":"How long does the changeover take?",
+#                "options":["Two seconds","Eleven seconds","A minute","It is instant"],
+#                "topic":"mast feed timing"}]}          # no correct_index
+
+ATTEMPT=$(curl -s -X POST "localhost:8080/api/v1/quizzes/$QUIZ_ID/attempts" -H "$AUTH" | jq -r .id)
+
+curl -s -X POST "localhost:8080/api/v1/quiz-attempts/$ATTEMPT/answers" -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"question_id":"'"$Q_ID"'","selected_index":1}'
+# {"selected_index":1,"correct_index":1,"correct":true,…}   # the key, once you have answered
+
+curl -s -X POST "localhost:8080/api/v1/quiz-attempts/$ATTEMPT/complete" -H "$AUTH"
+# {"score":5,"question_count":6,"completed_at":"…","answers":[…]}
+```
+
+Asked what quizzes you have, the assistant is shown the counts and your best
+score and nothing else — not one question, not one option. It cannot spoil a
+quiz because it was never shown one.
+
 Every card is checked against the document first. At least two thirds of an
 answer's words have to be in the passages the model was shown, and a figure
 that is not in them drops the card outright — so a plausible invention produces
@@ -491,7 +562,7 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 | `MAX_UPLOAD_BYTES` | no | `10485760` | 10 MB; rejected before the file is read |
 | `DOCUMENT_PROCESS_TIMEOUT` | no | `2m` | Budget for one synchronous upload; also sets the server's read/write timeout |
 | `CHAT_MODEL` | no | `llama3.2:3b` | The Ollama chat model |
-| `CHAT_TIMEOUT` | no | `24m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions and a flashcard generation, which run inside it. The process refuses to start if the two extraction timeouts, `AGENT_TIMEOUT` and `STUDY_GENERATE_TIMEOUT` exceed half of this |
+| `CHAT_TIMEOUT` | no | `24m` | Budget for one whole turn: route, retrieve, generate, persist — **and** both extractions and a flashcard or quiz generation, which run inside it. The process refuses to start if the two extraction timeouts, `AGENT_TIMEOUT` and `STUDY_GENERATE_TIMEOUT` exceed half of this |
 | `CHAT_TEMPERATURE` | no | `0.2` | 0–2. Low: the assistant quotes your own data back at you |
 | `CHAT_MAX_TOKENS` | no | `1024` | Reply length cap |
 | `CHAT_MIN_SIMILARITY` | no | `0.5` | 0–1. Retrieval floor for chat; below it a chunk is never shown to the model |
@@ -513,10 +584,10 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 | `AGENT_TIMEOUT` | no | `180s` | Bounds one routing decision. Spent *before* the first token, and counted inside `CHAT_TIMEOUT` |
 | `AGENT_TEMPERATURE` | no | `0.1` | 0–2. Near zero: it is a classification |
 | `AGENT_MAX_TOKENS` | no | `200` | Routing reply cap; a decision is one short JSON object |
-| `STUDY_MODEL` | no | `CHAT_MODEL` | Which model writes flashcards. A *bigger* one is the reasonable override, unlike the extractions: this output is read by a person, repeatedly |
-| `STUDY_GENERATE_TIMEOUT` | no | `180s` | Bounds one flashcard generation. Spent *before* the first token, like the routing call, and counted inside `CHAT_TIMEOUT` |
-| `STUDY_TEMPERATURE` | no | `0.1` | 0–2. Near zero: writing a card from a passage is a reading task |
-| `STUDY_MAX_TOKENS` | no | `1024` | Generation reply cap; twenty short cards as JSON |
+| `STUDY_MODEL` | no | `CHAT_MODEL` | Which model writes flashcards and quiz questions. A *bigger* one is the reasonable override, unlike the extractions: this output is read by a person, repeatedly |
+| `STUDY_GENERATE_TIMEOUT` | no | `180s` | Bounds one flashcard or quiz generation. Spent *before* the first token, like the routing call, and counted inside `CHAT_TIMEOUT` |
+| `STUDY_TEMPERATURE` | no | `0.1` | 0–2. Near zero: writing a card or a question from a passage is a reading task |
+| `STUDY_MAX_TOKENS` | no | `1024` | Generation reply cap; twenty short cards, or fifteen questions with their options, as JSON |
 | `STUDY_JSON_MODE` | no | `false` | As `MEMORY_JSON_MODE`, and off for the same measured reason |
 
 ## Common commands
@@ -525,7 +596,7 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> study -> ground, against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> study -> ground -> quiz -> take -> score, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -716,10 +787,13 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     wrong column when they arrive.
 52. **The grounding check drops good cards as well as bad ones.** A correct
     answer phrased entirely in words the document does not use is dropped, and
-    so is "40 minutes" from a passage that says "forty minutes". That is the
-    trade: a plausible invention on a card that will be rehearsed until it is
-    believed costs more than a missing card. The count of what was dropped is
-    logged, and the assistant says when a generation produced nothing.
+    so is "40 minutes" from a passage that says "forty minutes" — a figure has
+    to match exactly, written in digits or in words. That is the trade: a
+    plausible invention on a card that will be rehearsed until it is believed
+    costs more than a missing card. The count of what was dropped is logged,
+    and the assistant says when a generation produced nothing. It is not
+    complete: it catches a contradicted *figure*, and cannot catch a
+    semantically wrong answer made of the document's own words.
 53. **Generation is not deduplicated.** Asking twice makes two independent
     proposals, and nothing compares a new card against the deck it is about to
     join — so approving two similar generations leaves near-duplicates. It
@@ -728,4 +802,22 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     and no tool that changes one; the fix for a bad card is to delete it and
     write another.
 55. **Study has no screen of its own.** A plan reaches the web UI as a proposal
-    card in the chat or as a citation in an answer, and nothing lists a deck.
+    card in the chat or as a citation in an answer, and nothing lists a deck —
+    and nothing lets you sit a quiz, which needs a client.
+56. **A quiz's wrong answers are not checked.** Every *correct* answer is
+    verified against the document; a distractor is asked for in the prompt and
+    read by you on the approval card, and nothing here can tell a good one from
+    one that happens to be true of a part of the document the model was not
+    shown.
+57. **Nothing aggregates how a quiz went.** A `topic` per question and a
+    verdict per answer are recorded and nothing reads them: no weak-topic
+    tracking, no per-topic score, no "retry the ones I got wrong". That is 10c,
+    and this phase's job was to record the evidence rather than analyse it.
+58. **A quiz cannot be edited.** There is no `PATCH /quizzes/{id}` and no way
+    to add or remove a question: a quiz with a question added is a different
+    quiz from the one you have already sat, and the old attempts would silently
+    be scored against the new total.
+59. **Multiple choice only.** No true/false as its own type, no free text, no
+    matching, no ordering, and no difficulty. Grading free text means deciding
+    whether one sentence means another, which is the grounding problem again
+    with no document to check against.

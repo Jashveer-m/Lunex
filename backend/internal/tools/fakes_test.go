@@ -453,6 +453,13 @@ type fakeStudy struct {
 	propose    []study.NewCard
 	proposeErr error
 	err        error
+
+	// Phase 10b.
+	quizzes        map[uuid.UUID][]study.Quiz
+	created        []study.CreateQuizInput
+	quizProposals  []study.GenerateQuizInput
+	proposeQuiz    []study.NewQuestion
+	proposeQuizErr error
 }
 
 func newFakeStudy() *fakeStudy {
@@ -462,6 +469,19 @@ func newFakeStudy() *fakeStudy {
 		propose: []study.NewCard{
 			{Front: "How long did the aurora last?", Back: "About forty minutes."},
 			{Front: "What does the generator need?", Back: "A new fuel filter."},
+		},
+		quizzes: map[uuid.UUID][]study.Quiz{},
+		proposeQuiz: []study.NewQuestion{
+			{
+				Question:     "How long did the aurora last?",
+				Options:      []string{"About forty minutes", "Two hours"},
+				CorrectIndex: 0, Topic: "aurora duration",
+			},
+			{
+				Question:     "What does the generator need?",
+				Options:      []string{"An alternator", "A new fuel filter"},
+				CorrectIndex: 1, Topic: "generator servicing",
+			},
 		},
 	}
 }
@@ -488,7 +508,78 @@ func (f *fakeStudy) seedDocument(owner uuid.UUID, filename string) documents.Doc
 func (f *fakeStudy) writes() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.creates) + len(f.cards)
+	return len(f.creates) + len(f.cards) + len(f.created)
+}
+
+func (f *fakeStudy) seedQuiz(owner uuid.UUID, title string, questions int) study.Quiz {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	q := study.Quiz{ID: uuid.New(), UserID: owner, Title: title, QuestionCount: questions}
+	f.quizzes[owner] = append(f.quizzes[owner], q)
+	return q
+}
+
+func (f *fakeStudy) Quizzes(_ context.Context, userID uuid.UUID, filter study.QuizFilter) ([]study.Quiz, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []study.Quiz
+	for _, q := range f.quizzes[userID] {
+		if filter.Query != "" && !strings.Contains(strings.ToLower(q.Title), strings.ToLower(filter.Query)) {
+			continue
+		}
+		out = append(out, q)
+	}
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStudy) ProposeQuiz(_ context.Context, _ uuid.UUID, in study.GenerateQuizInput) (study.QuizProposal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.quizProposals = append(f.quizProposals, in)
+	if f.proposeQuizErr != nil {
+		return study.QuizProposal{}, f.proposeQuizErr
+	}
+	questions := f.proposeQuiz
+	if in.Count > 0 && len(questions) > in.Count {
+		questions = questions[:in.Count]
+	}
+	title := in.Title
+	if title == "" {
+		title = study.QuizTitleFor("field-notes.txt", in.Topic)
+	}
+	return study.QuizProposal{
+		DocumentID: in.DocumentID, Filename: "field-notes.txt", StudyPlanID: in.StudyPlanID,
+		Topic: in.Topic, Title: title,
+		Questions: append([]study.NewQuestion(nil), questions...),
+	}, nil
+}
+
+func (f *fakeStudy) CreateQuiz(_ context.Context, userID uuid.UUID, in study.CreateQuizInput) (study.Quiz, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.created = append(f.created, in)
+	if f.err != nil {
+		return study.Quiz{}, f.err
+	}
+	q := study.Quiz{
+		ID: uuid.New(), UserID: userID, Title: in.Title,
+		StudyPlanID: in.StudyPlanID, DocumentID: in.DocumentID,
+		QuestionCount: len(in.Questions),
+	}
+	for _, n := range in.Questions {
+		q.Questions = append(q.Questions, study.Question{
+			ID: uuid.New(), QuizID: q.ID, Question: n.Question,
+			Options: n.Options, CorrectIndex: n.CorrectIndex,
+		})
+	}
+	f.quizzes[userID] = append(f.quizzes[userID], q)
+	return q, nil
 }
 
 func (f *fakeStudy) Plans(_ context.Context, userID uuid.UUID, filter study.Filter) ([]study.Plan, error) {

@@ -92,8 +92,17 @@ var (
 	// changing. It is still not routed to individually; that is the step a
 	// later phase puts in front of Decide.
 	StudyAgent = Agent{
-		Name: "study", Purpose: "looking at what the user is studying and making flashcards from their documents",
-		Tools: []string{tools.SearchStudyPlans, tools.CreateStudyPlan, tools.GenerateFlashcards},
+		Name: "study",
+		Purpose: "looking at what the user is studying and making flashcards and quizzes " +
+			"from their documents",
+		// Phase 10b adds two, and its purpose gains "and quizzes" and nothing
+		// else: this agent makes study material out of the user's documents
+		// and reads back what they have. It does not take a quiz -- there is
+		// no tool for that, by construction; see tools.StudyService.
+		Tools: []string{
+			tools.SearchStudyPlans, tools.SearchQuizzes,
+			tools.CreateStudyPlan, tools.GenerateFlashcards, tools.GenerateQuiz,
+		},
 	}
 )
 

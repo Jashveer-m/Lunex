@@ -210,6 +210,10 @@ func toolSources(tool string, r tools.Result) []Source {
 		out = append(out, Source{Type: SourceStudyPlan, ID: p.ID, Title: p.Title, Tool: tool,
 			Excerpt: truncate(studyPlanSummary(p), MaxExcerptChars)})
 	}
+	for _, q := range r.Quizzes {
+		out = append(out, Source{Type: SourceQuiz, ID: q.ID, Title: q.Title, Tool: tool,
+			Excerpt: truncate(quizSummary(q), MaxExcerptChars)})
+	}
 	// A report has no row behind it, so it carries the zero id: it is a total
 	// the tool computed, not a record the client can open. analyze_spending is
 	// the only tool that produces one, which is why the type is fixed here; a
@@ -262,14 +266,31 @@ func (t toolStep) actionsBlock(sources []Source) string {
 		// and it has NOT been made: ..." copied the section into its reply, and
 		// shown this it answered "I have prepared a change ... it will only
 		// happen once you approve it" in every sample.
+		//
+		// A summary that runs to several lines goes *after* the instruction
+		// rather than inside it, and that is the same finding a second time.
+		// Every summary was one sentence when this was measured; a generated
+		// deck or quiz is not -- generate_quiz's is a heading, four lines per
+		// question and a closing sentence -- and interpolating fifteen lines
+		// into the middle of a "what it will do (...)" clause put the model
+		// back where it started. Measured on llama3.2:3b: shown a
+		// three-question quiz inline, it replied with the instruction itself,
+		// beginning "I prepared a change that has not been made yet. Reply by
+		// telling the user...". The instruction has to stay a sentence the
+		// model can hold in one piece.
+		summary := strings.TrimSuffix(t.call.Summary, ".")
+		inline, appended := " ("+summary+")", ""
+		if strings.Contains(summary, "\n") {
+			inline, appended = "", "\n\nWhat it will do:\n"+summary
+		}
 		line := "You prepared a change that has not been made yet. Reply by telling the user, in your own words, " +
-			"that you have prepared it, what it will do (" + strings.TrimSuffix(t.call.Summary, ".") + "), " +
+			"that you have prepared it, what it will do" + inline + ", " +
 			"and that it will only happen once they press Approve on the card shown with your reply (or Reject to cancel it). " +
 			"Never say that it is done, and never ask the user to type or reply anything to approve it: typing in the chat does nothing."
 		if t.reused != nil {
 			line += " (The same change was already proposed earlier in this conversation and is still waiting; it was not proposed twice.)"
 		}
-		lines = append(lines, line)
+		lines = append(lines, line+appended)
 	}
 
 	var earlier []string
@@ -277,7 +298,7 @@ func (t toolStep) actionsBlock(sources []Source) string {
 		if t.reused != nil && a.ID == t.reused.ID {
 			continue
 		}
-		earlier = append(earlier, "- "+strings.TrimSuffix(a.Summary, ".")+": "+statusInWords(a.Action))
+		earlier = append(earlier, "- "+headline(a.Summary)+": "+statusInWords(a.Action))
 	}
 	if len(earlier) > 0 {
 		lines = append(lines, "Earlier in this conversation you proposed:\n"+strings.Join(earlier, "\n"))
@@ -286,6 +307,28 @@ func (t toolStep) actionsBlock(sources []Source) string {
 		return ""
 	}
 	return "ACTIONS\n\n" + strings.Join(lines, "\n\n")
+}
+
+// headline is the one line of a summary that belongs in a recap of what was
+// proposed earlier.
+//
+// Every summary was one line when this list was written, so it read
+// "- Create a task "Buy milk": the user approved it and it was done." A
+// generated deck or quiz is not one line, and gluing the status onto the end
+// of one produced "The option marked (correct) is the one the quiz will mark
+// right: the user approved it and it was done" -- a sentence saying the
+// marker convention was approved -- with the questions spilling out of the
+// bullet in between, where a second entry could not be told from the first
+// one's options.
+//
+// A recap does not need the content: it was shown in full when it was
+// proposed, on the card the user read. What it needs is which change and what
+// became of it, and the first line is exactly that.
+func headline(summary string) string {
+	if i := strings.IndexByte(summary, '\n'); i >= 0 {
+		summary = summary[:i]
+	}
+	return strings.TrimSuffix(strings.TrimSpace(summary), ".")
 }
 
 // statusInWords is an action's status as a sentence the model can relay.

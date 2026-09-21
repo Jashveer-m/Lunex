@@ -373,6 +373,24 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		})
 	case errors.Is(err, ErrFlashcardNotFound):
 		httpx.NotFound(w, "flashcard")
+	// Phase 10b. Each names its own resource, so "no such quiz" and "no such
+	// attempt" are different sentences -- and all of them are 404s, including
+	// the ones that mean "that is somebody else's".
+	case errors.Is(err, ErrQuizNotFound):
+		httpx.NotFound(w, "quiz")
+	case errors.Is(err, ErrAttemptNotFound):
+		httpx.NotFound(w, "quiz attempt")
+	case errors.Is(err, ErrQuestionNotFound):
+		httpx.NotFound(w, "question in this quiz")
+	// The two conflicts. They are 409 rather than 400 because the request is
+	// well formed and was legal a moment ago: what is wrong is the state of
+	// the attempt, not the body.
+	case errors.Is(err, ErrAlreadyAnswered):
+		httpx.WriteError(w, http.StatusConflict, "already_answered",
+			"That question has already been answered in this attempt.")
+	case errors.Is(err, ErrAttemptComplete):
+		httpx.WriteError(w, http.StatusConflict, "attempt_complete",
+			"This attempt is already complete.")
 	case errors.Is(err, ErrNotFound):
 		httpx.NotFound(w, "study plan")
 	default:

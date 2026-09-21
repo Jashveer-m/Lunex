@@ -148,3 +148,52 @@ func TestSignificantWordsDropsTheVocabularyOfAsking(t *testing.T) {
 		t.Fatalf("words = %v, want the number kept", words)
 	}
 }
+
+// A figure written out in words is held to exactly the rule a figure in digits
+// is: matched exactly, and fatal to an answer when the passages do not contain
+// it.
+//
+// This is a regression test for a measured failure, and the shape of it is
+// worth keeping in view. Against a handbook that says "the whole bank is
+// equalised every forty days", llama3.2:3b wrote a quiz question whose correct
+// answer was "Every sixty days" -- and it was grounded, because "every" and
+// "days" are both in the passage and two content words out of three clears
+// MinGroundedShare. The rule that sinks an unsupported figure never fired,
+// because "sixty" has no digit in it.
+//
+// For a flashcard that is a wrong fact rehearsed until it is believed. For a
+// quiz it is the answer key, so it marks the learner wrong for knowing better.
+func TestAFigureWrittenInWordsMustMatchExactly(t *testing.T) {
+	passages := []string{
+		"The battery bank is a set of six cells wired in series, and the whole " +
+			"bank is equalised every forty days.",
+		"The changeover takes eleven seconds to complete.",
+	}
+	for name, tc := range map[string]struct {
+		answer string
+		want   bool
+	}{
+		"the document's own figure":            {"Every forty days", true},
+		"a different figure, in words":         {"Every sixty days", false},
+		"the document's own count":             {"Six cells", true},
+		"a different count":                    {"Four cells", false},
+		"the document's own interval":          {"Eleven seconds", true},
+		"a longer word starting the same way":  {"Fourteen seconds", false},
+		"no figure at all, and well supported": {"The cells are wired in series", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := GroundedIn(tc.answer, passages); got != tc.want {
+				t.Fatalf("GroundedIn(%q) = %v, want %v (words: %v)",
+					tc.answer, got, tc.want, SignificantWords(tc.answer))
+			}
+		})
+	}
+
+	// And the prefix rule that sameWord allows for ordinary words is off for
+	// figures in both directions: "four" must not match "fourteen".
+	for _, pair := range [][2]string{{"four", "fourteen"}, {"six", "sixty"}, {"forty", "fortieth"}} {
+		if sameWord(pair[0], pair[1]) {
+			t.Fatalf("sameWord(%q, %q) = true; a figure matches only exactly", pair[0], pair[1])
+		}
+	}
+}

@@ -301,7 +301,7 @@ func generateFlashcardsTool(s Services) Tool {
 				Count:      cardCount(a),
 			}
 			if planRef := a.String(append([]string{"study_plan", "study_plan_id"}, studyPlanAliases...)...); planRef != "" {
-				plan, err := resolveStudyPlan(ctx, s, userID, planRef)
+				plan, err := resolveStudyPlan(ctx, s, userID, GenerateFlashcards, planRef)
 				if err != nil {
 					return in, err
 				}
@@ -409,12 +409,16 @@ func endSentence(s string) string {
 	return s + "."
 }
 
-// cardCount reads how many cards the user asked for. Anything unreadable is
-// "they did not say", which study.ValidateGenerate turns into the default --
-// there is no sense in refusing a whole generation because a model wrote "a
-// few".
+// cardCount reads how many cards the user asked for.
 func cardCount(a Args) int {
-	raw := a.String("count", "how_many", "number", "cards", "n")
+	return countArg(a, "count", "how_many", "number", "cards", "n")
+}
+
+// countArg reads a "how many" argument. Anything unreadable is "they did not
+// say", which the service's validation turns into the default -- there is no
+// sense in refusing a whole generation because a model wrote "a few".
+func countArg(a Args, names ...string) int {
+	raw := a.String(names...)
 	if raw == "" {
 		return 0
 	}
@@ -464,7 +468,12 @@ var planRefStopWords = map[string]struct{}{
 // caller's own plans only. Same rule as resolveTask: an id, then an exact
 // title, then a unique text match, and several matches are an error listing
 // them.
-func resolveStudyPlan(ctx context.Context, s Services, userID uuid.UUID, ref string) (study.Plan, error) {
+//
+// It takes the tool name rather than naming one, because two tools file things
+// under a plan now -- an ArgumentError is read by the answering model and,
+// through it, by the user, and one that says generate_flashcards when the user
+// asked for a quiz sends them looking for the wrong thing.
+func resolveStudyPlan(ctx context.Context, s Services, userID uuid.UUID, tool, ref string) (study.Plan, error) {
 	if id, err := uuid.Parse(ref); err == nil {
 		found, err := s.Study.Plans(ctx, userID, study.Filter{Limit: study.MaxLimit})
 		if err != nil {
@@ -477,11 +486,11 @@ func resolveStudyPlan(ctx context.Context, s Services, userID uuid.UUID, ref str
 		}
 		// Another user's plan id resolves to nothing, the same "no such plan"
 		// as one that does not exist.
-		return study.Plan{}, invalid(GenerateFlashcards, "there is no such study plan")
+		return study.Plan{}, invalid(tool, "there is no such study plan")
 	}
 	ref = strings.TrimSpace(strings.Trim(ref, `"'`))
 	if ref == "" {
-		return study.Plan{}, invalid(GenerateFlashcards, "say which study plan to file the cards under")
+		return study.Plan{}, invalid(tool, "say which study plan to file it under")
 	}
 
 	var words []string
@@ -521,7 +530,7 @@ func resolveStudyPlan(ctx context.Context, s Services, userID uuid.UUID, ref str
 	case 1:
 		return candidates[0], nil
 	case 0:
-		return study.Plan{}, invalid(GenerateFlashcards,
+		return study.Plan{}, invalid(tool,
 			"the user has no study plan called %s: ask which plan they mean, or propose creating it first",
 			quoted(ref))
 	}
@@ -529,7 +538,7 @@ func resolveStudyPlan(ctx context.Context, s Services, userID uuid.UUID, ref str
 	for _, p := range candidates {
 		titles = append(titles, p.Title)
 	}
-	return study.Plan{}, invalid(GenerateFlashcards,
+	return study.Plan{}, invalid(tool,
 		"%s matches more than one study plan (%s): ask which one they mean",
 		quoted(ref), strings.Join(titles, ", "))
 }

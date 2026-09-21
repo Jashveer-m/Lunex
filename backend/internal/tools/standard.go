@@ -61,7 +61,8 @@ type (
 		CategoryByName(ctx context.Context, userID uuid.UUID, name string) (finance.Category, error)
 		Create(ctx context.Context, userID uuid.UUID, in finance.CreateInput) (finance.Expense, error)
 	}
-	// StudyService is Phase 10a's study plans and flashcards.
+	// StudyService is the study module: Phase 10a's plans and flashcards,
+	// and Phase 10b's quizzes.
 	//
 	// ProposeFlashcards is the interesting one, and the shape of the interface
 	// is the phase's approval story in miniature: it *proposes* cards and
@@ -79,6 +80,21 @@ type (
 		ProposeFlashcards(ctx context.Context, userID uuid.UUID, in study.GenerateInput) (study.Proposal, error)
 		CreateFlashcards(ctx context.Context, userID uuid.UUID, in []study.CreateCardInput) ([]study.Flashcard, error)
 		ResolveDocument(ctx context.Context, userID uuid.UUID, ref string) (documents.Document, error)
+
+		// Phase 10b, and the same shape for the same reason: ProposeQuiz
+		// writes nothing and CreateQuiz takes the questions rather than a
+		// document and a count, so there is no method here that generates and
+		// stores in one step.
+		//
+		// What is *not* named here is the more interesting half. There is no
+		// StartAttempt, no SubmitAnswer and no CompleteAttempt, so no tool can
+		// take a quiz on the user's behalf, answer a question for them or
+		// finish an attempt -- not because a tool declines to, but because the
+		// interface offers no way. Those are the user's own actions and they
+		// live at their own endpoints. See docs/decisions.md.
+		Quizzes(ctx context.Context, userID uuid.UUID, f study.QuizFilter) ([]study.Quiz, error)
+		ProposeQuiz(ctx context.Context, userID uuid.UUID, in study.GenerateQuizInput) (study.QuizProposal, error)
+		CreateQuiz(ctx context.Context, userID uuid.UUID, in study.CreateQuizInput) (study.Quiz, error)
 	}
 )
 
@@ -134,11 +150,17 @@ const (
 	// SearchStudyPlans and the two writes below are Phase 10a.
 	SearchStudyPlans = "search_study_plans"
 	CreateStudyPlan  = "create_study_plan"
-	// GenerateFlashcards is the one write in this codebase whose proposal is
+	// GenerateFlashcards is the first write in this codebase whose proposal is
 	// *content* rather than a restatement of what the user said: the cards are
 	// written by a model during preparation and are what the approval card
 	// shows. See generateFlashcardsInput.
 	GenerateFlashcards = "generate_flashcards"
+	// SearchQuizzes and GenerateQuiz are Phase 10b. GenerateQuiz is the second
+	// content proposal, on the same terms -- and there is deliberately no
+	// third tool beside them: taking a quiz is the user's own action, not
+	// something the assistant proposes. See StudyService.
+	SearchQuizzes = "search_quizzes"
+	GenerateQuiz  = "generate_quiz"
 )
 
 // Standard returns the tools, read tools first.
@@ -160,6 +182,7 @@ func Standard(s Services) []Tool {
 		searchExpensesTool(s),
 		analyzeSpendingTool(s),
 		searchStudyPlansTool(s),
+		searchQuizzesTool(s),
 		createTaskTool(s),
 		updateTaskTool(s),
 		createGoalTool(s),
@@ -168,6 +191,7 @@ func Standard(s Services) []Tool {
 		createExpenseTool(s),
 		createStudyPlanTool(s),
 		generateFlashcardsTool(s),
+		generateQuizTool(s),
 	}
 }
 
@@ -183,6 +207,7 @@ var searchStopWords = map[string]struct{}{
 	"todo": {}, "item": {}, "items": {}, "event": {}, "events": {}, "calendar": {},
 	"expense": {}, "expenses": {}, "spending": {}, "spent": {}, "cost": {}, "costs": {},
 	"plan": {}, "plans": {}, "study": {}, "flashcard": {}, "flashcards": {}, "card": {}, "cards": {},
+	"quiz": {}, "quizzes": {}, "question": {}, "questions": {}, "test": {},
 }
 
 // searchTerms is the whole phrase first, then -- as a fallback -- up to three of
@@ -199,18 +224,29 @@ func searchTerms(query string) []string {
 		return []string{""}
 	}
 	terms := []string{query}
+	significant := 0
 	for _, w := range strings.Fields(strings.ToLower(query)) {
 		w = strings.Trim(w, `"'.,;:!?()`)
-		if utf8.RuneCountInString(w) < 2 || w == strings.ToLower(query) {
+		if utf8.RuneCountInString(w) < 2 {
 			continue
 		}
 		if _, stop := searchStopWords[w]; stop {
 			continue
 		}
-		terms = append(terms, w)
-		if len(terms) == 4 {
-			break
+		significant++
+		if w == strings.ToLower(query) || len(terms) == 4 {
+			continue
 		}
+		terms = append(terms, w)
+	}
+	// A query made entirely of the words that name the *kind* of thing being
+	// searched is not a query: "my quizzes", "the tasks", "flashcards". The
+	// tool already knows what it is searching, so searching for the noun finds
+	// nothing and reports "you have none" -- which is a lie about the user's
+	// data, and the one answer a read must never give. Treated as no query at
+	// all, it lists them.
+	if significant == 0 {
+		return []string{""}
 	}
 	return terms
 }

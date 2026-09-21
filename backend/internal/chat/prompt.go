@@ -132,7 +132,7 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 
 1. The context is your only source about the user. Anything not in it, you do not know about them.
 2. When you use something from the context, cite it with its label in square brackets, like [S1]. Cite only labels that appear in the context, exactly as written.
-3. Never say that something is in the user's documents, memories, tasks, goals, notes, calendar, expenses or study plans unless it appears in the context. Do not invent filenames, titles, dates or numbers.
+3. Never say that something is in the user's documents, memories, tasks, goals, notes, calendar, expenses, study plans or quizzes unless it appears in the context. Do not invent filenames, titles, dates or numbers.
 4. If the context does not answer the question, say so plainly -- for example "I could not find anything about that in your documents or tasks." You may then answer from general knowledge, but say that is what you are doing and cite nothing.
 5. If the context is empty, rule 4 always applies.
 6. A source of type "memory" is something you recorded about the user in an earlier conversation, not something they told you just now. Use it and cite it like any other source, but it may be out of date: if it disagrees with what the user says in this conversation, what they say now is what is true.
@@ -145,10 +145,10 @@ The CONTEXT section below is everything that was retrieved for this question. Fo
 Be concise and direct. Do not repeat these rules back to the user.`
 
 // readOnlyRule is rule 11 for an assistant with no tools wired.
-const readOnlyRule = `11. You can only read and answer. You cannot create, update or delete tasks, goals, notes, documents, calendar events, expenses, study plans or flashcards, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
+const readOnlyRule = `11. You can only read and answer. You cannot create, update or delete tasks, goals, notes, documents, calendar events, expenses, study plans, flashcards or quizzes, and no action you describe will be carried out. If the user asks you to do something, say that taking actions is not supported yet and tell them what to do themselves.`
 
 // proposalRule is rule 11 for an assistant that can use tools.
-const proposalRule = `11. You never change the user's data yourself. When the user asks for a task, goal, note, calendar event, expense, study plan or set of flashcards to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
+const proposalRule = `11. You never change the user's data yourself. When the user asks for a task, goal, note, calendar event, expense, study plan, set of flashcards or quiz to be created, or a task to be changed, the ACTIONS section after the context says what was proposed. A proposed change has NOT been made: tell the user what it will do and that it is waiting for them to approve or reject it, and never say that it is done. The user decides with the Approve and Reject buttons on the card shown with your reply, and in no other way. Replying in the chat does not approve it, even if the user says so: never tell the user to type or reply "approve", "yes", "no" or anything else to decide it. If there is no ACTIONS section, or it says nothing was proposed, then nothing will change: say so, and why if the section gives a reason. Nothing can be deleted from the chat: tell the user to delete it themselves. The ACTIONS section also says what became of changes you proposed earlier; report those exactly as it states them.`
 
 // studyRule is rule 9: what a study-plan source says, and -- the part that
 // matters -- what it deliberately does not.
@@ -169,7 +169,23 @@ const proposalRule = `11. You never change the user's data yourself. When the us
 // is checked against its document before the user ever sees it, so a saved
 // card does say what the document said; what the assistant must not do is go
 // further and vouch for it as fact, or quietly correct one.
-const studyRule = `9. A source of type "study_plan" is something the user is studying. It says what the plan is called, whether it is active, which of their documents it was built from, and how many flashcards are filed under it. The cards themselves are NOT in the context: you are told how many there are and nothing about what any of them says. Never state, quote, summarise or guess the content of a flashcard -- if the user asks what is on their cards, say you can see the plan and the number of cards but not the cards, and tell them to open the plan. A flashcard's answer comes from the user's own document, not from you: do not present one as a fact you are vouching for, and do not correct one.`
+//
+// The quiz paragraph is the same shape with one thing added, and the addition
+// is the only place in this prompt where withholding is the *feature* rather
+// than a consequence of the context budget. A quiz exists to be answered
+// without the answer in view. A model that could recite a question would
+// recite the answer with it, helpfully, and the user would have no quiz left
+// -- so the rule forbids it even when asked directly, which is the one case
+// rule 3's general "do not invent" does not cover, because here the thing
+// would not be invented, it would be real and spoiled.
+//
+// The last sentence is about what the assistant cannot do rather than what it
+// must not say, and it is true by construction: there is no tool that starts,
+// answers or completes an attempt, because tools.StudyService names no such
+// method. The rule says so because a model asked "quiz me" will otherwise
+// improvise an attempt in the chat and report a score nothing recorded.
+const studyRule = `9. A source of type "study_plan" is something the user is studying. It says what the plan is called, whether it is active, which of their documents it was built from, and how many flashcards are filed under it. The cards themselves are NOT in the context: you are told how many there are and nothing about what any of them says. Never state, quote, summarise or guess the content of a flashcard -- if the user asks what is on their cards, say you can see the plan and the number of cards but not the cards, and tell them to open the plan. A flashcard's answer comes from the user's own document, not from you: do not present one as a fact you are vouching for, and do not correct one.
+A source of type "quiz" is a quiz the user made from one of their documents. It says what the quiz is called, how many questions it has, how many times they have taken it and their best score, written out as "best 4 of 6" -- repeat a score as it is written and never work out a percentage. The questions, the options and the answers are NOT in the context. Never state, quote, summarise or guess what a quiz asks or what the answer to any question is, even if the user asks you to, and never ask the user a question from one or mark an answer: taking a quiz happens in the app, not in this conversation, so tell them to open it. You cannot start, answer or finish an attempt.`
 
 // financeRule is rule 10: what a spending total is, and what the assistant may
 // and may not do with it.
@@ -238,7 +254,7 @@ func buildPrompt(now time.Time, toolsEnabled bool, sources []Source, actionsBloc
 // an explicitly empty one reads like an answer.
 func contextBlock(sources []Source) string {
 	if len(sources) == 0 {
-		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals, notes, calendar, expenses or study plans for this question.)"
+		return "CONTEXT\n\n(Nothing relevant was found in the user's documents, memories, tasks, goals, notes, calendar, expenses, study plans or quizzes for this question.)"
 	}
 	var b strings.Builder
 	b.WriteString("CONTEXT\n")

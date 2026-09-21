@@ -182,7 +182,7 @@ func TestPrepareNeverWrites(t *testing.T) {
 
 // --- declarations ---------------------------------------------------------------
 
-func TestStandardToolsAreTheBriefsSixteen(t *testing.T) {
+func TestStandardToolsAreTheBriefsEighteen(t *testing.T) {
 	w := newWorld()
 	var reads, writes []string
 	for _, tool := range w.reg.Tools() {
@@ -196,11 +196,11 @@ func TestStandardToolsAreTheBriefsSixteen(t *testing.T) {
 	sort.Strings(reads)
 	sort.Strings(writes)
 	if want := []string{AnalyzeSpending, SearchCalendar, SearchDocuments, SearchExpenses,
-		SearchGoals, SearchNotes, SearchStudyPlans, SearchTasks}; !slices.Equal(reads, want) {
+		SearchGoals, SearchNotes, SearchQuizzes, SearchStudyPlans, SearchTasks}; !slices.Equal(reads, want) {
 		t.Fatalf("read tools = %v, want %v", reads, want)
 	}
 	if want := []string{CreateCalendarEvent, CreateExpense, CreateGoal, CreateNote,
-		CreateStudyPlan, CreateTask, GenerateFlashcards, UpdateTask}; !slices.Equal(writes, want) {
+		CreateStudyPlan, CreateTask, GenerateFlashcards, GenerateQuiz, UpdateTask}; !slices.Equal(writes, want) {
 		t.Fatalf("write tools = %v, want %v", writes, want)
 	}
 	// Deletion is deferred. Nothing may be registered that sounds like it.

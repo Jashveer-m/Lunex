@@ -1,5 +1,6 @@
-// Package study owns the study module's first slice: study plans, and the
-// flashcards generated from the user's own documents.
+// Package study owns the study module: study plans, the flashcards generated
+// from the user's own documents (Phase 10a), and the quizzes generated the
+// same way and the graded attempts made at them (Phase 10b).
 //
 // It is the Phase 2 resource shape -- transport, service, repository, every
 // query scoped to the owner -- with one thing in it that is not CRUD, and that
@@ -24,11 +25,20 @@
 // exactly those cards. Nothing is regenerated at approval time -- that would
 // write cards nobody had seen. See internal/tools/study_tools.go.
 //
-// What this slice deliberately is not. There are no quizzes (10b), no
-// weak-topic tracking (10c), no spaced repetition (10d) and no sessions or
-// streaks (10e). A flashcard here has a front, a back and a source; it has no
-// review state, no due date and no "I got this right", and nothing in this
-// package counts anything about how a card went. See docs/decisions.md.
+// Phase 10b adds a second thing generated on exactly those terms -- see
+// quiz.go -- and one thing that is not generated at all: taking a quiz. An
+// attempt is the user answering their own questions, so it has no approval in
+// front of it and no tool that can reach it, on the same terms as the
+// hand-written flashcard endpoint.
+//
+// What the module deliberately is not, still. There is no weak-topic tracking
+// (10c), no spaced repetition (10d) and no sessions or streaks (10e). A
+// flashcard here has a front, a back and a source; it has no review state, no
+// due date and no "I got this right", and nothing in this package counts
+// anything about how a card went. A quiz question carries a `topic` and an
+// answer carries a verdict, and nothing aggregates either -- recording the
+// evidence 10c will read is not the same as building the analysis. See
+// docs/decisions.md.
 package study
 
 import (
@@ -66,7 +76,7 @@ var ErrNoPassages = errors.New("nothing in the document matches that topic")
 // call failed, the reply could not be parsed in any accepted shape, or nothing
 // it proposed was grounded in the document. It is the study module's
 // counterpart to memories.ErrExtraction.
-var ErrGeneration = errors.New("flashcard generation failed")
+var ErrGeneration = errors.New("generation failed")
 
 // The statuses a plan can be in. A plan is `active` until the user says
 // otherwise; `completed` is finished with, `abandoned` is dropped. They are

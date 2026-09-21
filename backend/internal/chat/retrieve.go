@@ -485,6 +485,37 @@ func studyPlanSummary(p study.Plan) string {
 	return withDescription(strings.Join(parts, " · "), p.Description)
 }
 
+// quizSummary renders one quiz as the line the model is shown.
+//
+// Size and outcome, and nothing else: how many questions, how many attempts,
+// and the best score if there is one. The questions are not here and neither
+// are the answers -- see SourceQuiz -- so the most this line ever supports is
+// "you have a six-question quiz on the relay handbook and your best is four".
+//
+// The score is written out against the total ("best 4 of 6") rather than as a
+// bare number, for the reason the calendar writes its times out: a 3B model
+// handed "4" and "6" in separate fields will sometimes report a percentage it
+// worked out itself.
+func quizSummary(q study.Quiz) string {
+	parts := []string{plural(q.QuestionCount, "question")}
+	switch {
+	case q.AttemptCount == 0:
+		parts = append(parts, "not attempted yet")
+	default:
+		parts = append(parts, plural(q.AttemptCount, "attempt"))
+	}
+	if q.BestScore != nil {
+		parts = append(parts, fmt.Sprintf("best %d of %d", *q.BestScore, q.QuestionCount))
+	}
+	if q.StudyPlanTitle != nil && *q.StudyPlanTitle != "" {
+		parts = append(parts, "under "+*q.StudyPlanTitle)
+	}
+	if q.DocumentName != nil && *q.DocumentName != "" {
+		parts = append(parts, "made from "+*q.DocumentName)
+	}
+	return strings.Join(parts, " · ")
+}
+
 // plural renders a count with its noun: "1 flashcard", "24 flashcards".
 func plural(n int, noun string) string {
 	if n == 1 {

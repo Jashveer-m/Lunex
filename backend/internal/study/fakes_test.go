@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -24,6 +25,11 @@ type fakeStore struct {
 	filters   []Filter
 	batches   [][]CreateCardInput
 	err       error
+
+	// Phase 10b's four tables, and what was asked of them.
+	quiz        quizTables
+	quizzes     []CreateQuizInput
+	quizFilters []QuizFilter
 }
 
 func newFakeStore() *fakeStore {
@@ -31,6 +37,7 @@ func newFakeStore() *fakeStore {
 		plans:     map[uuid.UUID]map[uuid.UUID]Plan{},
 		cards:     map[uuid.UUID]map[uuid.UUID]Flashcard{},
 		documents: map[uuid.UUID]map[uuid.UUID]string{},
+		quiz:      newQuizTables(),
 	}
 }
 
@@ -445,3 +452,257 @@ func planWithDescription() CreatePlanInput {
 func clearedDescription() UpdatePlanInput {
 	return UpdatePlanInput{Description: optional.Null[string]()}
 }
+
+// --- Phase 10b: quizzes ------------------------------------------------------
+
+// The quiz half of fakeStore, keyed the same way and deriving the same things
+// the SQL derives: the question count, the attempt count and the best score
+// are computed on read here too, so a test that asserts on them is asserting
+// the same property the repository has.
+type quizTables struct {
+	quizzes   map[uuid.UUID]map[uuid.UUID]Quiz
+	questions map[uuid.UUID][]Question
+	attempts  map[uuid.UUID]map[uuid.UUID]Attempt
+	answers   map[uuid.UUID][]Answer
+}
+
+func newQuizTables() quizTables {
+	return quizTables{
+		quizzes:   map[uuid.UUID]map[uuid.UUID]Quiz{},
+		questions: map[uuid.UUID][]Question{},
+		attempts:  map[uuid.UUID]map[uuid.UUID]Attempt{},
+		answers:   map[uuid.UUID][]Answer{},
+	}
+}
+
+// hydrateQuiz fills the three derived values and the two joined titles.
+func (f *fakeStore) hydrateQuiz(owner uuid.UUID, q Quiz) Quiz {
+	q.QuestionCount = len(f.quiz.questions[q.ID])
+	q.AttemptCount, q.BestScore = 0, nil
+	for _, a := range f.quiz.attempts[owner] {
+		if a.QuizID != q.ID {
+			continue
+		}
+		q.AttemptCount++
+		if a.CompletedAt != nil && a.Score != nil && (q.BestScore == nil || *a.Score > *q.BestScore) {
+			best := *a.Score
+			q.BestScore = &best
+		}
+	}
+	q.StudyPlanTitle = nil
+	if q.StudyPlanID != nil {
+		if p, ok := f.plans[owner][*q.StudyPlanID]; ok {
+			q.StudyPlanTitle = &p.Title
+		}
+	}
+	q.DocumentName = nil
+	if q.DocumentID != nil {
+		if name, ok := f.documents[owner][*q.DocumentID]; ok {
+			q.DocumentName = &name
+		}
+	}
+	return q
+}
+
+func (f *fakeStore) CreateQuiz(_ context.Context, userID uuid.UUID, in CreateQuizInput) (Quiz, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	f.quizzes = append(f.quizzes, in)
+	if f.err != nil {
+		return Quiz{}, f.err
+	}
+	q := Quiz{
+		ID: uuid.New(), UserID: userID, StudyPlanID: in.StudyPlanID,
+		DocumentID: in.DocumentID, Title: in.Title,
+	}
+	if f.quiz.quizzes[userID] == nil {
+		f.quiz.quizzes[userID] = map[uuid.UUID]Quiz{}
+	}
+	f.quiz.quizzes[userID][q.ID] = q
+	for _, n := range in.Questions {
+		topic := n.Topic
+		var tag *string
+		if topic != "" {
+			tag = &topic
+		}
+		f.quiz.questions[q.ID] = append(f.quiz.questions[q.ID], Question{
+			ID: uuid.New(), QuizID: q.ID, Question: n.Question,
+			Options: append([]string(nil), n.Options...), CorrectIndex: n.CorrectIndex, Topic: tag,
+		})
+	}
+	out := f.hydrateQuiz(userID, q)
+	out.Questions = append([]Question(nil), f.quiz.questions[q.ID]...)
+	return out, nil
+}
+
+func (f *fakeStore) QuizByID(_ context.Context, userID, id uuid.UUID) (Quiz, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	q, ok := f.quiz.quizzes[userID][id]
+	if !ok {
+		return Quiz{}, ErrQuizNotFound
+	}
+	out := f.hydrateQuiz(userID, q)
+	out.Questions = append([]Question(nil), f.quiz.questions[id]...)
+	return out, nil
+}
+
+func (f *fakeStore) Quizzes(_ context.Context, userID uuid.UUID, filter QuizFilter) ([]Quiz, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	f.quizFilters = append(f.quizFilters, filter)
+	out := []Quiz{}
+	for _, q := range f.quiz.quizzes[userID] {
+		if filter.StudyPlanID != nil && (q.StudyPlanID == nil || *q.StudyPlanID != *filter.StudyPlanID) {
+			continue
+		}
+		if filter.DocumentID != nil && (q.DocumentID == nil || *q.DocumentID != *filter.DocumentID) {
+			continue
+		}
+		if filter.Query != "" && !strings.Contains(strings.ToLower(q.Title), strings.ToLower(filter.Query)) {
+			continue
+		}
+		// A list carries no questions, like the SQL one.
+		out = append(out, f.hydrateQuiz(userID, q))
+	}
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) DeleteQuiz(_ context.Context, userID, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	if _, ok := f.quiz.quizzes[userID][id]; !ok {
+		return ErrQuizNotFound
+	}
+	delete(f.quiz.quizzes[userID], id)
+	delete(f.quiz.questions, id)
+	// The ON DELETE CASCADE from quizzes to attempts, and from attempts to
+	// answers.
+	for attemptID, a := range f.quiz.attempts[userID] {
+		if a.QuizID == id {
+			delete(f.quiz.attempts[userID], attemptID)
+			delete(f.quiz.answers, attemptID)
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) CreateAttempt(_ context.Context, userID, quizID uuid.UUID) (Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	q, ok := f.quiz.quizzes[userID][quizID]
+	if !ok {
+		return Attempt{}, ErrQuizNotFound
+	}
+	a := Attempt{
+		ID: uuid.New(), UserID: userID, QuizID: quizID, QuizTitle: q.Title,
+		QuestionCount: len(f.quiz.questions[quizID]), StartedAt: time.Now(),
+	}
+	if f.quiz.attempts[userID] == nil {
+		f.quiz.attempts[userID] = map[uuid.UUID]Attempt{}
+	}
+	f.quiz.attempts[userID][a.ID] = a
+	return a, nil
+}
+
+func (f *fakeStore) AttemptByID(_ context.Context, userID, id uuid.UUID) (Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	a, ok := f.quiz.attempts[userID][id]
+	if !ok {
+		return Attempt{}, ErrAttemptNotFound
+	}
+	a.QuestionCount = len(f.quiz.questions[a.QuizID])
+	a.Answers = append([]Answer(nil), f.quiz.answers[id]...)
+	return a, nil
+}
+
+func (f *fakeStore) QuestionForAttempt(_ context.Context, userID, attemptID, questionID uuid.UUID) (Question, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	a, ok := f.quiz.attempts[userID][attemptID]
+	if !ok {
+		return Question{}, ErrQuestionNotFound
+	}
+	for _, q := range f.quiz.questions[a.QuizID] {
+		if q.ID == questionID {
+			return q, nil
+		}
+	}
+	return Question{}, ErrQuestionNotFound
+}
+
+func (f *fakeStore) CreateAnswer(_ context.Context, userID, attemptID uuid.UUID, in AnswerInput, correct bool) (Answer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	a, ok := f.quiz.attempts[userID][attemptID]
+	if !ok || a.CompletedAt != nil {
+		return Answer{}, ErrAttemptNotFound
+	}
+	// The UNIQUE (attempt_id, question_id) index.
+	for _, existing := range f.quiz.answers[attemptID] {
+		if existing.QuestionID == in.QuestionID {
+			return Answer{}, ErrAlreadyAnswered
+		}
+	}
+	var question Question
+	for _, q := range f.quiz.questions[a.QuizID] {
+		if q.ID == in.QuestionID {
+			question = q
+		}
+	}
+	answer := Answer{
+		ID: uuid.New(), AttemptID: attemptID, QuestionID: in.QuestionID,
+		Question: question.Question, Options: append([]string(nil), question.Options...),
+		SelectedIndex: in.SelectedIndex, CorrectIndex: question.CorrectIndex,
+		Correct: correct, CreatedAt: time.Now(),
+	}
+	f.quiz.answers[attemptID] = append(f.quiz.answers[attemptID], answer)
+	return answer, nil
+}
+
+func (f *fakeStore) CompleteAttempt(_ context.Context, userID, id uuid.UUID) (Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	a, ok := f.quiz.attempts[userID][id]
+	if !ok {
+		return Attempt{}, ErrAttemptNotFound
+	}
+	if a.CompletedAt != nil {
+		return Attempt{}, ErrAttemptComplete
+	}
+	score := 0
+	for _, answer := range f.quiz.answers[id] {
+		if answer.Correct {
+			score++
+		}
+	}
+	now := time.Now()
+	a.CompletedAt, a.Score = &now, &score
+	f.quiz.attempts[userID][id] = a
+	a.QuestionCount = len(f.quiz.questions[a.QuizID])
+	a.Answers = append([]Answer(nil), f.quiz.answers[id]...)
+	return a, nil
+}
+
+// The reply a well-behaved model gives for the seeded document, as a quiz. The
+// correct option of each question is in the passages; the distractors are not,
+// which is the point -- a distractor is supposed to be wrong.
+const groundedQuizReply = `[{"question":"How long did the aurora borealis last?",` +
+	`"options":["About forty minutes","About three hours","Until sunrise","Nine seconds"],` +
+	`"correct_index":0,"topic":"aurora duration"},` +
+	`{"question":"What does the generator need before the next resupply run?",` +
+	`"options":["A spare alternator","A new fuel filter","Nothing at all","A longer guy-line"],` +
+	`"correct_index":1,"topic":"generator servicing"}]`

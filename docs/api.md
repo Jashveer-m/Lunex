@@ -1,4 +1,4 @@
-# Lunex API — v1 (Phases 1–10a)
+# Lunex API — v1 (Phases 1–10b)
 
 Base URL: `http://localhost:8080`
 All request and response bodies are JSON. Unknown JSON fields are rejected.
@@ -909,6 +909,232 @@ only slice of a deck anybody wants is one plan's.
 
 ---
 
+# Phase 10b — quizzes and attempts
+
+A **quiz** is a title and a list of multiple-choice questions written from one
+of your documents, optionally filed under a study plan. An **attempt** is one
+go at a quiz: it is started, answered one question at a time, and finished,
+and its score is how many you got right.
+
+**Generating a quiz is not an endpoint**, for the reason generating flashcards
+is not: it costs a model call and produces content you have to read before it
+is yours, so it happens through the assistant — the `generate_quiz` tool — and
+reaches the database only through an approval. The approval card shows every
+question, every option, and which option will be marked correct. See
+[Actions](#actions) and [decisions.md](decisions.md).
+
+Each question's correct answer is checked against the document before you see
+it. **That is not the same as the answer key being right** — the check
+establishes that an answer was drawn from your text, not that it answers the
+question — so the key is on the approval card for you to read. Wrong answers
+are not checked at all: a distractor is supposed to be wrong.
+
+**Taking a quiz is not an approval flow at all.** There is no tool that starts
+an attempt, answers a question or finishes one, and `tools.StudyService` names
+no method for any of them. Those are your own actions on your own data, so the
+attempt endpoints below are as direct as `POST /study-plans/{id}/flashcards`
+is.
+Approval stands between the assistant and your data, not between you and your
+own.
+
+## Quizzes
+
+### `GET /api/v1/quizzes`
+
+| Parameter | Meaning |
+| --- | --- |
+| `q` | quizzes whose **title** contains this, case-insensitively and literally |
+| `study_plan_id` | only the quizzes filed under one plan |
+| `document_id` | only the quizzes made from one document |
+| `sort` | `created_at`, `title`, each with a `-` prefix for descending. Default `-created_at` |
+| `limit`, `offset` | default 50, max 200 |
+
+```json
+{
+  "quizzes": [
+    {
+      "id": "1f2e3d4c-5b6a-4798-8a9b-0c1d2e3f4a5b",
+      "study_plan_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "study_plan": "Kestrel relay handbook",
+      "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "document": "relay-handbook.txt",
+      "title": "relay-handbook.txt — the battery bank",
+      "question_count": 6,
+      "attempt_count": 3,
+      "best_score": 4,
+      "created_at": "2026-09-21T09:14:02.881Z"
+    }
+  ],
+  "count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`q` searches the **title only**. Searching the questions would leak what a quiz
+asks into a list you are browsing before you sit it.
+
+`question_count`, `attempt_count` and `best_score` are counted on read, so they
+cannot disagree with the rows. `best_score` is the highest score over your
+**finished** attempts and is `null` until you finish one; read it against
+`question_count`. A list carries no `questions`.
+
+### `POST /api/v1/quizzes`
+
+```json
+{
+  "title": "Relay handbook — the battery bank",
+  "study_plan_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+  "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "questions": [
+    {
+      "question": "How long does the changeover to the auxiliary dipole take?",
+      "options": ["Two seconds", "Eleven seconds", "A minute", "It is instant"],
+      "correct_index": 1,
+      "topic": "mast feed timing"
+    }
+  ]
+}
+```
+
+This is the path an approved `generate_quiz` writes through, and it is open to
+a client writing its own questions on the same terms the hand-written flashcard
+endpoint is.
+
+`title` and at least one question are required, up to 15. Each question needs
+2–6 options, none blank and none repeating another, and a `correct_index` that
+is the position of one of them. `topic` is optional and is never invented: a
+question with none stores `null`. The same question text twice in one quiz is
+`400`. `study_plan_id` and `document_id` must be **yours**; somebody else's is
+`404 not_found`, not a validation error.
+
+`201 Created` — the quiz object, with its questions. **A quiz gets no
+knowledge-graph node**: the plan is the thing worth connecting and the quiz
+hangs off it, exactly as a deck does.
+
+### `GET /api/v1/quizzes/{id}`
+
+`200 OK` — the quiz, with its `questions`:
+
+```json
+{
+  "id": "1f2e3d4c-5b6a-4798-8a9b-0c1d2e3f4a5b",
+  "title": "Relay handbook — the battery bank",
+  "question_count": 1,
+  "questions": [
+    {
+      "id": "7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f",
+      "question": "How long does the changeover to the auxiliary dipole take?",
+      "options": ["Two seconds", "Eleven seconds", "A minute", "It is instant"],
+      "topic": "mast feed timing"
+    }
+  ],
+  "…": "…"
+}
+```
+
+**There is no `correct_index` here.** You are not being kept from your own data
+— the answer comes back the moment you answer the question, and a finished
+attempt reads back with every correct index on it — but a quiz whose `GET`
+hands the client the answer key is a quiz any client will accidentally spoil,
+and the resource exists to be answered rather than read. See
+[decisions.md](decisions.md).
+
+Questions come back in the order they were written, which for a generated quiz
+is the order of the document.
+
+### `DELETE /api/v1/quizzes/{id}`
+
+`204 No Content`. **Its questions, its attempts and their answers go with it.**
+
+There is no `PATCH`. A quiz with a question added or changed is a different
+quiz from the one you have already sat, and the attempts at the old one would
+silently be scored against the new total.
+
+---
+
+## Attempts
+
+### `POST /api/v1/quizzes/{id}/attempts`
+
+No body. `201 Created` — a new attempt:
+
+```json
+{
+  "id": "2b3c4d5e-6f70-4812-9a3b-4c5d6e7f8091",
+  "quiz_id": "1f2e3d4c-5b6a-4798-8a9b-0c1d2e3f4a5b",
+  "quiz": "Relay handbook — the battery bank",
+  "question_count": 6,
+  "started_at": "2026-09-21T09:20:44.118Z",
+  "completed_at": null,
+  "score": null,
+  "answers": []
+}
+```
+
+Retaking a quiz is simply another attempt. Nothing stops you having two open at
+once: an attempt is a row, and a rule that there may be only one would need an
+answer to "what happens to the old one" that nobody has asked for.
+
+### `POST /api/v1/quiz-attempts/{id}/answers`
+
+```json
+{ "question_id": "7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", "selected_index": 1 }
+```
+
+`201 Created` — the graded answer, **with the key**:
+
+```json
+{
+  "id": "8d9e0f1a-2b3c-4d5e-9f60-7a8b9c0d1e2f",
+  "question_id": "7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f",
+  "question": "How long does the changeover to the auxiliary dipole take?",
+  "options": ["Two seconds", "Eleven seconds", "A minute", "It is instant"],
+  "selected_index": 1,
+  "correct_index": 1,
+  "correct": true,
+  "created_at": "2026-09-21T09:21:03.552Z"
+}
+```
+
+This is where the answer key is revealed: one question at a time, and only once
+it has been answered.
+
+| Situation | Answer |
+| --- | --- |
+| the attempt is not yours, or does not exist | `404 not_found` |
+| the attempt is finished | `409 attempt_complete` |
+| the question is not in this attempt's quiz — including one of **your own** other quizzes | `404 not_found` |
+| the question was already answered in this attempt | `409 already_answered` |
+| `selected_index` is not the position of one of *that question's* options | `400 validation_failed` |
+
+The repeat is a conflict rather than an overwrite: an attempt records what you
+actually answered, not what you answered last having seen the first verdict.
+The rule is a unique index in the schema, not only a check in the service, so
+two concurrent submissions cannot both land.
+
+### `POST /api/v1/quiz-attempts/{id}/complete`
+
+No body. `200 OK` — the attempt with `completed_at` and `score` set, and its
+answers.
+
+The score is **how many you got right**, computed in the same statement that
+closes the attempt, so there is no window in which an attempt is complete and
+unscored. Questions you left unanswered are not counted wrong — they are not
+counted at all, and `question_count` is what makes "4" read as "4 of 6". An
+attempt can be completed with nothing answered.
+
+Completing an attempt twice is `409 attempt_complete`.
+
+### `GET /api/v1/quiz-attempts/{id}`
+
+`200 OK` — the attempt, its answers oldest first, and its score once it has
+one. Each answer carries its question, its options and the correct index,
+because the only reason to read an attempt is to review it and "you picked 2"
+is not a review.
+
+---
+
 ## Documents
 
 Upload a file, and the API extracts its text, splits it into overlapping
@@ -1673,6 +1899,8 @@ none can delete.
 | `search_study_plans` | read | what you are studying, what each plan is built from, and how big its deck is, optionally by status |
 | `create_study_plan` | write | title, and optionally a description and one of your uploaded documents |
 | `generate_flashcards` | write | writes flashcards from one of your documents and proposes them — **the cards themselves are the proposal** |
+| `search_quizzes` | read | your quizzes: what each is on, how big it is, how many times you have taken it and your best score. **Never the questions or the answers** |
+| `generate_quiz` | write | writes multiple-choice questions from one of your documents and proposes them — **the questions, their options and the answer key are the proposal** |
 
 **A read runs during the turn.** When a message looks like it asks to find
 something, the model may choose a search; it runs immediately, what it found
@@ -1846,7 +2074,10 @@ edited and does not expire. See `docs/decisions.md`.
 | `name` (expense categories) | 1–100 characters, whitespace collapsed |
 | `description` (expenses) | 1,000 characters |
 | `front`, `back` (flashcards) | 1–1,000 characters each, whitespace collapsed |
-| `topic` (flashcard generation) | 200 characters |
+| `topic` (flashcard or quiz generation) | 200 characters |
+| `question` (quiz) | 1–1,000 characters, whitespace collapsed |
+| `options` (quiz) | 2–6 per question, 1–500 characters each, none repeated |
+| `topic` (quiz question) | 100 characters, or null |
 | `amount` | greater than 0, at most 9,999,999,999.99, at most two decimal places |
 | `currency` | exactly 3 letters |
 | `location` (events) | 500 characters |
@@ -1863,6 +2094,8 @@ edited and does not expire. See `docs/decisions.md`.
 | study-plan list paging | default 50, max 200 |
 | flashcard list paging | default 200, max 500 |
 | flashcards per generation | default 8, max 20 |
+| quiz list paging | default 50, max 200 |
+| questions per quiz | 1–15; a generation defaults to 6 |
 | passages per generation | 8 chunks, 6,000 characters |
 | chat message `content` | 8,000 characters |
 | memory `content` | 1,000 characters |

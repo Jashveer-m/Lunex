@@ -336,6 +336,46 @@ Here it is **content a model wrote**, so the check goes further:
 `E2E_ONLY=study ./scripts/e2e.sh` runs only the preflight, registration and
 this check — it uploads its own document, so it stands alone.
 
+Since Phase 10b the same section ends with the **quiz** check, which is the
+study check with one more thing to get right: a quiz is content a model wrote
+*and* an answer key, so it is not enough that the questions trace back to the
+document — the grading has to agree with what the user approved. It runs
+against the same handbook and the same plan:
+
+- **ask for a quiz** — "Make me a multiple-choice quiz from relay-handbook.txt
+  for my Kestrel relay handbook plan." must produce one `action` frame naming
+  `generate_quiz`, proposed, whose stored input carries the questions with
+  their options and a `correct_index` that is one of them — and whose summary
+  shows **every question, every option, and which one is marked `(correct)`**.
+  An answer key the user never saw is the one error here they cannot correct
+  afterwards;
+- **proposed, not saved** — `GET /quizzes` must still be empty;
+- **approve it** — the saved quiz must be what was shown, question for question
+  and option for option *in the same order* (nothing shuffles between the
+  approval card and the database), filed under the plan and recording the
+  document. `GET /quizzes/{id}` must **not** carry `correct_index`. A second
+  approval must be `409` without saving a second quiz;
+- **take it** — every question is answered, the first one deliberately wrong
+  and the rest right, so grading is checked in both directions rather than
+  being the total either way. Each answer's `correct` must agree with the key
+  that was approved, and answering one question twice must be `409`;
+- **finish it** — the score must be the number the answers support, out of the
+  quiz's `question_count`, every answer's verdict must match its own indices, a
+  second completion must be `409`, and the quiz must then report one attempt
+  and that best score;
+- **grounded** — every *correct* option is checked against the uploaded file by
+  the same rule the flashcard step uses. The distractors are not checked, which
+  is the phase's deliberate limit; see [decisions.md](decisions.md). **This one
+  fails the run**;
+- **read it back** — "What quizzes do I have?" must
+  run `search_quizzes`, and what reaches the model must carry the counts and
+  **none of the questions or options**. That is the assertion the prompt rule
+  exists to back up: the assistant cannot spoil a quiz because it was never
+  shown one.
+
+`E2E_ONLY=quiz ./scripts/e2e.sh` runs the upload, the plan and this check, and
+skips the flashcard half; `E2E_ONLY=study` runs both.
+
 The script builds the API and runs the binary directly, and refuses to start if
 anything already answers on its port (`E2E_PORT`, default 8099). Before Phase 7
 it started the server with `go run` and killed the `go run` process on exit,
@@ -348,7 +388,7 @@ A run against a cold model takes several minutes: the first turn includes
 loading llama3.2:3b into memory, and since Phase 6 each substantial turn makes
 *three* model calls rather than one (four since Phase 7, when the message looks
 like it asks for a tool, and **five** since Phase 10a when that tool is
-`generate_flashcards`) — the routing call, the generation, the answer, the
+`generate_flashcards` or, since 10b, `generate_quiz`) — the routing call, the generation, the answer, the
 memory extraction and the relationship extraction, in that order and in
 sequence, because they all queue behind the same resident model.
 
@@ -367,26 +407,51 @@ good output, just not inside the budget.
 
 The **routing call** is the one to watch since Phase 10a, and it is worth
 naming because it is the least obvious. It got slower without anybody making it
-slower: the routing prompt renders every offered tool, and Phase 10a added
-three, so the prompt is now about 8,300 characters and the model has to
-evaluate all of it before writing a word. Measured on the same machine: one
-routing decision at 16 tools takes **3m08s**, over a 180s default — and it
-fails as `model_unavailable` on the *first* turn of the study check rather than
-as anything about study. The decision itself was correct; it simply did not
-arrive in time.
+slower: the routing prompt renders every offered tool, and the model has to
+evaluate all of it before writing a word. Every module that adds a tool
+therefore slows down every turn, including turns that have nothing to do with
+it.
+
+| Tools offered | Routing prompt |
+| --- | --- |
+| 16 (Phase 10a) | 8,300 characters |
+| 18 (Phase 10b) | 9,387 characters |
+
+Those two figures are exact — they are computed from the tool declarations. The
+times are not, and this page is careful to say which is which. One routing
+decision at 16 tools was measured at **3m08s** on a 2019 Intel Mac that was
+otherwise idle, against a 180s default. At 18 tools, on the same machine but
+under heavy load and with Ollama on CPU, a single decision did not finish
+inside fifteen minutes. That second number measures a busy laptop rather than
+the two extra tools; what it establishes is only that the `AGENT_TIMEOUT=420s`
+this page used to recommend is no longer enough headroom.
+
+When the budget is missed, the turn fails as `model_unavailable` on the *first*
+turn of the study or quiz check rather than as anything about study or quizzes.
+The decision itself is correct; it simply does not arrive in time. See
+[decisions.md](decisions.md) for why the fix is configuration rather than code,
+and what the structural answer is.
 
 The timeouts and the turn budget are all passed through to the API, so raise
 them together:
 
 ```sh
-MEMORY_EXTRACT_TIMEOUT=300s GRAPH_EXTRACT_TIMEOUT=300s AGENT_TIMEOUT=420s \
-  STUDY_GENERATE_TIMEOUT=420s CHAT_TIMEOUT=50m ./scripts/e2e.sh
+MEMORY_EXTRACT_TIMEOUT=300s GRAPH_EXTRACT_TIMEOUT=300s AGENT_TIMEOUT=900s \
+  STUDY_GENERATE_TIMEOUT=600s CHAT_TIMEOUT=90m ./scripts/e2e.sh
 ```
 
 `CHAT_TIMEOUT` has to cover the whole turn *including* both extractions, the
-routing call and a flashcard generation, and `config.Load` refuses to start a
-process where they would take more than half of it — so raising one without the
-others is a boot error rather than a mystery.
+routing call and a flashcard or quiz generation, and `config.Load` refuses to
+start a process where they would take more than half of it — so raising one
+without the others is a boot error rather than a mystery. On a machine with
+GPU acceleration the Phase 10a numbers are the right starting point.
+
+On a machine slow enough that even that is impractical, `MEMORY_EXTRACTION=0`
+and `GRAPH_EXTRACTION=0` are passed through as well. They take two model calls
+off every substantial turn, which roughly halves a study or quiz run. The
+sections that assert on what was remembered or linked will then fail, so they
+are for running one `E2E_ONLY` check that does not — not for making a full run
+go green.
 
 One other thing got slower rather than merely longer: the run holds a single
 access token from registration to the last assertion, and that span now

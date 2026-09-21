@@ -256,6 +256,16 @@ func TestTheGateSkipsConversationAndKeepsRequests(t *testing.T) {
 		"Remind me to call the bank on Friday",
 		"Delete my task about the antenna",
 		"I finished the essay",
+		// Phase 10a's tools were reachable only by accident: these are the
+		// natural ways to ask for them, and until 10b added the study cues
+		// every one of them was gated out before the router saw it -- so no
+		// tool could ever be chosen for them, however good the model was.
+		"Quiz me on the relay handbook",
+		"What is on my flashcards?",
+		"Test me on chapter four",
+		"Make me a deck from lecture-3.pdf",
+		"I need to revise the battery bank section",
+		"What am I studying?",
 	} {
 		if !MightUseTool(m) {
 			t.Fatalf("the gate skipped %q", m)

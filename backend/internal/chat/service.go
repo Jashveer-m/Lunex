@@ -476,6 +476,10 @@ func anchorFor(r tools.Result) *graph.Anchor {
 	case len(r.Plans) > 0:
 		return &graph.Anchor{RefTable: "study_plans", RefID: r.Plans[0].ID, Label: r.Plans[0].Title}
 	}
+	// A created quiz has no anchor, because a quiz has no graph node: the plan
+	// is the thing worth connecting and the quiz hangs off it, exactly as a
+	// deck does. See migration 000011. A nil anchor is the ordinary "nothing
+	// to anchor to" the extractor already handles.
 	return nil
 }
 

@@ -69,8 +69,14 @@
 #     STUDY_GENERATE_TIMEOUT=180s CHAT_TIMEOUT=24m ./scripts/e2e.sh
 #
 # CHAT_TIMEOUT has to cover the whole turn including both extractions, the
-# routing call and a flashcard generation, and the API refuses to start if it
-# does not leave them room -- so raise them together or none.
+# routing call and a flashcard or quiz generation, and the API refuses to start
+# if it does not leave them room -- so raise them together or none.
+#
+# On a machine slow enough that a full run is impractical, MEMORY_EXTRACTION=0
+# and GRAPH_EXTRACTION=0 are passed through too. They take two model calls off
+# every substantial turn, and the sections that assert on what was remembered
+# or linked will fail -- so they are for running one of the E2E_ONLY checks
+# that does not, not for making a full run go green.
 #
 # The run also holds one access token from registration to the last assertion,
 # and since Phase 6 that span routinely exceeds the 15-minute default TTL --
@@ -154,6 +160,8 @@ BIN="$(mktemp -d)/api"
   GRAPH_EXTRACT_TIMEOUT="${GRAPH_EXTRACT_TIMEOUT:-}" \
   AGENT_TIMEOUT="${AGENT_TIMEOUT:-}" \
   STUDY_GENERATE_TIMEOUT="${STUDY_GENERATE_TIMEOUT:-}" \
+  MEMORY_EXTRACTION="${MEMORY_EXTRACTION:-}" \
+  GRAPH_EXTRACTION="${GRAPH_EXTRACTION:-}" \
   exec "${BIN}" >"${LOG}" 2>&1) &
 API_PID=$!
 trap 'kill "${API_PID}" 2>/dev/null || true; wait "${API_PID}" 2>/dev/null || true' EXIT
@@ -237,6 +245,10 @@ out = {
                                for i, (k, _) in enumerate(events) if k == "action"),
     "done_actions": len((done or {}).get("actions", [])),
     "tool_sources": ",".join("%s:%s" % (s.get("tool"), s["title"]) for s in sources if s.get("tool")),
+    # Phase 10b: what a tool's sources actually put in front of the model,
+    # which for a quiz is the assertion that matters -- a quiz source must
+    # carry counts and no questions.
+    "tool_excerpts": " | ".join(s.get("excerpt", "") for s in sources if s.get("tool")),
     "tool_cited": len([s for s in sources if s.get("tool") and s["cited"]]),
 }
 print(out[want])
@@ -1147,9 +1159,14 @@ fi # E2E_ONLY: finance only
 # stand out: an invented answer cannot accidentally match a station name and a
 # set of made-up figures.
 #
-# This section uploads its own document, so E2E_ONLY=study runs on its own.
+# Phase 10b's quiz check is at the end of this section rather than in one of
+# its own, because it needs the same uploaded handbook and the same study plan.
+# E2E_ONLY=quiz runs the upload, the plan and the quiz check and skips the
+# flashcard half; E2E_ONLY=study runs all of it.
+#
+# This section uploads its own document, so either runs on its own.
 
-if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "study" ]; then
+if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "study" ] || [ "${E2E_ONLY:-}" = "quiz" ]; then
 
 step "Uploading a document to study from"
 STUDY_FILE="$(mktemp -d)/relay-handbook.txt"
@@ -1206,6 +1223,8 @@ assert n["type"] == "project", "the node is a %r" % n["type"]
 print("     %s (%s)" % (n["label"], n["type"]))
 ' "${STUDY_PLAN_ID}" || fail "the plan has no graph node: ${STUDY_NODES}"
 ok "a study plan is mirrored as a project node, like every other mirrored row"
+
+if [ "${E2E_ONLY:-}" != "quiz" ]; then
 
 step "Asking the assistant for flashcards from the document"
 STUDY_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
@@ -1294,6 +1313,21 @@ most such only own same too many much each both other another between under afte
 definition describe explain name list state give according document passage text mentioned
 mentions says said call called known term mean means meaning answer question""".split())
 
+# The figures a model writes out in words. They are held to the same two rules
+# as a token with a digit in it -- matched exactly, and fatal when the document
+# does not contain them -- because "every sixty days" from a handbook that says
+# "every forty days" is the same wrong answer as "60 days" would be. Measured
+# on llama3.2:3b, which wrote exactly that. Keep in step with numberWords in
+# internal/study/grounding.go.
+NUMBERS = set("""zero one two three four five six seven eight nine ten eleven twelve thirteen
+fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy
+eighty ninety hundred thousand million billion first second third fourth fifth sixth seventh
+eighth ninth tenth eleventh twelfth twentieth thirtieth fortieth fiftieth hundredth thousandth
+half quarter twice double triple dozen once""".split())
+
+def figure(w):
+    return any(ch.isdigit() for ch in w) or w in NUMBERS
+
 def words(s):
     out, seen = [], set()
     for w in re.findall(r"[0-9a-z']+", s.lower()):
@@ -1310,7 +1344,9 @@ def words(s):
 def same(a, b):
     if a == b:
         return True
-    if any(ch.isdigit() for ch in a + b):
+    # A figure matches only exactly, whether it is digits or words: "40" is a
+    # prefix of "400" and "four" is a prefix of "fourteen".
+    if figure(a) or figure(b):
         return False
     short, long = sorted((a, b), key=len)
     return len(short) >= 4 and long.startswith(short)
@@ -1323,9 +1359,10 @@ bad = []
 for c in cards:
     ws = words(c["back"])
     found = [w for w in ws if any(same(w, s) for s in source)]
-    # An unsupported figure sinks an answer outright: a wrong number is the
-    # part of a flashcard a learner is least able to check.
-    numbers = [w for w in ws if any(ch.isdigit() for ch in w) and w not in found]
+    # An unsupported figure sinks an answer outright, written in digits or in
+    # words: a wrong number is the part of a flashcard a learner is least able
+    # to check.
+    numbers = [w for w in ws if figure(w) and w not in found]
     if not ws or numbers or len(found) * 3 < len(ws) * 2:
         bad.append((c, [w for w in ws if w not in found]))
 
@@ -1358,12 +1395,309 @@ assert any(p["card_count"] > 0 for p in plans), "the plan reports no cards: %r" 
 ok "search_study_plans ran without approval; $(sse "${LOOK}" tool_cited) cited"
 printf '     %s\n' "$(sse "${LOOK}" answer | tr '\n' ' ' | head -c 300)"
 
-fi # E2E_ONLY: study only
+fi # E2E_ONLY=quiz skips the flashcard half
+
+# --- Phase 10b: quizzes ----------------------------------------------------------
+#
+# The same rule as the flashcard check, applied to a thing with one more part
+# to it. A quiz is content a model wrote *and* an answer key, so it is not
+# enough to see that rows appeared: the proposal has to show every question
+# with its options and which one will be marked right, the approval has to
+# write exactly that, taking it has to grade against exactly that, and every
+# correct answer has to trace back to the uploaded text.
+#
+# It runs against the same handbook, which was written for this: short,
+# factual, and about something a 3B model has no prior opinion about, so an
+# invented answer cannot accidentally match a station name and a set of
+# made-up figures.
+
+# quiz_count -- how many quizzes the user has.
+quiz_count() {
+  local body
+  body=$(curl -s "${API}/api/v1/quizzes" -H "${AUTH}")
+  expect "listing the quizzes" "${body}" 'd["count"]'
+}
+
+step "Asking the assistant for a quiz from the document"
+QUIZ_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" \
+  -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+[ -n "${QUIZ_CONV}" ] || fail "conversation was not created"
+[ "$(quiz_count)" = "0" ] || fail "a quiz exists before one was asked for"
+
+MAKEQ="$(mktemp)"
+ask "${QUIZ_CONV}" "Make me a multiple-choice quiz from relay-handbook.txt for my Kestrel relay handbook plan." "${MAKEQ}"
+sse "${MAKEQ}" answer >/dev/null || fail "the quiz turn failed"
+[ "$(sse "${MAKEQ}" action_frames)" = "1" ] || {
+  fail "the turn announced $(sse "${MAKEQ}" action_frames) action frame(s), want 1: $(sse "${MAKEQ}" answer | head -c 300)"
+}
+QUIZ_ACTION="$(sse "${MAKEQ}" action)"
+QUIZ_ACTION_ID=$(expect "reading the action frame" "${QUIZ_ACTION}" 'd["id"]')
+
+# The proposal has to *be* the quiz, answer key included. A summary that only
+# counted the questions would leave the user approving an answer key they had
+# not read -- and an answer key is the one thing here they cannot correct
+# afterwards, because a wrong one marks them wrong for knowing better.
+echo "${QUIZ_ACTION}" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["tool_name"] == "generate_quiz", "tool is %r" % a["tool_name"]
+assert a["status"] == "proposed", "status is %r" % a["status"]
+assert a["permission_level"] == "write", "permission is %r" % a["permission_level"]
+assert a["result"] is None, "a proposal has a result: %r" % a
+questions = a["input"].get("questions") or []
+assert questions, "the proposal carries no questions: %r" % a["input"]
+assert a["input"].get("title"), "the proposal has no title: %r" % a["input"]
+for q in questions:
+    assert q.get("question"), "a proposed question is empty: %r" % q
+    options = q.get("options") or []
+    assert 2 <= len(options) <= 6, "a question has %d options: %r" % (len(options), q)
+    i = q.get("correct_index")
+    assert isinstance(i, int) and 0 <= i < len(options), "correct_index %r is not an option: %r" % (i, q)
+    # Every question, every option and the answer key are in the summary the
+    # user reads.
+    assert q["question"] in a["summary"], "the summary does not show %r" % q["question"]
+    for o in options:
+        assert o in a["summary"], "the summary does not show the option %r" % o
+assert "(correct)" in a["summary"], "the summary does not mark which option is right"
+print("     %d question(s) proposed" % len(questions))
+' || fail "the proposal does not show the quiz it would create: ${QUIZ_ACTION}"
+ok "proposed, with the questions and the answer key in it"
+printf '%s\n' "$(echo "${QUIZ_ACTION}" | json 'd["summary"]')" | sed 's/^/     /'
+claims_done "$(sse "${MAKEQ}" answer)"
+
+step "Checking it was proposed, not saved"
+[ "$(quiz_count)" = "0" ] || fail "the quiz exists before it was approved"
+ok "the user still has no quizzes"
+
+step "Approving it"
+QUIZ_APPROVED=$(curl -s -X POST "${API}/api/v1/actions/${QUIZ_ACTION_ID}/approve" -H "${AUTH}")
+[ "$(expect "approving" "${QUIZ_APPROVED}" 'd["status"]')" = "executed" ] \
+  || fail "approval did not execute: ${QUIZ_APPROVED}"
+QUIZ_ID=$(expect "reading the approved result" "${QUIZ_APPROVED}" 'd["result"]["quiz_id"]')
+QUIZ=$(curl -s "${API}/api/v1/quizzes/${QUIZ_ID}" -H "${AUTH}")
+
+# What was saved is exactly what was shown -- not a second generation, which
+# would store a quiz nobody had read. And the answer key is not in the
+# response: a client rendering this cannot spoil it.
+echo "${QUIZ}" | python3 -c '
+import sys, json
+saved = json.load(sys.stdin)
+proposed = json.loads(sys.argv[1])["input"]
+assert saved["title"] == proposed["title"], "saved %r, approved %r" % (saved["title"], proposed["title"])
+assert saved["study_plan"] == "Kestrel relay handbook", "filed under %r" % saved["study_plan"]
+assert saved["document"] == "relay-handbook.txt", "made from %r" % saved["document"]
+assert saved["attempt_count"] == 0 and saved["best_score"] is None, "a new quiz reads %r" % saved
+got, want = saved["questions"], proposed["questions"]
+assert len(got) == len(want), "%d questions saved, %d proposed" % (len(got), len(want))
+for g, w in zip(got, want):
+    assert g["question"] == w["question"], "saved %r, approved %r" % (g["question"], w["question"])
+    assert g["options"] == w["options"], "options saved %r, approved %r" % (g["options"], w["options"])
+    assert "correct_index" not in g, "reading the quiz hands the client the answer key: %r" % g
+' "${QUIZ_ACTION}" || fail "what was saved is not what was approved: ${QUIZ}"
+
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/actions/${QUIZ_ACTION_ID}/approve" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "a second approval returned ${CODE}, want 409"
+[ "$(quiz_count)" = "1" ] || fail "approving twice saved a second quiz"
+ok "saved $(echo "${QUIZ}" | json 'len(d["questions"])') question(s), byte for byte what was approved; a second approval is 409"
+
+step "Taking the quiz"
+# Every question is answered: the first one deliberately wrong, the rest
+# right, so the score is checked in both directions rather than being the
+# total either way.
+ATTEMPT=$(curl -s -X POST "${API}/api/v1/quizzes/${QUIZ_ID}/attempts" -H "${AUTH}")
+ATTEMPT_ID=$(expect "starting the attempt" "${ATTEMPT}" 'd["id"]')
+[ "$(echo "${ATTEMPT}" | json 'd["completed_at"] is None')" = "True" ] \
+  || fail "a new attempt is already complete: ${ATTEMPT}"
+
+QUIZ_JSON="$(mktemp)"
+printf '%s' "${QUIZ_ACTION}" > "${QUIZ_JSON}"
+ANSWERS="$(mktemp)"
+python3 - "${QUIZ_JSON}" "${QUIZ}" > "${ANSWERS}" <<'PYEOF'
+import sys, json
+# The approved input holds the answer key; the saved quiz holds the question
+# ids. They are in the same order, because nothing between the proposal and
+# the database rearranges them -- which is itself what this pairing checks.
+key = json.load(open(sys.argv[1]))["input"]["questions"]
+saved = json.loads(sys.argv[2])["questions"]
+assert len(key) == len(saved), "%d approved, %d saved" % (len(key), len(saved))
+for i, (k, q) in enumerate(zip(key, saved)):
+    assert k["question"] == q["question"], "question %d is %r, approved %r" % (i, q["question"], k["question"])
+    correct = k["correct_index"]
+    if i == 0:
+        # Any option that is not the right one.
+        chosen = next(j for j in range(len(q["options"])) if j != correct)
+    else:
+        chosen = correct
+    print("%s %d %d" % (q["id"], chosen, 1 if chosen == correct else 0))
+PYEOF
+[ -s "${ANSWERS}" ] || fail "could not pair the approved answer key with the saved quiz"
+
+EXPECTED=0
+while read -r QID CHOSEN WANT; do
+  ANSWER=$(curl -s -X POST "${API}/api/v1/quiz-attempts/${ATTEMPT_ID}/answers" -H "${AUTH}" \
+    -H 'Content-Type: application/json' \
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"question_id":sys.argv[1],"selected_index":int(sys.argv[2])}))' "${QID}" "${CHOSEN}")")
+  GOT=$(expect "answering ${QID}" "${ANSWER}" 'int(d["correct"])')
+  [ "${GOT}" = "${WANT}" ] \
+    || fail "option ${CHOSEN} was graded correct=${GOT}, want ${WANT}: ${ANSWER}"
+  EXPECTED=$((EXPECTED + WANT))
+done < "${ANSWERS}"
+
+# The same question twice in one attempt is a conflict, not an overwrite.
+FIRST_QID=$(head -1 "${ANSWERS}" | cut -d' ' -f1)
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/quiz-attempts/${ATTEMPT_ID}/answers" -H "${AUTH}" \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json,sys;print(json.dumps({"question_id":sys.argv[1],"selected_index":0}))' "${FIRST_QID}")")
+[ "${CODE}" = "409" ] || fail "answering the same question twice returned ${CODE}, want 409"
+ok "answered $(wc -l < "${ANSWERS}" | tr -d ' ') question(s); a repeat answer is 409"
+
+step "Finishing it and checking the score"
+DONE=$(curl -s -X POST "${API}/api/v1/quiz-attempts/${ATTEMPT_ID}/complete" -H "${AUTH}")
+echo "${DONE}" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+expected, asked = int(sys.argv[1]), int(sys.argv[2])
+assert a["completed_at"] is not None, "the attempt is not complete: %r" % a
+assert a["score"] == expected, "score is %r, want %d" % (a["score"], expected)
+assert a["question_count"] == asked, "question_count is %r, want %d" % (a["question_count"], asked)
+assert len(a["answers"]) == asked, "%d answers recorded, want %d" % (len(a["answers"]), asked)
+for ans in a["answers"]:
+    assert ans["correct"] == (ans["selected_index"] == ans["correct_index"]), "graded wrongly: %r" % ans
+print("     scored %d of %d" % (a["score"], a["question_count"]))
+' "${EXPECTED}" "$(wc -l < "${ANSWERS}" | tr -d ' ')" || fail "the attempt was not scored as its answers support: ${DONE}"
+
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/api/v1/quiz-attempts/${ATTEMPT_ID}/complete" -H "${AUTH}")
+[ "${CODE}" = "409" ] || fail "completing twice returned ${CODE}, want 409"
+RELOADED=$(curl -s "${API}/api/v1/quizzes/${QUIZ_ID}" -H "${AUTH}")
+echo "${RELOADED}" | python3 -c '
+import sys, json
+q = json.load(sys.stdin)
+assert q["attempt_count"] == 1, "attempt_count is %r" % q["attempt_count"]
+assert q["best_score"] == int(sys.argv[1]), "best_score is %r, want %s" % (q["best_score"], sys.argv[1])
+' "${EXPECTED}" || fail "the quiz does not report the attempt: ${RELOADED}"
+ok "scored, and the quiz reports the attempt and the best score; a second completion is 409"
+
+step "Checking every correct answer says what the document says"
+# The point of the phase, and the reason a quiz is not just a deck with extra
+# fields: the *correct* option has to trace back to the uploaded text. A
+# distractor does not -- it is supposed to be wrong -- so only the answer key
+# is checked, which is exactly what the service checks.
+python3 - "${STUDY_FILE}" "${QUIZ_JSON}" <<'PYEOF' || fail "a saved quiz answer is not grounded in the uploaded document"
+import sys, json, re
+
+STOP = set("""the and for with this that these those their they them its our your you has have
+had was were are been being will would can could should not but from into onto over than then
+about some any all also very who what which when where how why there here does did just more
+most such only own same too many much each both other another between under after before define
+definition describe explain name list state give according document passage text mentioned
+mentions says said call called known term mean means meaning answer question""".split())
+
+# The figures a model writes out in words. They are held to the same two rules
+# as a token with a digit in it -- matched exactly, and fatal when the document
+# does not contain them -- because "every sixty days" from a handbook that says
+# "every forty days" is the same wrong answer as "60 days" would be. Measured
+# on llama3.2:3b, which wrote exactly that. Keep in step with numberWords in
+# internal/study/grounding.go.
+NUMBERS = set("""zero one two three four five six seven eight nine ten eleven twelve thirteen
+fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy
+eighty ninety hundred thousand million billion first second third fourth fifth sixth seventh
+eighth ninth tenth eleventh twelfth twentieth thirtieth fortieth fiftieth hundredth thousandth
+half quarter twice double triple dozen once""".split())
+
+def figure(w):
+    return any(ch.isdigit() for ch in w) or w in NUMBERS
+
+def words(s):
+    out, seen = [], set()
+    for w in re.findall(r"[0-9a-z']+", s.lower()):
+        w = w.strip("'")
+        if not any(ch.isdigit() for ch in w):
+            if len(w) < 3 or w in STOP:
+                continue
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out
+
+def same(a, b):
+    if a == b:
+        return True
+    # A figure matches only exactly, whether it is digits or words: "40" is a
+    # prefix of "400" and "four" is a prefix of "fourteen".
+    if figure(a) or figure(b):
+        return False
+    short, long = sorted((a, b), key=len)
+    return len(short) >= 4 and long.startswith(short)
+
+source = words(open(sys.argv[1]).read())
+questions = json.load(open(sys.argv[2]))["input"]["questions"]
+assert questions, "no questions to check"
+
+bad = []
+for q in questions:
+    answer = q["options"][q["correct_index"]]
+    ws = words(answer)
+    found = [w for w in ws if any(same(w, s) for s in source)]
+    # An unsupported figure sinks an answer outright, written in digits or in
+    # words: a wrong answer key marks the learner wrong for knowing better.
+    numbers = [w for w in ws if figure(w) and w not in found]
+    if not ws or numbers or len(found) * 3 < len(ws) * 2:
+        bad.append((q, answer, [w for w in ws if w not in found]))
+
+for q in questions:
+    print("     Q: %s" % q["question"])
+    for i, o in enumerate(q["options"]):
+        print("        %s %s" % ("*" if i == q["correct_index"] else "-", o))
+if bad:
+    for q, answer, missing in bad:
+        print("     NOT IN THE DOCUMENT: %r (words: %s)" % (answer, ", ".join(missing)))
+    sys.exit("%d of %d answer keys say something the handbook does not" % (len(bad), len(questions)))
+PYEOF
+ok "every correct answer traces back to relay-handbook.txt"
+
+step "Asking what quizzes the assistant can see"
+LOOKQ="$(mktemp)"
+ask "${QUIZ_CONV}" "What quizzes do I have?" "${LOOKQ}"
+sse "${LOOKQ}" answer >/dev/null || fail "the quiz read turn failed"
+sse "${LOOKQ}" tool_sources | grep -qi "search_quizzes:" \
+  || fail "the search did not run: sources=$(sse "${LOOKQ}" tool_sources) types=$(sse "${LOOKQ}" types)"
+echo "$(sse "${LOOKQ}" action)" | python3 -c '
+import sys, json
+a = json.load(sys.stdin)
+assert a["permission_level"] == "read" and a["status"] == "executed", "the read is %r" % a
+quizzes = a["result"]["quizzes"]
+assert quizzes, "the read found no quizzes"
+for q in quizzes:
+    assert q["attempt_count"] >= 1, "the quiz reports no attempts: %r" % q
+    # A quiz read carries counts, never content.
+    for forbidden in ("questions", "options", "correct_index"):
+        assert forbidden not in q, "a quiz read leaked %r: %r" % (forbidden, q)
+' || fail "the read did not return the quiz and how it went: $(sse "${LOOKQ}" action)"
+
+# And what reached the model carries no question and no answer. This is the
+# assertion the prompt rule exists to back up: the assistant cannot spoil a
+# quiz because it was never shown one.
+EXCERPTS="$(sse "${LOOKQ}" tool_excerpts)"
+python3 - "${EXCERPTS}" "${QUIZ_JSON}" <<'PYEOF' || fail "a quiz source put the quiz in front of the model"
+import sys, json
+excerpts = sys.argv[1]
+for q in json.load(open(sys.argv[2]))["input"]["questions"]:
+    assert q["question"] not in excerpts, "the model was shown the question %r" % q["question"]
+    for o in q["options"]:
+        assert o not in excerpts, "the model was shown the option %r" % o
+print("     what the model saw: %s" % excerpts[:200])
+PYEOF
+ok "search_quizzes ran without approval and showed the model counts, not questions"
+printf '     %s\n' "$(sse "${LOOKQ}" answer | tr '\n' ' ' | head -c 300)"
+
+fi # E2E_ONLY: study / quiz only
 
 case "${E2E_ONLY:-}" in
   actions)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n' ;;
   calendar) printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> on the calendar -> node -> read back\n' ;;
   finance)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> recorded -> node -> totalled -> not advised\n' ;;
-  study)    printf '\n\033[32mPASS\033[0m upload -> plan -> node -> generate -> propose (with the cards) -> approve -> saved -> grounded -> read back\n' ;;
-  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total -> study -> generate -> ground\n' ;;
+  study)    printf '\n\033[32mPASS\033[0m upload -> plan -> node -> generate -> propose (with the cards) -> approve -> saved -> grounded -> read back -> quiz -> take -> score\n' ;;
+  quiz)     printf '\n\033[32mPASS\033[0m upload -> plan -> generate -> propose (with the answer key) -> approve -> saved -> take -> grade -> score -> grounded -> read back\n' ;;
+  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total -> study -> generate -> ground -> quiz -> take -> score\n' ;;
 esac

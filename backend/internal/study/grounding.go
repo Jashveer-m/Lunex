@@ -121,19 +121,60 @@ func hasDigit(s string) bool {
 	return false
 }
 
+// numberWords are the figures a model writes out in words. They are treated
+// exactly like a token with a digit in it: matched only exactly, and fatal to
+// an answer when the passages do not contain them.
+//
+// This is not a refinement, it is the hole the digit rule left. Measured, on
+// llama3.2:3b against a handbook that says "the whole bank is equalised every
+// forty days": the model wrote a question whose correct answer was "Every
+// sixty days" -- and it was grounded, because "every" and "days" are both in
+// the passage and two content words out of three clears MinGroundedShare.
+// "sixty" has no digit in it, so the rule below that sinks an unsupported
+// figure never fired.
+//
+// A wrong figure is the part of a card or a quiz a learner is least able to
+// check and most likely to memorise, and for a quiz it is worse than wrong: it
+// is the answer key, so it marks the learner wrong for knowing better. Whether
+// the model wrote "40" or "forty" is not a difference in what is at stake.
+var numberWords = setOf(
+	"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+	"ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+	"seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+	"sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "billion",
+	// Ordinals, which is how a passage names a step or a section.
+	"first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+	"ninth", "tenth", "eleventh", "twelfth", "twentieth", "thirtieth", "fortieth",
+	"fiftieth", "hundredth", "thousandth",
+	// Quantities that are figures in everything but spelling.
+	"half", "quarter", "third", "twice", "double", "triple", "dozen", "once",
+)
+
+// isFigure reports whether a word states a quantity -- as digits, or written
+// out. Both are held to the same two rules: matched exactly, and fatal when
+// the passages do not contain them.
+func isFigure(s string) bool {
+	if hasDigit(s) {
+		return true
+	}
+	_, ok := numberWords[s]
+	return ok
+}
+
 // sameWord reports whether two words are the same word, allowing for the
 // inflections a restatement introduces: "last" and "lasted", "filter" and
 // "filters". One must be a prefix of the other and the shorter at least four
 // letters, so "run" does not match "rung".
 //
-// A word with a digit in it has to match exactly. "40" is a prefix of "400",
-// and a card answering "400 metres" from a passage that says "40 metres" is
-// precisely the failure this file exists to catch.
+// A figure has to match exactly, whether it is written in digits or in words.
+// "40" is a prefix of "400", and a card answering "400 metres" from a passage
+// that says "40 metres" is precisely the failure this file exists to catch --
+// and "four" is a prefix of "fourteen", which is the same failure spelled out.
 func sameWord(a, b string) bool {
 	if a == b {
 		return true
 	}
-	if hasDigit(a) || hasDigit(b) {
+	if isFigure(a) || isFigure(b) {
 		return false
 	}
 	if len(a) > len(b) {
@@ -194,7 +235,11 @@ func groundedIn(text string, source []string) bool {
 		// document's and entirely wrong, and a figure is the part of a
 		// flashcard a learner is least able to check and most likely to
 		// memorise. An unsupported number is never framing.
-		if hasDigit(w) {
+		//
+		// "Every sixty days" against a passage that says "every forty days" is
+		// the same sentence with the same arithmetic, and it is why isFigure
+		// covers words as well as digits; see numberWords.
+		if isFigure(w) {
 			return false
 		}
 	}
@@ -236,4 +281,35 @@ func mentionsAny(text string, source []string) bool {
 func CardGrounded(c NewCard, passages []string) bool {
 	source := passageWords(passages)
 	return groundedIn(c.Back, source) && mentionsAny(c.Front, source)
+}
+
+// QuestionGrounded reports whether a proposed quiz question traces to the
+// passages. It is CardGrounded with the multiple-choice shape substituted in,
+// and deliberately the same two tests rather than a second rule: the back of a
+// card and the correct option of a question are the same thing -- the sentence
+// the learner will end up believing -- so they are held to the same bar.
+//
+// The correct answer has to be GroundedIn the passages. The question itself
+// only has to name something in them (MentionsAny), for the reason the front
+// of a card does.
+//
+// The distractors are not checked at all, and that is the one place this
+// differs from a flashcard in substance rather than in shape. A wrong answer
+// is *supposed* to be wrong: requiring it to appear in the document would mean
+// every option was something the document says, which is the opposite of what
+// a distractor is for, and refusing options the document does not contain
+// would throw away every well-made question. What that costs is real and is
+// stated rather than hidden: nothing here can tell a good distractor from one
+// that happens to be true of a part of the document the model was not shown.
+// The mitigation is the same one the whole phase rests on -- the user reads
+// every question, with its options, on the approval card before the quiz
+// exists.
+//
+// A question whose correct index does not point at an option is not grounded
+// rather than being an error here: CorrectAnswer returns "" for it, and "" has
+// no content words. Validation catches it properly, with a field name; this is
+// the backstop.
+func QuestionGrounded(q NewQuestion, passages []string) bool {
+	source := passageWords(passages)
+	return groundedIn(q.CorrectAnswer(), source) && mentionsAny(q.Question, source)
 }

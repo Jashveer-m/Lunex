@@ -138,9 +138,9 @@ type Param struct {
 	// Derived marks a key the *tool* fills in while the call is prepared,
 	// rather than one the model supplies.
 	//
-	// There is exactly one in this phase: generate_flashcards' `cards`. That
-	// tool's proposal has to show the user the actual questions and answers
-	// before they approve it, so the cards are written during Prepare and
+	// There are two: generate_flashcards' `cards` and generate_quiz's
+	// `questions`. Those tools' proposals have to show the user the actual
+	// content before they approve it, so it is written during Prepare and
 	// stored in the canonical input -- which means the input carries a key the
 	// model never wrote, and the invariant that every stored key is a declared
 	// param has to be kept some other way. This is that way: the key is
@@ -211,7 +211,11 @@ type Result struct {
 	Events   []calendar.Event
 	Expenses []finance.Expense
 	Plans    []study.Plan
-	Chunks   []documents.SearchResult
+	// Quizzes are what search_quizzes found and what an approved generate_quiz
+	// created. A quiz record carries no questions and no answers; see
+	// quizRecord.
+	Quizzes []study.Quiz
+	Chunks  []documents.SearchResult
 	// Reports are figures a tool worked out from the user's records rather
 	// than records it found. They exist for analyze_spending, which answers
 	// "how much did I spend on food this month" with a total: there is no row
@@ -238,7 +242,7 @@ type Report struct {
 // one thing the model is shown and one thing it can cite.
 func (r Result) Count() int {
 	return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Events) +
-		len(r.Expenses) + len(r.Plans) + len(r.Chunks) + len(r.Reports)
+		len(r.Expenses) + len(r.Plans) + len(r.Quizzes) + len(r.Chunks) + len(r.Reports)
 }
 
 // define builds a Tool whose canonical input is the Go type In.

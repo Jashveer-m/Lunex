@@ -65,6 +65,19 @@ var toolCues = []string{
 	// asking for something to change
 	"mark", "change", "update", "edit", "rename", "move", "finish", "complet", "done",
 	"postpone", "reschedule", "bump",
+	// the study module. Phase 10a added three tools and no cues, which left
+	// the most natural way to ask for either of them gated out before the
+	// router ever saw it: "Quiz me on the relay handbook" and "What is on my
+	// flashcards?" contain none of the words above, so no tool could ever be
+	// chosen for them however good the model was. The generation requests
+	// happened to slip through on "make", which is why it went unnoticed.
+	//
+	// "stud" covers study, studying, studied and student; "revis" covers
+	// revise and revision; "practi" covers practice and practising. "test" and
+	// "exam" are the ones that err long -- "test the connection", "examine" --
+	// and a false positive costs one routing call and nothing else.
+	"quiz", "flashcard", "card", "deck", "stud", "revis", "exam", "test",
+	"practi", "learn", "memoris", "memoriz",
 	// asking to find something
 	"find", "search", "look", "show", "list", "which", "mention", "open", "pending",
 	// asking to remove something: no tool can, and the router says so --

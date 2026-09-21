@@ -34,6 +34,21 @@ type Store interface {
 	CreateFlashcards(ctx context.Context, userID uuid.UUID, in []CreateCardInput) ([]Flashcard, error)
 	Flashcards(ctx context.Context, userID uuid.UUID, f CardFilter) ([]Flashcard, error)
 	DeleteFlashcard(ctx context.Context, userID, id uuid.UUID) error
+
+	// Phase 10b. Same rule, one table further down: every one of these takes
+	// the owner id, including the three that reach rows with no user_id of
+	// their own -- a question belongs to a quiz and an answer to an attempt,
+	// and both are reached through a join that names the owner.
+	CreateQuiz(ctx context.Context, userID uuid.UUID, in CreateQuizInput) (Quiz, error)
+	QuizByID(ctx context.Context, userID, id uuid.UUID) (Quiz, error)
+	Quizzes(ctx context.Context, userID uuid.UUID, f QuizFilter) ([]Quiz, error)
+	DeleteQuiz(ctx context.Context, userID, id uuid.UUID) error
+
+	CreateAttempt(ctx context.Context, userID, quizID uuid.UUID) (Attempt, error)
+	AttemptByID(ctx context.Context, userID, id uuid.UUID) (Attempt, error)
+	QuestionForAttempt(ctx context.Context, userID, attemptID, questionID uuid.UUID) (Question, error)
+	CreateAnswer(ctx context.Context, userID, attemptID uuid.UUID, in AnswerInput, correct bool) (Answer, error)
+	CompleteAttempt(ctx context.Context, userID, id uuid.UUID) (Attempt, error)
 }
 
 // Library is the slice of internal/documents this module reads.
@@ -361,31 +376,9 @@ func (s *Service) ProposeFlashcards(ctx context.Context, userID uuid.UUID, in Ge
 		}
 	}
 
-	doc, err := s.library.Get(ctx, userID, in.DocumentID)
-	if errors.Is(err, documents.ErrNotFound) {
-		// The same 404 a foreign id gets everywhere else: another user's
-		// document is indistinguishable from one that does not exist.
-		return Proposal{}, ErrNotFound
-	}
-	if err != nil {
-		return Proposal{}, fmt.Errorf("read document: %w", err)
-	}
-	switch {
-	case doc.Status != documents.StatusReady:
-		return Proposal{}, fmt.Errorf("%w: %s is %s", ErrNotStudyable, doc.Filename, doc.Status)
-	case doc.ChunkCount == 0:
-		// Ready and empty: a scanned PDF whose text layer held nothing. The
-		// status alone would read as "ready", which is true and unhelpful.
-		return Proposal{}, fmt.Errorf("%w: nothing was extracted from %s", ErrNotStudyable, doc.Filename)
-	}
-
-	passages, err := s.passages(ctx, userID, in)
+	doc, shown, err := s.generationSource(ctx, userID, in.DocumentID, in.Topic)
 	if err != nil {
 		return Proposal{}, err
-	}
-	shown := PromptPassages(passages)
-	if len(shown) == 0 {
-		return Proposal{}, ErrNoPassages
 	}
 	texts := PassageTexts(shown)
 
@@ -425,7 +418,47 @@ func (s *Service) ProposeFlashcards(ctx context.Context, userID uuid.UUID, in Ge
 	return out, nil
 }
 
-// passages picks the part of the document the cards come from.
+// generationSource resolves the document a generation runs from and the
+// passages it will be shown -- and checked against.
+//
+// It is shared by ProposeFlashcards and ProposeQuiz, which is not a
+// convenience: the two have to agree about what "the document says" means, or
+// a quiz and a deck made from the same request would be grounded in different
+// text. Everything either of them does before the model call is here.
+func (s *Service) generationSource(ctx context.Context, userID, documentID uuid.UUID, topic string) (documents.Document, []documents.Passage, error) {
+	if s.model == nil || s.library == nil {
+		return documents.Document{}, nil, fmt.Errorf("%w: no model or document library is wired", ErrGeneration)
+	}
+	doc, err := s.library.Get(ctx, userID, documentID)
+	if errors.Is(err, documents.ErrNotFound) {
+		// The same 404 a foreign id gets everywhere else: another user's
+		// document is indistinguishable from one that does not exist.
+		return documents.Document{}, nil, ErrNotFound
+	}
+	if err != nil {
+		return documents.Document{}, nil, fmt.Errorf("read document: %w", err)
+	}
+	switch {
+	case doc.Status != documents.StatusReady:
+		return documents.Document{}, nil, fmt.Errorf("%w: %s is %s", ErrNotStudyable, doc.Filename, doc.Status)
+	case doc.ChunkCount == 0:
+		// Ready and empty: a scanned PDF whose text layer held nothing. The
+		// status alone would read as "ready", which is true and unhelpful.
+		return documents.Document{}, nil, fmt.Errorf("%w: nothing was extracted from %s", ErrNotStudyable, doc.Filename)
+	}
+
+	passages, err := s.passages(ctx, userID, documentID, topic)
+	if err != nil {
+		return documents.Document{}, nil, err
+	}
+	shown := PromptPassages(passages)
+	if len(shown) == 0 {
+		return documents.Document{}, nil, ErrNoPassages
+	}
+	return doc, shown, nil
+}
+
+// passages picks the part of the document the generated content comes from.
 //
 // With a topic, that is the vector search restricted to this one document: the
 // user said which part they wanted. With no topic it is the start of the
@@ -437,9 +470,9 @@ func (s *Service) ProposeFlashcards(ctx context.Context, userID uuid.UUID, in Ge
 // to the start of the document. Generating cards about chapter one because the
 // user asked about a chapter that is not in the file would answer a question
 // they did not ask, and they would have no way to see that it had happened.
-func (s *Service) passages(ctx context.Context, userID uuid.UUID, in GenerateInput) ([]documents.Passage, error) {
-	if in.Topic == "" {
-		found, err := s.library.Passages(ctx, userID, in.DocumentID, PassagesPerGeneration)
+func (s *Service) passages(ctx context.Context, userID, documentID uuid.UUID, topic string) ([]documents.Passage, error) {
+	if topic == "" {
+		found, err := s.library.Passages(ctx, userID, documentID, PassagesPerGeneration)
 		if err != nil {
 			return nil, fmt.Errorf("read document passages: %w", err)
 		}
@@ -451,10 +484,10 @@ func (s *Service) passages(ctx context.Context, userID uuid.UUID, in GenerateInp
 	// chat floor would make "cards about the appendix" fail on a document
 	// whose appendix is worded differently from the word "appendix".
 	found, err := s.library.Search(ctx, userID, documents.SearchQuery{
-		Query: in.Topic, Limit: PassagesPerGeneration, DocumentIDs: []uuid.UUID{in.DocumentID},
+		Query: topic, Limit: PassagesPerGeneration, DocumentIDs: []uuid.UUID{documentID},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("search document for %q: %w", in.Topic, err)
+		return nil, fmt.Errorf("search document for %q: %w", topic, err)
 	}
 	if len(found) == 0 {
 		return nil, ErrNoPassages
@@ -475,6 +508,25 @@ func (s *Service) passages(ctx context.Context, userID uuid.UUID, in GenerateInp
 
 // propose runs the model and turns its reply into candidate cards.
 func (s *Service) propose(ctx context.Context, passages []documents.Passage, filename string, in GenerateInput) ([]NewCard, error) {
+	reply, err := s.generate(ctx, GenerationPrompt(passages, filename, in.Topic, in.Count))
+	if err != nil {
+		return nil, err
+	}
+	cards := ParseFlashcards(reply, in.Count)
+	if len(cards) == 0 {
+		return nil, fmt.Errorf("%w: the model wrote no readable cards", ErrGeneration)
+	}
+	return cards, nil
+}
+
+// generate is the model call both generations make: one prompt in, the whole
+// reply out, under this module's own timeout and options.
+//
+// It is shared rather than written twice because the options are the argument
+// -- a bigger model, a near-zero temperature, JSON mode off by default -- and
+// two copies of them would be two things to keep in step with the
+// configuration. See Options.
+func (s *Service) generate(ctx context.Context, prompt []ai.Message) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.opts.Timeout)
 	defer cancel()
 
@@ -482,29 +534,25 @@ func (s *Service) propose(ctx context.Context, passages []documents.Passage, fil
 	if s.opts.JSONMode {
 		format = ai.FormatJSON
 	}
-	stream, err := s.model.Chat(ctx, GenerationPrompt(passages, filename, in.Topic, in.Count), ai.Options{
+	stream, err := s.model.Chat(ctx, prompt, ai.Options{
 		Model:       s.opts.Model,
 		Temperature: s.opts.Temperature,
 		MaxTokens:   s.opts.MaxTokens,
 		// Off by default; see Options.JSONMode. Either way the reply is parsed
 		// defensively, because JSON asked for and JSON guaranteed are
-		// different things and ParseFlashcards cannot tell which it has.
+		// different things and the parsers cannot tell which they have.
 		Format: format,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrGeneration, err)
+		return "", fmt.Errorf("%w: %w", ErrGeneration, err)
 	}
 	defer stream.Close() //nolint:errcheck // releases the upstream connection
 
 	reply, err := ai.Collect(stream)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrGeneration, err)
+		return "", fmt.Errorf("%w: %w", ErrGeneration, err)
 	}
-	cards := ParseFlashcards(reply, in.Count)
-	if len(cards) == 0 {
-		return nil, fmt.Errorf("%w: the model wrote no readable cards", ErrGeneration)
-	}
-	return cards, nil
+	return reply, nil
 }
 
 // ResolveDocument finds the one document a reference means, among the caller's

@@ -29,11 +29,14 @@ test-integration:
 # much has been spent this month and checks the total is the one the API
 # reports and the answer is not phrased as financial advice -- and finally
 # uploads a handbook, asks for flashcards from it, checks the proposal shows
-# the cards themselves, approves them, and checks every saved answer actually
-# appears in the uploaded document.
+# the cards themselves, approves them, checks every saved answer actually
+# appears in the uploaded document -- and then asks for a quiz from the same
+# handbook, checks the proposal shows every question with its options and the
+# answer key, approves it, takes it, and checks the score is the one the
+# answers support and every correct answer is in the document.
 # E2E_ONLY=actions runs just the action part, E2E_ONLY=calendar just the
-# calendar part, E2E_ONLY=finance just the finance part, and E2E_ONLY=study
-# just the study part.
+# calendar part, E2E_ONLY=finance just the finance part, E2E_ONLY=study the
+# study part (flashcards and quizzes) and E2E_ONLY=quiz just the quiz part.
 # Needs Postgres with pgvector and a running Ollama; see docs/testing.md.
 test-e2e:
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" ./scripts/e2e.sh

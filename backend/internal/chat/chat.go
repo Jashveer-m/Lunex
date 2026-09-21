@@ -130,6 +130,13 @@ const (
 	// and putting them in front of the model would spend the whole context
 	// budget restating a document it can retrieve properly.
 	SourceStudyPlan = "study_plan"
+	// SourceQuiz is one of the user's quizzes: what it is on, how big it is,
+	// how many times they have taken it and how they did. Like a study plan it
+	// carries no content -- and here that is not only a context-budget
+	// argument. The questions and the answer key are exactly what a quiz
+	// exists to withhold until it is answered, so an assistant that could see
+	// them could spoil one by being helpful. See the study rule in prompt.go.
+	SourceQuiz = "quiz"
 )
 
 // Source is one retrieved item, recorded on the assistant message that was

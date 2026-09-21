@@ -2776,3 +2776,521 @@ anyway.
 
 The web UI gained nothing this phase. A plan reaches the user through the API,
 through an approved proposal, or as a citation in an answer.
+
+# Phase 10b decisions
+
+## Only the correct answer is grounded; a distractor is supposed to be wrong
+
+Phase 10a's claim was that a generated flashcard says what the document says,
+and the machinery that makes it true is `grounding.go`: the back of a card has
+to be `GroundedIn` the passages the model was shown, and the front only has to
+`MentionsAny` of them. A quiz question is the same claim with more parts, and
+the decision this phase had to make is *which* parts.
+
+`QuestionGrounded` is `CardGrounded` with the correct option standing in for
+the back. It is literally the same two calls, and a test pins that a question
+and the same question written as a front/back pair are judged identically — so
+if the rule changes for one it changes for both, rather than drifting into two
+rules that are nearly the same.
+
+The distractors are not checked at all, and that is not an omission. A wrong
+answer is *supposed* to be wrong. Requiring it to appear in the document would
+mean every option was something the document says, which is the opposite of
+what a distractor is for; and dropping a question because its wrong answers are
+not in the text would drop every well-made question in the set. There is no
+version of the check that helps here, because the property a distractor needs —
+being *false* of the document — is not something a bag-of-words comparison can
+establish.
+
+What that costs is real and is stated rather than hidden: nothing in this
+codebase can tell a good distractor from one that happens to be true of a part
+of the document the model was not shown. A quiz can therefore have two right
+answers and mark one of them wrong. The mitigations are the prompt, which asks
+for wrong answers in so many words and forbids the lazy ones ("none of the
+above", "all of the above"), and the approval card, which shows every option of
+every question to the person who knows the document. Measuring distractor
+quality would need a second model call per question grading its own output,
+which is a worse guarantee than a person reading four lines.
+
+## The approval card shows the answer key, because it is the part that cannot be fixed later
+
+`generate_flashcards`' summary renders both sides of every card. `generate_quiz`
+renders every question, every option, *and* which option will be marked
+correct.
+
+The last of those is the one worth arguing for, because it is what makes the
+summary long. A wrong flashcard teaches the user something false, which is bad
+and is what the grounding check exists for. A wrong answer *key* does something
+the flashcard cannot: it marks the user wrong for knowing better. That is the
+one error here they cannot correct by reading more carefully afterwards —
+there is no `PATCH` on a quiz, so a bad key means deleting the quiz and their
+attempts with it. So it goes in front of them before it exists.
+
+## The options are never shuffled, anywhere
+
+Not in the parser, not on approval, not on read. The order the model wrote is
+the order stored and the order shown.
+
+The reason is the same one the cards-in-the-proposal decision rests on: an
+approval has to execute exactly what was approved. A quiz that rearranged
+itself between the approval card and the database would be a quiz the user did
+not read, and `correct_index` is a position — shuffling means rewriting the
+answer key, which is precisely the value that must not be rewritten by anything
+the user cannot see.
+
+There is a real cost: a model that puts the right answer first every time
+produces a quiz that can be passed without reading it. Shuffling belongs in the
+client that renders the quiz, which can do it per attempt without touching the
+stored row, and the prompt's worked example varies the position to discourage
+the habit at the source.
+
+## `correct_index` is a position and `answer` is a value
+
+`ParseQuizQuestions` accepts the answer as an index, as a letter and as the
+option's own text, because a small model writes all three about equally often.
+Resolving them has one genuinely wrong outcome available, and avoiding it is
+why the fields are split into two kinds.
+
+A quiz whose options are themselves numbers — "2", "4", "6", "8" — is where the
+difference bites. `correct_index: 2` means the third option; reading it as the
+text "2" marks the first. So `answer`, `correct`, and `correct_answer` name the
+answer *by value* and are matched against the option text first; `correct_index`
+and `answer_index` name it *by position* and are never text-matched. A letter is
+tried from either kind, because "B" can only mean one thing. A JSON *number* in
+`answer` is read as a position, which is the one remaining ambiguity and is
+resolved the way a model that was asked for `correct_index` most likely meant
+it.
+
+Within the value fields, the written-out answer beats an index that disagrees
+with it: a model writes the option's text correctly far more often than it
+counts the options. And an index that points at no option is not salvaged by
+assuming the model counted from one. That assumption is right about as often as
+it is wrong, and being wrong produces a quiz that marks the right answer wrong —
+so the question is dropped instead, and the user gets five questions rather than
+six.
+
+## `GET /quizzes/{id}` does not return the answer key
+
+The quiz reads back with its questions and their options and no `correct_index`.
+The answer comes back when the question is answered, and a finished attempt
+reads back with every correct index on it.
+
+This is the one place in the API where a user is not handed their own data on
+request, so it is worth being plain about what it is and is not. It is not
+secrecy — nothing here is hidden from them, and two requests get the whole key.
+It is that a quiz's only purpose is to be answered without the answer in view,
+and an endpoint that returns the key is one that every client will leak by
+accident: into a devtools panel, a debug log, a cached JSON blob, a
+`console.log` left in. Withholding it in the default read makes the careless
+thing the correct thing.
+
+The cost is that reviewing a quiz you have not taken means taking it. That is
+acceptable because the alternative — a `?with_answers=true` — is a flag whose
+only user would be the client that should not be reading them.
+
+## Taking a quiz is not a tool, and could not be
+
+`tools.StudyService` gains `Quizzes`, `ProposeQuiz` and `CreateQuiz`. It does
+*not* gain `StartAttempt`, `SubmitAnswer` or `CompleteAttempt`, so there is no
+tool that can take a quiz, answer a question or finish an attempt — not because
+a tool declines to, but because the interface offers no way, which is the same
+guarantee that keeps a delete tool out (item 33).
+
+The distinction is the one the whole approval design rests on and this is the
+clearest case of it yet. Approval stands between the *assistant* and the user's
+data. An attempt is the user answering their own questions: there is nothing
+for them to be protected from, and an approval card reading "record that you
+chose option B" would be a dialog box between a person and their own click.
+
+What the rule has to stop is the other direction. A 3B model asked "quiz me"
+will happily improvise a quiz in the chat, ask the questions itself and mark
+the answers, producing a score that nothing recorded and that does not exist.
+So the system prompt says, in the same rule that withholds the questions, that
+the assistant cannot start, answer or finish an attempt and that taking a quiz
+happens in the app. The sentence is true by construction; it is in the prompt
+because the model cannot see the interface.
+
+## A "quiz" source carries counts and never content
+
+A `study_plan` source tells the model how many flashcards a plan has and
+nothing about any of them, for a context-budget reason: a deck is hundreds of
+one-line answers. A `quiz` source withholds the questions for a reason that is
+not about budget at all.
+
+A quiz exists to be answered without the answer in view. A model that could
+recite a question would recite the answer with it — helpfully, in the same turn,
+because the user asked — and there would be no quiz left. So `quizSummary`
+renders the size and the outcome and nothing else, `quizRecord` carries no
+questions and no options, and `generate_quiz`'s recorded *result* carries the
+question text but not the options or the key, because a result is read back
+into later prompts.
+
+The prompt rule then forbids stating, quoting, summarising or guessing what a
+quiz asks **even when asked directly**. That last clause is the one case rule 3
+does not already cover: rule 3 forbids inventing, and here the thing would not
+be invented — it would be real, and spoiled.
+
+The score is written out against the total in the excerpt ("best 4 of 6")
+rather than as two fields, for the reason the calendar writes its times out: a
+model handed "4" and "6" separately will sometimes report a percentage it
+worked out itself.
+
+## One answer per question per attempt, enforced by the schema
+
+`quiz_answers` has a unique index on `(attempt_id, question_id)`, and the
+service also checks before it writes.
+
+The service check is there because it has a better error to give — a 409 naming
+the question rather than a constraint violation — and the index is there
+because the check is a race. Two submissions of the same question can both pass
+a `SELECT` and both insert, and the attempt is then scored out of more answers
+than the quiz has questions. A check tells you what went wrong; a constraint
+decides what is possible.
+
+The second answer is a *conflict* rather than an overwrite, which is the
+substantive half of the decision. An attempt is a record of what the user
+answered. Letting the second submission win would make the score a record of
+what they answered last, having already been told whether the first was right —
+which is not a score. Retaking the quiz is a new attempt, and a new attempt is
+a new row.
+
+## The score is computed by the statement that closes the attempt
+
+`CompleteAttempt` sets `completed_at` and `score` in one `UPDATE`, with the
+score as a `count(*)` over the attempt's own answers, and `completed_at IS
+NULL` in the `WHERE`.
+
+Three things fall out of that shape. There is no window in which an attempt is
+complete and unscored, so no read can see a half-finished state. The number
+cannot disagree with the rows it came from, because it is derived from them in
+the same statement. And completion is once-only for the same structural reason
+an approval is: a second call matches no row, which is what `ErrAttemptComplete`
+reports.
+
+Unanswered questions are not counted wrong. They are not counted at all — the
+score is how many were right — and the attempt carries the quiz's
+`question_count` beside it so "4" is read as "4 of 6". An attempt can be
+completed with nothing answered, because a user who stopped halfway should not
+be left with a row that can never be anything else.
+
+## A quiz gets no knowledge-graph node
+
+Migration 000011 touches neither the `ref_table` allow-list nor the trigger
+list, and `anchorFor` returns nil for a created quiz.
+
+It follows the rule 000010 set for flashcards, which is that the *plan* is the
+thing worth connecting and the material hangs off it. A node per quiz would put
+a second label for the same subject into the graph — the quiz is titled after
+the document it came from — and the chat's mention scan would then fire twice
+on one word. An attempt is a worse candidate still: it is an event rather than
+a thing the user has, and there would be one every time they sat down.
+
+The test that pins this asserts both halves: no node points at the quiz, *and*
+the plan still has its own — so it cannot pass by the graph simply being empty.
+
+## The three counts on a quiz are computed, and `best_score` is not 10c
+
+`question_count`, `attempt_count` and `best_score` are correlated subqueries,
+not columns, for the reason `study_plans.card_count` is one: a counter kept in
+a column is a counter that can be wrong.
+
+`best_score` deserves a sentence on its own, because 10b is explicitly not
+supposed to analyse anything. It is a `max` over one quiz's finished attempts
+and nothing else. The thing 10c will build is *per-topic* and *across* quizzes
+— "you keep getting the battery-bank questions wrong" — and needs the `topic`
+column on every question and the `correct` column on every answer, both of
+which this phase records and neither of which anything here reads. A quiz list
+with no indication of whether you have taken it is a list nobody can use; that
+is what this is for.
+
+## `topic` is the model's word or nothing
+
+Every question carries an optional `topic`, which nothing in this phase reads.
+It is here because 10c reads it, and a tag recorded when the question was
+written is better evidence than one derived later from its wording.
+
+A question the model gave no topic stores `NULL` rather than getting one
+derived from its text. A derived tag would group by phrasing — "how long does
+the changeover take" and "what is the changeover time" would be two topics —
+which is exactly the failure 10c's aggregation would then be built on. An
+absent tag is honest and skippable; a wrong one is neither.
+
+## `clock_timestamp()` again, on both new ordered tables
+
+The Phase 10a ordering bug was `now()` on a batch insert: it is the
+transaction's start time, so every flashcard in one generation got the same
+stamp and the read order fell to the tie-break on a random uuid — which
+shuffled a deck out of the order of the document it came from.
+
+`quiz_questions` is the same insert in the same shape, and it matters more: a
+shuffled deck is annoying, and a shuffled quiz means the approval card and the
+stored quiz are in different orders, which is the one property the whole
+generated-at-prepare-time design exists to keep. So the column defaults to
+`clock_timestamp()` *and* `CreateQuiz` names it explicitly, so the ordering does
+not depend on a default somebody could change.
+
+`quiz_answers` gets it too, although answers are inserted one per request today
+and `now()` would do. That is the point: "answers are never batched" is exactly
+the kind of assumption that was true of flashcards until it wasn't.
+
+## `generationSource` and `generate` are shared, not duplicated
+
+The flashcard and quiz generations do the same six things before they differ:
+check the model is wired, resolve the document, refuse one with no indexed
+text, take the topic's passages or the document's first few, bound them to what
+fits in a prompt, and refuse a topic that matches nothing.
+
+That is now one function, called by both. It is not a tidiness argument. The
+two have to agree about what "the document says" means, because the grounding
+check runs against exactly the text the model was shown — and a quiz and a deck
+made from the same request being grounded in different passages would make both
+claims weaker than they read. The model call is shared for a smaller version of
+the same reason: the options are the argument (a bigger model, near-zero
+temperature, JSON mode off), and two copies of them are two things to keep in
+step with the configuration.
+
+## A figure written in words is a figure: the hole the digit rule left
+
+`grounding.go` has always said that an unsupported *number* sinks an answer
+outright, whatever the two-thirds share works out to, because a figure is the
+part of a card a learner is least able to check and most likely to memorise.
+It implemented that by looking for a digit in the token.
+
+Measured while writing this phase, against the handbook the end-to-end check
+uploads — which says "the whole bank is equalised every forty days" —
+llama3.2:3b wrote:
+
+> How often is the whole battery bank equalised?
+> Every five days / Every forty days / **Every sixty days** *(correct)* / Every ninety days
+
+The right answer was sitting in the same list, and the model marked the wrong
+one. `GroundedIn("Every sixty days")` returned **true**: `every` and `days` are
+both in the passage, `sixty` is not, and two content words out of three clears
+`MinGroundedShare`. The rule that exists for exactly this never fired, because
+"sixty" contains no digit.
+
+So `isFigure` now covers numbers written out — cardinals, ordinals, and the
+quantity words ("half", "twice", "dozen") that are figures in everything but
+spelling — and it is used in both places the digit test was: an unmatched
+figure sinks the answer, and a figure matches only exactly. The second half
+matters on its own, because `sameWord`'s prefix rule was letting "four" match
+"fourteen".
+
+Two things are worth recording about how this was found. It was not found by a
+unit test, because every unit test in this module was written by the same
+person who wrote the rule and shared its blind spot; it was found by generating
+a quiz from a real document with a real model and reading the output. And the
+end-to-end script *reproduced it and passed it*, because its Python
+re-implementation of the check had been faithful to the Go — including the
+hole. Both are fixed, and `scripts/e2e.sh` now carries a note to keep its
+number list in step with `numberWords`.
+
+It does not make the check complete, and the very next run showed exactly how.
+From the same handbook, which says "The ice shield is retracted before any
+equalisation charge":
+
+> What is retracted before the equalisation charge?
+> The ice shield / The mast feed / **The dipole** *(correct)* / The bus
+
+The answer key is wrong and the grounding check passed it, correctly: "dipole"
+*is* in the document — "the mast feed is switched to the auxiliary dipole". The
+check asks whether the answer is drawn from the text, and this one is. It has
+never asked whether the answer is right, and a bag-of-words comparison cannot:
+"The ice shield" and "The dipole" are each one content word, each present.
+
+That is the honest boundary of the claim, and it is worth stating in the same
+breath as the claim itself. **"Every correct answer traces back to the
+document" is not "every answer key is right."** What the check buys is that no
+answer is invented out of the model's own knowledge. What catches a wrong key
+is the approval card, which in that run showed "The dipole (correct)" on the
+line above "The ice shield" to somebody who had read the handbook — and that is
+why the answer key is in the proposal rather than summarised away.
+
+So the figure rule closes the specific class the code already recognised as
+different in kind, and the class that is worst in a quiz: a contradicted figure
+does not merely teach something false, it marks the learner wrong for knowing
+better. The general class stays open, and the user is the check on it.
+
+## A proposal summary is now content, so it cannot live inside a sentence
+
+`chat.toolStep.actionsBlock` tells the answering model what to say about a
+proposal, and `act.go` records the measurement behind its wording: shown "You
+proposed this change, and it has NOT been made: ...", llama3.2:3b copied the
+section into its reply; shown "You prepared a change that has not been made
+yet. Reply by telling the user, in your own words, that you have prepared it,
+what it will do (*summary*), and that it will only happen once they press
+Approve...", it answered properly in every sample.
+
+That was measured when every summary was one sentence. `generate_flashcards`
+made summaries multi-line and `generate_quiz` made them long — a heading, four
+option lines per question, and a closing sentence; fifteen lines for three
+questions — and interpolating that into the middle of a "what it will do (...)"
+clause reproduced the original failure exactly. Measured on llama3.2:3b in the
+end-to-end run, the reply began:
+
+> I prepared a change that has not been made yet. Reply by telling the user, in
+> your own words, that you have prepared it, what it will do (Create a new
+> quiz…
+
+which is the instruction, read out.
+
+So a summary containing a newline now goes *after* the instruction, under a
+"What it will do:" heading, and a one-line summary keeps the inline form that
+was measured. Both are pinned by tests, the second as much as the first: the
+point is not to improve the wording, it is to stop this phase changing what
+every other write tool produces.
+
+The same function had a second site, found by looking for it rather than by a
+failure. The recap of earlier proposals is a bullet per action, built as
+`"- " + summary + ": " + status`, which for a quiz produced:
+
+> - Save a quiz "relay-handbook.txt", 2 questions:
+> 1. What is the voltage of the equalisation charge?
+>    - 40 volts
+>    - 58.4 volts (correct)
+> The option marked (correct) is the one the quiz will mark right: the user
+> approved it and it was done.
+
+— a sentence saying the marker convention was approved, with the questions
+spilling out of the bullet in between, where a second entry could not be told
+from the first one's options. It fires on the second turn of any conversation
+that proposed a quiz or a deck. The recap now takes the summary's first line,
+which is all a recap needs: the content was shown in full when it was proposed,
+on the card the user read.
+
+The general shape is the one this phase keeps running into: **a measurement is
+made under conditions, and the conditions stop holding when a later phase
+changes the inputs.** Nothing failed when summaries became multi-line — the
+approval still worked, the row was still correct, and only the sentence the
+user read was wrong.
+
+## The routing gate had no word for anything the study module owns
+
+`agents.MightUseTool` is a lexical gate in front of the routing call: no cue
+word, no routing call, no tool. Phase 10a added three tools and no cues, and
+Phase 10b made the consequence visible.
+
+Measured:
+
+| Message | Reached the router before 10b |
+| --- | --- |
+| `Make flashcards from relay-handbook.txt …` | yes — on "make" |
+| `Quiz me on the relay handbook.` | **no** |
+| `What is on my flashcards?` | **no** |
+| `Test me on chapter four.` | **no** |
+
+The generation requests slipped through on a verb that happens to be in the
+list, which is why nothing noticed. But the most natural way to ask for a quiz
+— "quiz me on X" — contained no cue at all, so `generate_quiz` could never have
+been chosen for it however good the model was. That is not a routing-quality
+problem, it is a tool that is unreachable through its own front door.
+
+The fix is the gate's own idiom: a group of prefixes for the things this module
+owns — `quiz`, `flashcard`, `card`, `deck`, `stud`, `revis`, `exam`, `test`,
+`practi`, `learn`. `test` and `exam` err long ("test the connection",
+"examine"), which is the documented trade: a false positive costs one routing
+call and the gate can only ever decline a tool, never choose one.
+
+The general lesson is worth stating because it will recur: **a phase that adds
+a tool has to add the words people use to ask for it.** The gate is not
+derived from the tool declarations, and nothing fails when it falls behind —
+the feature simply does not work for the phrasing nobody tested.
+
+## Eighteen tools, and the routing prompt is now about 9,400 characters
+
+Phase 10a recorded that the routing prompt renders every offered tool, that
+sixteen tools made it about 8,300 characters, and that one routing decision on
+a 2019 Intel Mac was measured at **3m08s** — over the 180s default, so the turn
+failed as `model_unavailable` before anything about study ran.
+
+This phase adds two more. The prompt is **9,387 characters** — that number is
+exact, because it is computed from the tool declarations rather than measured.
+The time is not, and it is worth being careful about what was and was not
+established here.
+
+What was observed while writing this phase: an `E2E_ONLY=quiz` run with
+`AGENT_TIMEOUT=420s` — the budget this page and `docs/testing.md` had been
+recommending — failed at the first turn with `model_unavailable`, saying
+nothing about quizzes; and a standalone routing decision for the same message
+did not finish inside fifteen minutes. But that machine was also under a load
+average around 250 with Ollama running entirely on CPU (`size_vram: 0`), so
+those numbers measure a badly loaded laptop and not the cost of two extra
+tools. The honest statement is the direction, not a figure: the prompt grew
+about 13%, the recommended budget was already marginal at sixteen tools, and it
+is no longer adequate here.
+
+The decision is unchanged and the fix is still configuration rather than code;
+`docs/testing.md` now recommends a larger `AGENT_TIMEOUT` with a `CHAT_TIMEOUT`
+to match, and says plainly which of its numbers are measurements and which are
+headroom. What is worth naming is the shape, because this is the second phase
+in two to hit it: **the routing prompt grows with every tool the codebase
+gains, so every module makes every turn slower, including turns that have
+nothing to do with it.** The named-agent layer `internal/agents` was built for
+— one step that picks an agent, then a routing call offered only that agent's
+tools — is the structural answer, and it stops being an architectural nicety at
+roughly the point this cost crosses a budget somebody has configured. It has
+now done that twice.
+
+# Phase 10b — explicitly deferred
+
+## 69. No weak-topic tracking
+
+10c. `quiz_questions.topic` and `quiz_answers.correct` are recorded and nothing
+reads them. There is no aggregation across attempts, no "you keep missing the
+battery-bank questions", no per-topic score and no endpoint that would return
+one. Recording the evidence is not the same as building the analysis, and the
+analysis needs decisions this phase has no information for — whether one wrong
+answer is a weak topic, how much a right answer three attempts ago counts.
+
+## 70. No spaced repetition and no scheduling
+
+10d. Nothing decides when a quiz should be taken again, and there is no due
+date, interval or ease factor on a quiz, a question or an attempt.
+
+## 71. No sessions and no streaks
+
+10e. An attempt records when it started and when it finished, and nothing
+groups attempts into a session or counts consecutive days.
+
+## 72. No "retry the ones I got wrong"
+
+A new attempt is a new row at the same quiz, with all of its questions. There
+is no attempt that contains a subset, and no quiz generated from another quiz's
+wrong answers. Both are 10c's, because both need to know which questions were
+wrong *across* attempts, which is the aggregation deferred above.
+
+## 73. A quiz cannot be edited
+
+There is no `PATCH /quizzes/{id}`, no endpoint that adds or removes a question,
+and no tool that changes one. A quiz with a question added is a different quiz
+from the one somebody has already sat, and the attempts at the old one would
+silently be scored against the new total. The fix for a bad quiz is to delete
+it — which deletes its attempts, and says so — and generate another.
+
+## 74. No question types but multiple choice
+
+No true/false (which is multiple choice with two options, and can be written as
+one), no free text, no matching, no ordering. Free text is the interesting
+absence: grading it means deciding whether a sentence means the same as another
+sentence, which is the grounding problem again with no document to check
+against.
+
+## 75. No difficulty, and no way to ask for one
+
+A generation takes a document, a topic and a count. There is no "make it
+harder", no difficulty column and nothing that rates a question. A model's
+self-reported difficulty is not a measurement, and the real one — how often
+people get it wrong — is 10c's data.
+
+## 76. The distractors are not checked
+
+Stated above as a decision rather than an absence, and repeated here because it
+is the honest limit of the phase's claim: "every correct answer is in the
+document" is guaranteed, and "every wrong answer is wrong" is asked for in the
+prompt and read by the user on the approval card.
+
+## 77. Quizzes have no screen
+
+The web UI gained nothing this phase. A quiz reaches the user through the API,
+through an approved proposal, or as a citation in an answer — and taking one
+needs a client, which is a UI phase's job.

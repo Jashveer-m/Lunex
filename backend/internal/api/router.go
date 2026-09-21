@@ -127,6 +127,16 @@ func NewRouter(d Deps) http.Handler {
 			r.Mount("/study-plans", d.Study.PlanRoutes())
 			r.Mount("/flashcards", d.Study.FlashcardRoutes())
 
+			// Phase 10b. Taking a quiz is database work too, and more of it
+			// than anything else here: an answer is graded by comparing two
+			// integers. The one thing in this module that calls a model --
+			// writing the questions from a document -- is deliberately not
+			// here for the same reason flashcard generation is not: it is a
+			// proposal the assistant makes, inside the chat turn's own budget.
+			// See study.Handler.QuizRoutes.
+			r.Mount("/quizzes", d.Study.QuizRoutes())
+			r.Mount("/quiz-attempts", d.Study.AttemptRoutes())
+
 			// Phase 5. Managing memories is database work: listing, editing
 			// and deleting rows. The model and the embedder are only involved
 			// in the chat turn that creates one -- and in the re-embed a PATCH

@@ -144,15 +144,19 @@ func (r *Repository) Plans(ctx context.Context, userID uuid.UUID, f Filter) ([]P
 	return out, nil
 }
 
-// qualify puts the table alias on a Sorts fragment. The fragments are written
-// bare -- "lower(title) ASC" -- so they can be read, and the alias is added
-// here rather than baked into the map, which the ?sort= allow-list also
+// qualify puts the study_plans alias on a Sorts fragment. The fragments are
+// written bare -- "lower(title) ASC" -- so they can be read, and the alias is
+// added here rather than baked into the map, which the ?sort= allow-list also
 // reports on.
-func qualify(fragment string) string {
-	if i := strings.Index(fragment, "lower("); i == 0 {
-		return "lower(p." + fragment[len("lower("):]
+func qualify(fragment string) string { return qualified("p", fragment) }
+
+// qualified is the same for any alias. Quizzes sort by their own columns under
+// a different one; see QuizSorts.
+func qualified(alias, fragment string) string {
+	if strings.HasPrefix(fragment, "lower(") {
+		return "lower(" + alias + "." + fragment[len("lower("):]
 	}
-	return "p." + fragment
+	return alias + "." + fragment
 }
 
 func (r *Repository) UpdatePlan(ctx context.Context, userID, id uuid.UUID, p Patch) (Plan, error) {
@@ -364,4 +368,13 @@ func nullString(s string) *string {
 func IsForeignKeyViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
+// IsUniqueViolation identifies a row the schema will only hold once. There is
+// one such constraint in this module -- one answer per question per attempt --
+// and it is what makes "answer twice" impossible rather than merely checked;
+// see migration 000011.
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
