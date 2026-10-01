@@ -214,6 +214,9 @@ func toolSources(tool string, r tools.Result) []Source {
 		out = append(out, Source{Type: SourceQuiz, ID: q.ID, Title: q.Title, Tool: tool,
 			Excerpt: truncate(quizSummary(q), MaxExcerptChars)})
 	}
+	for _, t := range r.WeakTopics {
+		out = append(out, weakTopicSource(t, tool))
+	}
 	// A report has no row behind it, so it carries the zero id: it is a total
 	// the tool computed, not a record the client can open. analyze_spending is
 	// the only tool that produces one, which is why the type is fixed here; a

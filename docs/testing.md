@@ -54,10 +54,15 @@
 | Phase 8 SQL: the overlap query, the interval CHECK, the two cascades, the event node | `internal/db/phase8_integration_test.go` | **yes** |
 | Phase 9 SQL: the numeric column, the summary GROUP BY, the category seed trigger, cascades, the expense node | `internal/db/phase9_integration_test.go` | **yes** |
 | Phase 10a SQL: the computed card count, the two cascades that differ, the ordered passage read, the plan's `project` node | `internal/db/phase10_integration_test.go` | **yes** |
+| Phase 10c SQL: the topic GROUP BY — case-insensitive grouping, untagged questions excluded, open attempts counted, owner scoping, the active-plan flag, a deleted document | `internal/db/phase10c_integration_test.go` | **yes** |
 | Cross-user isolation over the whole stack, documents included | `internal/api/isolation_test.go` | **yes** |
 | Phase 7 over HTTP: propose → approve/reject, concurrency, isolation | `internal/api/actions_isolation_test.go` | **yes** |
 | Phase 8 over HTTP: calendar isolation, foreign links, the required range, overlap, node sync | `internal/api/calendar_isolation_test.go` | **yes** |
 | Phase 9 over HTTP: expense isolation (totals included), foreign links, exact amounts, the seeded categories, node sync | `internal/api/finance_isolation_test.go` | **yes** |
+| Phase 10c over HTTP: `GET /study/weak-topics` from real attempts, cross-user isolation, and the chat turn surfacing only the caller's weak topic | `internal/api/weak_topics_isolation_test.go` | **yes** |
+| Weak topics: the threshold (exhaustively), worst-first order, aggregation over real attempts (fakes) | `internal/study/weak_topics_test.go` | no |
+| `get_weak_topics`: a read, no arguments, the service's figures, the caller's own (fakes) | `internal/tools/weak_topic_tools_test.go` | no |
+| Orchestrator: the weak-topic heuristic, real figures only, the rule against invented commentary (fakes + MockProvider) | `internal/chat/weak_topics_test.go` | no |
 | Phase 10a over HTTP: plan and card isolation, foreign document links, the deck cascade, strict bodies, node sync | `internal/api/study_isolation_test.go` | **yes** |
 | The whole pipeline and the assistant against a real Ollama | `scripts/e2e.sh` | **yes**, plus Ollama |
 
@@ -375,6 +380,30 @@ against the same handbook and the same plan:
 
 `E2E_ONLY=quiz ./scripts/e2e.sh` runs the upload, the plan and this check, and
 skips the flashcard half; `E2E_ONLY=study` runs both.
+
+Since Phase 10c the run ends with the **weak-topic** check, which needs no
+generation — the quiz is written straight through `POST /quizzes`:
+
+- **take a quiz and get some wrong** — one topic answered wrong, wrong, right,
+  wrong over four attempts; another right every time;
+- **one wrong answer is not weak** — after the first attempt the topic must not
+  be in `GET /study/weak-topics`;
+- **the read reflects it exactly** — afterwards the topic must be listed with
+  `answers` 4, `correct` 1, `wrong` 3, `correct_percent` 25, and the topic
+  answered right every time must not be listed;
+- **ask about it** — "How am I doing on Kestrel mast feed timing?" (no routing
+  call) must put a `weak_topic` source in front of the model whose excerpt is
+  `1 of 4 answers correct (25%), 3 of 4 wrong (75%)`, and the answer must give
+  those figures and **no other percentage or "N of M"**;
+- **ask which topics keep going wrong** — the topic must reach the model
+  whichever way the router goes (`get_weak_topics`, or the heuristic if it
+  picks something else; the run prints which), the answer must name it, and
+  must invent no figure;
+- **ask something unrelated** — a greeting must surface no weak topic.
+
+`E2E_ONLY=weak ./scripts/e2e.sh` runs only this. It asserts nothing about
+memories or the graph, so `MEMORY_EXTRACTION=0 GRAPH_EXTRACTION=0` are safe with
+it and save two model calls a turn.
 
 The script builds the API and runs the binary directly, and refuses to start if
 anything already answers on its port (`E2E_PORT`, default 8099). Before Phase 7
@@ -790,3 +819,36 @@ Phase 7:
   the Phase 6 assistant: the read-only rule, one model call, nothing recorded;
 - the `q` filter is case-insensitive, owner-scoped and literal — `50%` finds the
   task containing it, `_` matches nothing it should not.
+
+Phase 10c:
+
+- **the weak-topic rule**, exhaustively rather than by example: no
+  (answers, correct) pair up to 50 is ever weak on fewer than two wrong
+  answers; 60% exactly is not weak; two answers is never enough
+  (`internal/study/weak_topics_test.go`);
+- worst first is lowest rate, then most answers, then name, and 1/3 and 2/6
+  tie exactly (integers, not floats);
+- **cross-user isolation**, end to end and against real SQL: another user's
+  answers — on a quiz with the same topics — never appear in the caller's
+  counts, a user with no answers gets an empty list, and the chat turn of a
+  user with no weak topics carries no `weak_topic` source and nothing about
+  weak areas in its prompt (`internal/api/weak_topics_isolation_test.go`);
+- the SQL groups `"Mast Feed Timing"` and `" mast feed timing "` as one topic
+  under the commonest spelling, leaves untagged questions out, counts answers
+  in open attempts, flips the active-plan flag when the plan is completed, and
+  keeps the evidence when the source document is deleted
+  (`internal/db/phase10c_integration_test.go`);
+- **the heuristic only surfaces real data**: across a spread of study questions
+  every `weak_topic` source is one the service reported, its excerpt carries
+  that topic's counts exactly, and with nothing on record nothing is surfaced
+  (`internal/chat/weak_topics_test.go`);
+- one shared common word is not a mention: "what's the timing of my meeting"
+  does not surface "mast feed timing";
+- the system prompt carries the rule against invented weak-area commentary,
+  with the threshold read from the study module's constants and **no example
+  figure** — an example number in a prompt that is in every turn was caught
+  being repeated as data by the HTTP test;
+- `get_weak_topics` is a read with no arguments: an invented `topic` argument
+  changes nothing, and its result suppresses the heuristic so one topic is not
+  shown twice under two labels.
+

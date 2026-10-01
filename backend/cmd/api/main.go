@@ -259,6 +259,8 @@ func run(logger *slog.Logger) error {
 		Notes:          noteSvc,
 		// Phase 8: what is on in the next day or two, as background.
 		Calendar: calendarSvc,
+		// Phase 10c: weak quiz topics, surfaced when the message is about them.
+		WeakTopics: studySvc,
 		// Phase 7, all three or none.
 		Router:  router,
 		Tools:   toolRunner,

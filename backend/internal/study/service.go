@@ -49,6 +49,11 @@ type Store interface {
 	QuestionForAttempt(ctx context.Context, userID, attemptID, questionID uuid.UUID) (Question, error)
 	CreateAnswer(ctx context.Context, userID, attemptID uuid.UUID, in AnswerInput, correct bool) (Answer, error)
 	CompleteAttempt(ctx context.Context, userID, id uuid.UUID) (Attempt, error)
+
+	// Phase 10c. One read, and no table behind it: the answers grouped by
+	// their question's topic. Owner-scoped through the attempt, like every
+	// other read of quiz_answers.
+	TopicStats(ctx context.Context, userID uuid.UUID) ([]TopicStat, error)
 }
 
 // Library is the slice of internal/documents this module reads.

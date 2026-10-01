@@ -137,6 +137,10 @@ func NewRouter(d Deps) http.Handler {
 			r.Mount("/quizzes", d.Study.QuizRoutes())
 			r.Mount("/quiz-attempts", d.Study.AttemptRoutes())
 
+			// Phase 10c. Weak topics are one GROUP BY over the answers 10b
+			// records -- database work, no model -- so the ordinary budget.
+			r.Mount("/study", d.Study.StudyRoutes())
+
 			// Phase 5. Managing memories is database work: listing, editing
 			// and deleting rows. The model and the embedder are only involved
 			// in the chat turn that creates one -- and in the re-embed a PATCH

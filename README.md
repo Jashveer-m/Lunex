@@ -66,8 +66,17 @@ Personal life-operating-system.
   the questions or the answers — it cannot spoil a quiz, because it is never
   shown one.
 
-Weak-topic tracking, spaced repetition and study sessions are 10c–10e
-and are deliberately absent; so is any review state on a card. Deleting through
+- **Phase 10c** — weak topics: your quiz answers grouped by question topic
+  across every quiz and attempt, and the topics you keep getting wrong — under
+  60% right over at least 3 answers, so one slip never flags anything — at
+  `GET /api/v1/study/weak-topics`. There is no new table: it is one `GROUP BY`
+  over the answers 10b records. The assistant can read it (`get_weak_topics`),
+  and also brings it up on its own when your message names a weak topic, the
+  plan or document it came from, or asks how you are doing — with the real
+  counts ("1 of 4 answers correct (25%)") and never with commentary about weak
+  areas the data does not show.
+
+Spaced repetition and study sessions are 10d–10e and are deliberately absent; so is any review state on a card. Deleting through
 the chat belongs to a later phase. The assistant can change your data
 only by proposing a change you then approve, and nothing — including asking it
 to skip the approval — relaxes that.
@@ -120,7 +129,7 @@ lunex/
 │   └── go.mod
 ├── frontend/              # the web UI (Vite + React)
 ├── docs/                  # api.md, decisions.md, testing.md
-├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule -> spend -> study -> ground -> quiz -> take -> score, against real Postgres and Ollama
+├── scripts/e2e.sh         # upload -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> schedule -> spend -> study -> ground -> quiz -> take -> score -> weak topics, against real Postgres and Ollama
 └── Makefile
 ```
 
@@ -520,6 +529,20 @@ Asked what quizzes you have, the assistant is shown the counts and your best
 score and nothing else — not one question, not one option. It cannot spoil a
 quiz because it was never shown one.
 
+### Weak topics (Phase 10c)
+
+```sh
+curl -s localhost:8080/api/v1/study/weak-topics -H "$AUTH"
+# {"weak_topics":[{"topic":"mast feed timing","answers":4,"correct":1,"wrong":3,
+#   "correct_rate":0.25,"correct_percent":25,"quizzes":1,
+#   "study_plans":["Kestrel relay handbook"],"documents":["relay-handbook.txt"],…}],
+#  "count":1,"threshold":{"max_correct_rate":0.6,"min_answers":3}}
+```
+
+Ask the assistant "how am I doing on mast feed timing?" and it is shown that
+topic's figures as a `weak_topic` source and answers from them. Ask about
+something else and it is shown nothing about weak topics at all.
+
 Every card is checked against the document first. At least two thirds of an
 answer's words have to be in the passages the model was shown, and a figure
 that is not in them drops the card outright — so a plausible invention produces
@@ -596,7 +619,7 @@ Vite proxies `/api` and `/healthz` to `:8080`, so no CORS is involved.
 make build             # go build ./...
 make test              # unit + handler tests, no database and no Ollama needed
 make test-integration  # adds the Postgres-backed tests (needs pgvector)
-make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> study -> ground -> quiz -> take -> score, against a real Ollama
+make test-e2e          # upload -> search -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> study -> ground -> quiz -> take -> score -> weak topics, against a real Ollama
 make migrate-up        # apply migrations
 make migrate-version   # print schema version
 make run               # start the API
@@ -809,10 +832,11 @@ Summarised here, detailed in [docs/decisions.md](docs/decisions.md):
     read by you on the approval card, and nothing here can tell a good one from
     one that happens to be true of a part of the document the model was not
     shown.
-57. **Nothing aggregates how a quiz went.** A `topic` per question and a
-    verdict per answer are recorded and nothing reads them: no weak-topic
-    tracking, no per-topic score, no "retry the ones I got wrong". That is 10c,
-    and this phase's job was to record the evidence rather than analyse it.
+57. **Weak topics say *what*, not *when*, and not how it changed.** Every
+    answer counts the same however old it is, nothing schedules a revisit
+    (10d), there is no per-topic trend, and there is still no "retry the ones I
+    got wrong". Topics are grouped by their exact words, case aside — "mast
+    feed" and "mast feed timing" stay two topics.
 58. **A quiz cannot be edited.** There is no `PATCH /quizzes/{id}` and no way
     to add or remove a question: a quiz with a question added is a different
     quiz from the one you have already sat, and the old attempts would silently

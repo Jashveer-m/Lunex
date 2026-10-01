@@ -3235,7 +3235,7 @@ now done that twice.
 
 ## 69. No weak-topic tracking
 
-10c. `quiz_questions.topic` and `quiz_answers.correct` are recorded and nothing
+*Done in 10c — see "Phase 10c decisions".* 10c. `quiz_questions.topic` and `quiz_answers.correct` are recorded and nothing
 reads them. There is no aggregation across attempts, no "you keep missing the
 battery-bank questions", no per-topic score and no endpoint that would return
 one. Recording the evidence is not the same as building the analysis, and the
@@ -3294,3 +3294,169 @@ prompt and read by the user on the approval card.
 The web UI gained nothing this phase. A quiz reaches the user through the API,
 through an approved proposal, or as a citation in an answer — and taking one
 needs a client, which is a UI phase's job.
+
+# Phase 10c decisions
+
+## Weak topics are a query, not a table
+
+10b recorded the two facts this phase needs — `quiz_questions.topic` and
+`quiz_answers.correct` — precisely so that 10c would be a read. It is: one
+`GROUP BY lower(btrim(topic))` over the caller's answers, joined through the
+attempt (which carries the owner) to the question (which carries the topic). No
+migration, no counter, no flag.
+
+A stored per-topic row would be a second copy of the answers that has to be
+kept in step with them — on every submission, every deleted quiz (which
+cascades its answers away), every deleted question. A computed one cannot
+disagree with its inputs, and the cost is a scan over one user's answers,
+which is small by construction: a person answers tens of questions a day, not
+millions. If that ever stops being true, a materialised view is the next step,
+and the API does not change.
+
+The repository returns *every* topic with its counts; the threshold is applied
+in Go (`study.WeakTopicsOf`). That keeps the rule one function a unit test can
+pin exhaustively, and keeps the SQL the plain aggregate it is.
+
+## The threshold: under 60% correct over at least 3 answers
+
+The brief suggested "under 60% with at least 2 attempts" and asked that a
+topic never be flagged on a single wrong answer. Those two are in tension: at
+two answers, one right and one wrong is 50%, which is under 60% — flagged on
+one slip.
+
+Three is the smallest minimum that makes the property hold at every count.
+Below 60% of *n ≥ 3* answers means more than 0.4·n ≥ 1.2 wrong, so at least
+two. `TestNoTopicIsWeakOnASingleWrongAnswer` checks it for every (answers,
+correct) pair up to 50 rather than by example.
+
+60% itself: on a four-option question guessing scores 25%, and 60% is the line
+between "mostly right" and "wrong about as often as right". It is a constant,
+not a knob — the API returns it beside every result and the chat prompt reads
+it from the same constant, so a client and the assistant cannot mean different
+things by "weak".
+
+An *attempt* is not the unit; an *answer* is. A quiz can ask about the same
+topic twice, and a topic can appear in several quizzes; counting answers is
+what makes "4 of 5" mean what it says. Answers in open attempts count, because
+an answer is graded on submission and is evidence whether or not the attempt
+was closed. Unanswered questions do not count — the score's rule, for the
+score's reason.
+
+## Grouping is case- and space-insensitive, and reports the commonest spelling
+
+The topic is free text a model wrote, per question, per generation. The same
+model writes "Mast feed timing" in one quiz and "mast feed timing" in the next,
+and treating those as two topics would halve the evidence for each and could
+keep both under the minimum. So the key is `lower(btrim(topic))`, and the label
+reported is `mode()` over the trimmed spellings.
+
+What it does not do is any fuzzier merging — "mast feed" and "mast feed
+timing" stay two topics. Stemming or embedding topic names would merge things
+that are genuinely different, silently, and a wrong merge produces a weak topic
+nobody can find the questions for.
+
+## Surfacing in chat is a retrieval source, not a notification
+
+The brief asks for weak topics to come up "proactively" and also forbids a push
+or notification. The reconciliation is that *proactive* means the assistant has
+the figures in front of it without the user having to ask the right tool for
+them — which is what a heuristic retrieval source is. Nothing runs outside a
+turn.
+
+The heuristic (`chat.relevantWeakTopics`) surfaces up to three weak topics when
+the message:
+
+- names a weak topic — every significant word of a one- or two-word topic, or
+  at least two of a longer one;
+- names a study plan or document a weak topic's questions came from, by the
+  same rule; or
+- asks how studying is going ("how am I doing", "what should I study next",
+  "what am I weak at", "revise", "exam" …).
+
+Named topics come first. For the third case with no topic named, topics under
+a still-*active* plan come before the rest — that is the brief's "recently
+active study plan" clause: with nothing named, what the user is currently
+studying is the best guess at what they mean.
+
+The two-word requirement for long topics is measured against the obvious false
+positive: "mast feed timing" and "what's the timing of my meeting" share
+"timing", and a weak topic dropped into a calendar question on the strength of
+one common word is noise the user would rightly find strange. A test pins that
+case.
+
+The heuristic skips itself when `get_weak_topics` already ran this turn: they
+are the same figures, and the same topic under two labels would split the
+citations.
+
+The cost is one aggregate query per turn whose message has any significant word
+in it — the matching needs the topic names, and they live in the answers. That
+is the same order of cost as the task, goal and note heuristics already pay on
+every turn, over a smaller table; a message with no significant word and no
+study phrase ("ok", "thanks!") skips the query entirely.
+
+## A weak-topic source carries finished sentences, and the rule has no example numbers
+
+A `weak_topic` source is a computation, like a `spending` total: no id, and an
+excerpt with every number already written out — `1 of 5 answers correct (20%),
+4 of 5 wrong (80%) · across 2 quizzes · under study plan "Kestrel relay
+handbook" · …`. The percentage is the study service's own rounding, the same
+number the API returns, so a 3B model repeats it rather than dividing.
+
+The wrong share was added after the live run. Shown only "1 of 4 answers
+correct (25%), 3 wrong", llama3.2:3b answered "only 25% of your answers were
+correct, meaning 75% were incorrect" — true, but a number it worked out, which
+is exactly what the rule forbids and what the e2e invented-figure check
+refuses. Writing both shares out leaves it nothing to compute.
+
+The study rule gained a paragraph: a topic is weak only if a `weak_topic`
+source names it; never call any other topic weak, hard or a struggle; with no
+such source, say you found no quiz results showing one; do not guess why.
+
+The first draft of that paragraph included a worked example — *repeat them as
+written, for example "1 of 5 correct (20%)"*. The API test that asks the
+assistant about a weak topic caught the consequence: the mock model, which
+quotes the first figure in the prompt, quoted the example from the system
+prompt instead of the user's data. A real model can do the same, and the system
+prompt is in every turn, so an example figure is a plausible invented statistic
+on offer to every answer. The rule now says "exactly as the source writes them"
+and carries no numbers.
+
+## One read tool, with no arguments
+
+`get_weak_topics` takes nothing. The list is short by construction — only
+topics with enough evidence are in it — and a `topic` argument would be one
+more place for the router to guess a value that empties the result and reads
+as "you have no weak topics", which is a false statement about the user's
+data. The router's grounding check exists for filters like that; not having
+the filter is simpler than grounding it.
+
+The gate gained `weak`, `wrong` and `struggl`. It did not gain "how am I
+doing": that phrase is mostly small talk, and the chat heuristic answers it
+with the same figures without paying for a routing call.
+
+# Phase 10c — explicitly deferred
+
+## 78. No *when* — revisiting is 10d
+
+A weak topic is reported with when it was last answered, and nothing decides
+when it should be revisited. There is no due date, no interval and no decay:
+an answer from three months ago counts exactly as much as one from today.
+Weighting by recency is a scheduling decision and belongs with spaced
+repetition.
+
+## 79. No "retry the ones I got wrong"
+
+Still deferred (72). The aggregate knows which *topics* are weak; building an
+attempt or a quiz out of the questions behind them is a generation and an
+attempt-model change, not a read.
+
+## 80. No per-topic history and no trend
+
+The endpoint reports the totals now, not how they moved. "You were 1 of 5 and
+are now 4 of 6" needs answers bucketed by time, which is a different query and
+a different claim, and nothing asked for it yet.
+
+## 81. Weak topics have no screen
+
+As with quizzes (77): API, tool and chat only. The web UI gained nothing.
+

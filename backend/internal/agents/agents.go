@@ -99,8 +99,14 @@ var (
 		// else: this agent makes study material out of the user's documents
 		// and reads back what they have. It does not take a quiz -- there is
 		// no tool for that, by construction; see tools.StudyService.
+		//
+		// Phase 10c adds one read, get_weak_topics: what the user's quiz
+		// answers add up to by topic. It is still reading back, not advising
+		// -- the numbers are the service's, and the chat prompt's study rule
+		// says the assistant may only call a topic weak when one of them says
+		// so.
 		Tools: []string{
-			tools.SearchStudyPlans, tools.SearchQuizzes,
+			tools.SearchStudyPlans, tools.SearchQuizzes, tools.GetWeakTopics,
 			tools.CreateStudyPlan, tools.GenerateFlashcards, tools.GenerateQuiz,
 		},
 	}

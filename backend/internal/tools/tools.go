@@ -215,7 +215,11 @@ type Result struct {
 	// created. A quiz record carries no questions and no answers; see
 	// quizRecord.
 	Quizzes []study.Quiz
-	Chunks  []documents.SearchResult
+	// WeakTopics are what get_weak_topics worked out: per-topic counts over
+	// the user's quiz answers. Like Reports they are computed rather than
+	// found, and they carry their numbers so the model never has to.
+	WeakTopics []study.TopicStat
+	Chunks     []documents.SearchResult
 	// Reports are figures a tool worked out from the user's records rather
 	// than records it found. They exist for analyze_spending, which answers
 	// "how much did I spend on food this month" with a total: there is no row
@@ -242,7 +246,7 @@ type Report struct {
 // one thing the model is shown and one thing it can cite.
 func (r Result) Count() int {
 	return len(r.Tasks) + len(r.Goals) + len(r.Notes) + len(r.Events) +
-		len(r.Expenses) + len(r.Plans) + len(r.Quizzes) + len(r.Chunks) + len(r.Reports)
+		len(r.Expenses) + len(r.Plans) + len(r.Quizzes) + len(r.WeakTopics) + len(r.Chunks) + len(r.Reports)
 }
 
 // define builds a Tool whose canonical input is the Go type In.

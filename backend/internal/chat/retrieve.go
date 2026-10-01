@@ -150,6 +150,16 @@ func (s *Service) retrieve(ctx context.Context, userID uuid.UUID, question strin
 	}
 	out = append(out, linked...)
 
+	// Weak topics sit with the graph: they are surfaced only when the message
+	// names one (or asks how studying is going), which makes them targeted
+	// rather than background, and what they carry is computed figures rather
+	// than the user's own words.
+	weak, err := s.weakTopics(ctx, userID, question, first)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, weak...)
+
 	soon, err := s.upcomingEvents(ctx, userID)
 	if err != nil {
 		return nil, err

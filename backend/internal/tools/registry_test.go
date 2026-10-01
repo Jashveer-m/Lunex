@@ -182,7 +182,7 @@ func TestPrepareNeverWrites(t *testing.T) {
 
 // --- declarations ---------------------------------------------------------------
 
-func TestStandardToolsAreTheBriefsEighteen(t *testing.T) {
+func TestStandardToolsAreTheBriefsNineteen(t *testing.T) {
 	w := newWorld()
 	var reads, writes []string
 	for _, tool := range w.reg.Tools() {
@@ -195,7 +195,7 @@ func TestStandardToolsAreTheBriefsEighteen(t *testing.T) {
 	}
 	sort.Strings(reads)
 	sort.Strings(writes)
-	if want := []string{AnalyzeSpending, SearchCalendar, SearchDocuments, SearchExpenses,
+	if want := []string{AnalyzeSpending, GetWeakTopics, SearchCalendar, SearchDocuments, SearchExpenses,
 		SearchGoals, SearchNotes, SearchQuizzes, SearchStudyPlans, SearchTasks}; !slices.Equal(reads, want) {
 		t.Fatalf("read tools = %v, want %v", reads, want)
 	}

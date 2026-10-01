@@ -48,7 +48,8 @@
 # nothing else -- a few minutes rather than most of an hour on a slow machine.
 # E2E_ONLY=calendar does the same for the calendar check, E2E_ONLY=finance for
 # the finance one, and E2E_ONLY=study for the study one -- which uploads its own
-# document, so it stands alone.
+# document, so it stands alone. E2E_ONLY=weak runs the Phase 10c weak-topic
+# check, which writes its own quiz and needs no generation.
 #
 # Nothing here is mocked: real Postgres, real pgvector, real Ollama, real
 # generation, real extraction.
@@ -250,6 +251,13 @@ out = {
     # carry counts and no questions.
     "tool_excerpts": " | ".join(s.get("excerpt", "") for s in sources if s.get("tool")),
     "tool_cited": len([s for s in sources if s.get("tool") and s["cited"]]),
+    # Phase 10c: the weak-topic sources, whichever way they arrived -- the
+    # get_weak_topics tool (tool set) or the chat heuristic (no tool).
+    "weak_count": len([s for s in sources if s["type"] == "weak_topic"]),
+    "weak_titles": ",".join(s["title"] for s in sources if s["type"] == "weak_topic"),
+    "weak": " | ".join(s.get("excerpt", "") for s in sources if s["type"] == "weak_topic"),
+    "weak_cited": len([s for s in sources if s["type"] == "weak_topic" and s["cited"]]),
+    "weak_tool": ",".join(sorted({s.get("tool") or "heuristic" for s in sources if s["type"] == "weak_topic"})),
 }
 print(out[want])
 PYEOF
@@ -1693,11 +1701,126 @@ printf '     %s\n' "$(sse "${LOOKQ}" answer | tr '\n' ' ' | head -c 300)"
 
 fi # E2E_ONLY: study / quiz only
 
+# --- Phase 10c: weak topics ----------------------------------------------------------
+#
+# The brief's check: take a quiz, get some answers wrong, confirm the weak-topic
+# read reflects it exactly, then ask the assistant about it and confirm the
+# answer carries the real topic with the real numbers.
+#
+# The quiz is written straight through POST /quizzes -- the path an approved
+# generate_quiz takes -- so this section costs no generation, and its topic is
+# one no generated quiz will have named. E2E_ONLY=weak runs only this.
+if [ -z "${E2E_ONLY:-}" ] || [ "${E2E_ONLY:-}" = "weak" ]; then
+
+WEAK_TOPIC="kestrel mast feed timing"
+
+# weak_topic <field> -- one field of this section's topic in GET
+# /study/weak-topics, or "absent".
+weak_topic() {
+  local body
+  body=$(curl -s "${API}/api/v1/study/weak-topics" -H "${AUTH}")
+  expect "reading the weak topics" "${body}" \
+    "next((str(t['$1']) for t in d['weak_topics'] if t['topic'].lower() == '${WEAK_TOPIC}'), 'absent')"
+}
+
+step "Making a quiz to get wrong"
+WQUIZ=$(curl -s -X POST "${API}/api/v1/quizzes" -H "${AUTH}" -H 'Content-Type: application/json' -d '{
+  "title": "Weak-topic check",
+  "questions": [
+    {"question": "When does the mast feed switch to the backup line?", "options": ["At 58.4 volts", "At dawn", "Never"],
+     "correct_index": 0, "topic": "Kestrel mast feed timing"},
+    {"question": "What colour is the battery-bank fuse?", "options": ["Amber", "Blue"],
+     "correct_index": 0, "topic": "kestrel battery fuse"}
+  ]}')
+WQUIZ_ID=$(expect "creating the quiz" "${WQUIZ}" 'd["id"]')
+WQUESTIONS=$(expect "reading its questions" "${WQUIZ}" '" ".join(q["id"] for q in d["questions"])')
+read -r MAST_Q FUSE_Q <<<"${WQUESTIONS}"
+ok "quiz ${WQUIZ_ID} with two questions"
+
+# sit <mast-index> -- one attempt: the mast question answered as given, the
+# fuse question always right.
+sit() {
+  local attempt id
+  attempt=$(curl -s -X POST "${API}/api/v1/quizzes/${WQUIZ_ID}/attempts" -H "${AUTH}")
+  id=$(expect "starting an attempt" "${attempt}" 'd["id"]')
+  for pair in "${MAST_Q}:$1" "${FUSE_Q}:0"; do
+    curl -s -o /dev/null -X POST "${API}/api/v1/quiz-attempts/${id}/answers" -H "${AUTH}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"question_id\":\"${pair%%:*}\",\"selected_index\":${pair##*:}}"
+  done
+  curl -s -o /dev/null -X POST "${API}/api/v1/quiz-attempts/${id}/complete" -H "${AUTH}"
+}
+
+step "Taking it: the mast question wrong, wrong, right, wrong"
+sit 1
+[ "$(weak_topic answers)" = "absent" ] || fail "one wrong answer already made a weak topic"
+ok "after one wrong answer: not a weak topic"
+sit 2
+sit 0
+sit 1
+for field in answers:4 correct:1 wrong:3 correct_percent:25 quizzes:1; do
+  got=$(weak_topic "${field%%:*}")
+  [ "${got}" = "${field##*:}" ] || fail "weak topic ${field%%:*} = ${got}, want ${field##*:}: $(curl -s "${API}/api/v1/study/weak-topics" -H "${AUTH}")"
+done
+FUSE=$(curl -s "${API}/api/v1/study/weak-topics" -H "${AUTH}" | json '[t for t in d["weak_topics"] if "fuse" in t["topic"]]')
+[ "${FUSE}" = "[]" ] || fail "a topic answered right every time is listed as weak: ${FUSE}"
+ok "GET /study/weak-topics: ${WEAK_TOPIC}, 1 of 4 correct (25%); the fuse topic is not listed"
+
+# has_our_figures <answer> -- the answer repeats the real numbers, in either of
+# the two forms the source writes them.
+has_our_figures() { echo "$1" | grep -qiE "(25 ?%|1 of 4|one of (the )?four)"; }
+# invents_figures <answer> -- a percentage or "N of M" the source did not
+# write: 1 of 4 and 25% correct, 3 of 4 and 75% wrong -- or the rule's own
+# 60% threshold, which the system prompt states and a model may quote.
+invents_figures() {
+  echo "$1" | grep -oiE "[0-9]+ ?%|[0-9]+ of [0-9]+" | grep -viE "^(25 ?%|75 ?%|60 ?%|1 of 4|3 of 4)$" | grep -q .
+}
+
+step "Asking the assistant about the topic"
+WEAK_CONV=$(curl -s -X POST "${API}/api/v1/conversations" -H "${AUTH}" -H 'Content-Type: application/json' -d '{}' | json 'd["id"]')
+WEAK1="$(mktemp)"
+ask "${WEAK_CONV}" "How am I doing on Kestrel mast feed timing?" "${WEAK1}"
+sse "${WEAK1}" answer >/dev/null || fail "the weak-topic turn failed"
+[ "$(sse "${WEAK1}" weak_count)" -ge 1 ] || fail "no weak-topic source reached the model: types $(sse "${WEAK1}" types)"
+sse "${WEAK1}" weak | grep -q "1 of 4 answers correct (25%), 3 of 4 wrong (75%)" \
+  || fail "the weak-topic source does not carry the real figures: $(sse "${WEAK1}" weak)"
+ok "the model was shown: $(sse "${WEAK1}" weak | head -c 160)"
+ANSWER1="$(sse "${WEAK1}" answer)"
+printf '     %s\n' "$(echo "${ANSWER1}" | tr '\n' ' ' | head -c 300)"
+has_our_figures "${ANSWER1}" || fail "the answer does not give the real figures (1 of 4, 25%)"
+invents_figures "${ANSWER1}" && fail "the answer states a figure the data does not have"
+[ "$(sse "${WEAK1}" weak_cited)" -ge 1 ] \
+  || printf '  \033[33mwarn\033[0m the answer used the figures without citing the source\n'
+ok "the answer names the real figures and invents none"
+
+step "Asking which topics keep going wrong"
+WEAK2="$(mktemp)"
+ask "${WEAK_CONV}" "Which quiz topics do I keep getting wrong?" "${WEAK2}"
+sse "${WEAK2}" answer >/dev/null || fail "the second weak-topic turn failed"
+sse "${WEAK2}" weak_titles | grep -qi "${WEAK_TOPIC}" \
+  || fail "the weak topic did not reach the model: types $(sse "${WEAK2}" types), action $(sse "${WEAK2}" action)"
+ok "the weak topic reached the model via: $(sse "${WEAK2}" weak_tool)"
+ANSWER2="$(sse "${WEAK2}" answer)"
+printf '     %s\n' "$(echo "${ANSWER2}" | tr '\n' ' ' | head -c 300)"
+echo "${ANSWER2}" | grep -qi "mast feed" || fail "the answer does not name the weak topic"
+invents_figures "${ANSWER2}" && fail "the answer states a figure the data does not have"
+ok "the answer names the weak topic and invents no figures"
+
+step "Asking something unrelated"
+WEAK3="$(mktemp)"
+ask "${WEAK_CONV}" "Good morning!" "${WEAK3}"
+sse "${WEAK3}" answer >/dev/null || fail "the greeting turn failed"
+[ "$(sse "${WEAK3}" weak_count)" = "0" ] || fail "a greeting surfaced a weak topic: $(sse "${WEAK3}" weak)"
+ok "a greeting surfaces no weak topic"
+
+fi # E2E_ONLY: weak only
+
 case "${E2E_ONLY:-}" in
   actions)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> created ; ask -> propose -> reject -> nothing ; find\n' ;;
   calendar) printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> on the calendar -> node -> read back\n' ;;
   finance)  printf '\n\033[32mPASS\033[0m ask -> propose -> approve -> recorded -> node -> totalled -> not advised\n' ;;
   study)    printf '\n\033[32mPASS\033[0m upload -> plan -> node -> generate -> propose (with the cards) -> approve -> saved -> grounded -> read back -> quiz -> take -> score\n' ;;
+  weak)     printf '\n\033[32mPASS\033[0m quiz -> wrong answers -> weak topic (exact counts) -> asked -> real figures, none invented\n' ;;
   quiz)     printf '\n\033[32mPASS\033[0m upload -> plan -> generate -> propose (with the answer key) -> approve -> saved -> take -> grade -> score -> grounded -> read back\n' ;;
-  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total -> study -> generate -> ground -> quiz -> take -> score\n' ;;
+  *)        printf '\n\033[32mPASS\033[0m upload -> chunk -> embed -> retrieve -> ask -> cite -> remember -> recall -> link -> traverse -> propose -> approve -> reject -> schedule -> spend -> total -> study -> generate -> ground -> quiz -> take -> score -> weak topics\n' ;;
 esac

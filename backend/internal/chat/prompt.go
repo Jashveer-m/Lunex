@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jashveer/lifeos/backend/internal/ai"
+	"github.com/jashveer/lifeos/backend/internal/study"
 )
 
 // Retrieval budget. These are the numbers that decide how much of the user's
@@ -179,13 +180,27 @@ const proposalRule = `11. You never change the user's data yourself. When the us
 // rule 3's general "do not invent" does not cover, because here the thing
 // would not be invented, it would be real and spoiled.
 //
-// The last sentence is about what the assistant cannot do rather than what it
-// must not say, and it is true by construction: there is no tool that starts,
-// answers or completes an attempt, because tools.StudyService names no such
-// method. The rule says so because a model asked "quiz me" will otherwise
+// The weak-topic paragraph is Phase 10c's, and it deliberately has no worked
+// example with numbers in it: this prompt is in every turn, and an example
+// figure is one a model can repeat as if it were the user's -- the exact
+// invention the paragraph forbids. (The API test that asks the assistant about
+// a weak topic caught the first draft doing this.)
+//
+// It is the grounding rule aimed at the one invention a study assistant
+// reaches for most readily: "you seem to struggle with X". The heuristic only
+// ever puts real figures in front of the model; this is the half that stops it
+// producing the same sentence with no figures behind it, including when the
+// user asks "what am I weak at" and the answer is that their quizzes show
+// nothing.
+//
+// The last sentence of the quiz paragraph is about what the assistant cannot
+// do rather than what it must not say, and it is true by construction: there
+// is no tool that starts, answers or completes an attempt, because
+// tools.StudyService names no such method. The rule says so because a model asked "quiz me" will otherwise
 // improvise an attempt in the chat and report a score nothing recorded.
 const studyRule = `9. A source of type "study_plan" is something the user is studying. It says what the plan is called, whether it is active, which of their documents it was built from, and how many flashcards are filed under it. The cards themselves are NOT in the context: you are told how many there are and nothing about what any of them says. Never state, quote, summarise or guess the content of a flashcard -- if the user asks what is on their cards, say you can see the plan and the number of cards but not the cards, and tell them to open the plan. A flashcard's answer comes from the user's own document, not from you: do not present one as a fact you are vouching for, and do not correct one.
-A source of type "quiz" is a quiz the user made from one of their documents. It says what the quiz is called, how many questions it has, how many times they have taken it and their best score, written out as "best 4 of 6" -- repeat a score as it is written and never work out a percentage. The questions, the options and the answers are NOT in the context. Never state, quote, summarise or guess what a quiz asks or what the answer to any question is, even if the user asks you to, and never ask the user a question from one or mark an answer: taking a quiz happens in the app, not in this conversation, so tell them to open it. You cannot start, answer or finish an attempt.`
+A source of type "quiz" is a quiz the user made from one of their documents. It says what the quiz is called, how many questions it has, how many times they have taken it and their best score, written out as "best 4 of 6" -- repeat a score as it is written and never work out a percentage. The questions, the options and the answers are NOT in the context. Never state, quote, summarise or guess what a quiz asks or what the answer to any question is, even if the user asks you to, and never ask the user a question from one or mark an answer: taking a quiz happens in the app, not in this conversation, so tell them to open it. You cannot start, answer or finish an attempt.
+A source of type "weak_topic" is a quiz topic the user's own answers show they keep getting wrong: fewer than %WEAKPERCENT%% of at least %WEAKMIN% answers on it were right. Its figures are already worked out -- repeat them exactly as the source writes them, cite it, and never work out a number yourself. A topic is weak only if a weak_topic source names it: never call any other topic weak, hard or a struggle for the user, and if there is no weak_topic source in the context, do not describe their weak areas at all -- say you found no quiz results showing one. Do not guess why they got a topic wrong.`
 
 // financeRule is rule 10: what a spending total is, and what the assistant may
 // and may not do with it.
@@ -198,6 +213,14 @@ A source of type "quiz" is a quiz the user made from one of their documents. It 
 // rule in front of it will answer confidently.
 const financeRule = `10. A source of type "spending" is a set of totals added up from the expenses the user recorded themselves. The figures in it have already been worked out: repeat them as they are written, with the currency and the period they name, and never add, re-total or convert anything yourself. Totals in different currencies are separate; nothing here converts between them. They cover only what the user recorded -- money they never entered is not in them -- so do not describe them as their income, their savings, their budget or their whole financial position. You are not a financial adviser, an accountant or a regulated professional, and you must not present yourself as one or imply that you are. Describe what the user's own records show; do not tell them what to do with their money. That means: no advice to invest, save, borrow, buy, sell, switch, refinance or move money, no telling them a category is too high or that they should spend less on something, no forecasts of what they will spend, and no budgets or targets. If they ask what they should do with their money, say plainly that you can show them what their own records say but cannot give financial advice, and then show them.`
 
+// weakTopicRule fills the weak-topic threshold into the study rule from the
+// study module's own constants, so the prompt and the API cannot disagree
+// about what "weak" means.
+func weakTopicRule(rule string) string {
+	rule = strings.Replace(rule, "%WEAKPERCENT%", strconv.Itoa(int(study.WeakTopicMaxCorrectRate*100)), 1)
+	return strings.Replace(rule, "%WEAKMIN%", strconv.Itoa(study.WeakTopicMinAnswers), 1)
+}
+
 // systemPromptFor is the system prompt with the action rule that matches what
 // the assistant can actually do.
 func systemPromptFor(toolsEnabled bool) string {
@@ -205,7 +228,7 @@ func systemPromptFor(toolsEnabled bool) string {
 	if toolsEnabled {
 		rule = proposalRule
 	}
-	out := strings.Replace(systemPrompt, "%STUDYRULE%", studyRule, 1)
+	out := strings.Replace(systemPrompt, "%STUDYRULE%", weakTopicRule(studyRule), 1)
 	out = strings.Replace(out, "%FINANCERULE%", financeRule, 1)
 	return strings.Replace(out, "%ACTIONRULE%", rule, 1)
 }

@@ -95,6 +95,10 @@ type (
 		Quizzes(ctx context.Context, userID uuid.UUID, f study.QuizFilter) ([]study.Quiz, error)
 		ProposeQuiz(ctx context.Context, userID uuid.UUID, in study.GenerateQuizInput) (study.QuizProposal, error)
 		CreateQuiz(ctx context.Context, userID uuid.UUID, in study.CreateQuizInput) (study.Quiz, error)
+
+		// Phase 10c. A read of a computation: the topics the user's quiz
+		// answers are below the bar on, worked out from the answers.
+		WeakTopics(ctx context.Context, userID uuid.UUID) ([]study.TopicStat, error)
 	}
 )
 
@@ -161,6 +165,9 @@ const (
 	// something the assistant proposes. See StudyService.
 	SearchQuizzes = "search_quizzes"
 	GenerateQuiz  = "generate_quiz"
+	// GetWeakTopics is Phase 10c's one tool, and a read: it reports what the
+	// user's quiz answers add up to by topic, and changes nothing.
+	GetWeakTopics = "get_weak_topics"
 )
 
 // Standard returns the tools, read tools first.
@@ -183,6 +190,7 @@ func Standard(s Services) []Tool {
 		analyzeSpendingTool(s),
 		searchStudyPlansTool(s),
 		searchQuizzesTool(s),
+		getWeakTopicsTool(s),
 		createTaskTool(s),
 		updateTaskTool(s),
 		createGoalTool(s),

@@ -78,6 +78,13 @@ var toolCues = []string{
 	// and a false positive costs one routing call and nothing else.
 	"quiz", "flashcard", "card", "deck", "stud", "revis", "exam", "test",
 	"practi", "learn", "memoris", "memoriz",
+	// Phase 10c: how the questions get_weak_topics answers are asked --
+	// "what am I weak at", "what do I keep getting wrong", "where am I
+	// struggling". "wrong" errs long ("what's wrong with the heater"), and a
+	// false positive costs one routing call. "How am I doing" is deliberately
+	// not a cue: it is mostly small talk, and the chat turn's weak-topic
+	// heuristic surfaces the figures for it without a routing call.
+	"weak", "wrong", "struggl",
 	// asking to find something
 	"find", "search", "look", "show", "list", "which", "mention", "open", "pending",
 	// asking to remove something: no tool can, and the router says so --

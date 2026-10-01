@@ -460,6 +460,9 @@ type fakeStudy struct {
 	quizProposals  []study.GenerateQuizInput
 	proposeQuiz    []study.NewQuestion
 	proposeQuizErr error
+
+	// Phase 10c: what WeakTopics answers, per owner.
+	weak map[uuid.UUID][]study.TopicStat
 }
 
 func newFakeStudy() *fakeStudy {
@@ -471,6 +474,7 @@ func newFakeStudy() *fakeStudy {
 			{Front: "What does the generator need?", Back: "A new fuel filter."},
 		},
 		quizzes: map[uuid.UUID][]study.Quiz{},
+		weak:    map[uuid.UUID][]study.TopicStat{},
 		proposeQuiz: []study.NewQuestion{
 			{
 				Question:     "How long did the aurora last?",
@@ -779,4 +783,13 @@ func (w *world) totalWrites() int {
 	f := len(w.finance.creates)
 	w.finance.mu.Unlock()
 	return w.tasks.writes() + g + n + c + f + w.study.writes()
+}
+
+func (f *fakeStudy) WeakTopics(_ context.Context, userID uuid.UUID) ([]study.TopicStat, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]study.TopicStat(nil), f.weak[userID]...), nil
 }

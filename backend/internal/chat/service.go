@@ -80,6 +80,8 @@ type Options struct {
 //
 // Calendar is optional on the same terms as the four below: a nil one is an
 // assistant that retrieves what Phase 7 did, with no calendar in its context.
+// WeakTopics (Phase 10c) is optional on the same terms: a nil one is an
+// assistant with no weak quiz topics in its context.
 //
 // Four of them are optional and independently so: a nil Memories is an
 // assistant that retrieves exactly what Phase 4 did, a nil MemoryExtractor is
@@ -104,6 +106,7 @@ type Deps struct {
 	Goals           GoalLister
 	Notes           NoteLister
 	Calendar        EventLister
+	WeakTopics      WeakTopicLister
 	Router          ToolRouter
 	Tools           ToolRunner
 	Actions         ActionLog
@@ -127,6 +130,7 @@ type Service struct {
 	goals     GoalLister
 	notes     NoteLister
 	calendar  EventLister
+	study     WeakTopicLister
 	router    ToolRouter
 	tools     ToolRunner
 	actions   ActionLog
@@ -158,6 +162,7 @@ func NewService(d Deps) *Service {
 		docs: d.Documents, memories: d.Memories, extractor: d.MemoryExtractor,
 		graph: d.Graph, linker: d.GraphExtractor,
 		tasks: d.Tasks, goals: d.Goals, notes: d.Notes, calendar: d.Calendar,
+		study:  d.WeakTopics,
 		router: d.Router, tools: d.Tools, actions: d.Actions, agent: agent,
 		log: log, opts: opts, now: time.Now,
 	}

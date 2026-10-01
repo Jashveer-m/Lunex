@@ -1135,6 +1135,84 @@ is not a review.
 
 ---
 
+## Weak topics
+
+Phase 10c. What the caller's quiz answers add up to, topic by topic, across
+every quiz and every attempt — and which topics are below the bar. There is no
+table behind it: it is one `GROUP BY` over `quiz_answers` joined to
+`quiz_questions.topic`, worked out on every read, so it cannot drift from the
+answers and a topic that stops being weak stops being reported.
+
+**The rule.** A topic is *weak* when **fewer than 60%** of **at least 3**
+answers to questions on it were right. The minimum is three, not two, for an
+arithmetical reason: below 60% of three or more answers means at least two
+wrong, so no topic is ever flagged on a single wrong answer (at two answers, one
+slip is 50%). Both numbers are returned with every response.
+
+What counts: every graded answer the caller has given, in finished attempts and
+open ones alike (an answer is graded when it is submitted). Unanswered
+questions are not counted, the same rule the score follows. Questions with no
+topic are left out rather than grouped as "untagged". Topics are grouped case-
+and space-insensitively — `"Mast feed timing"` and `" mast feed timing"` are one
+topic — and reported under their most common spelling.
+
+### `GET /api/v1/study/weak-topics`
+
+`200 OK` — the weak topics, worst first: lowest correct rate, then most
+answers, then by name.
+
+```sh
+curl -s localhost:8080/api/v1/study/weak-topics -H "$AUTH"
+```
+
+```json
+{
+  "weak_topics": [
+    {
+      "topic": "mast feed timing",
+      "answers": 5,
+      "correct": 1,
+      "wrong": 4,
+      "correct_rate": 0.2,
+      "correct_percent": 20,
+      "quizzes": 2,
+      "study_plans": ["Kestrel relay handbook"],
+      "documents": ["relay-handbook.txt"],
+      "last_answered_at": "2026-09-30T10:12:44Z"
+    }
+  ],
+  "count": 1,
+  "threshold": { "max_correct_rate": 0.6, "min_answers": 3 }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `answers`, `correct`, `wrong` | Counts over every answer to a question on this topic |
+| `correct_rate` | `correct / answers`, rounded to four places |
+| `correct_percent` | The same, as a whole rounded percentage — the number the assistant is shown |
+| `quizzes` | How many different quizzes the answers came from |
+| `study_plans` | Titles of the plans those quizzes are filed under (any status) |
+| `documents` | Filenames those quizzes were made from; a deleted document drops out, its answers do not |
+| `last_answered_at` | When a question on this topic was last answered |
+
+An empty list is `{"weak_topics": [], "count": 0, ...}`. Another user's answers
+never appear; there is no id in the path to probe.
+
+**In the assistant.** The same figures reach the chat in two ways. The
+`get_weak_topics` read tool returns them when the router chooses it ("what am
+I weak at?", "which topics do I keep getting wrong?"). And on every turn, a
+light heuristic adds up to three of them as `weak_topic` sources when — and
+only when — the message names a weak topic, names a study plan or document a
+weak topic's questions came from, or asks how studying is going ("how am I
+doing", "what should I study next"); with no topic named, topics under an
+active plan come first. A `weak_topic` source has no `id` (it is a computation,
+like a `spending` total) and its excerpt is the figures written out:
+`1 of 5 answers correct (20%), 4 of 5 wrong (80%) · across 2 quizzes · …`. The system
+prompt forbids calling any topic weak that no `weak_topic` source names.
+
+---
+
 ## Documents
 
 Upload a file, and the API extracts its text, splits it into overlapping
@@ -1488,6 +1566,7 @@ yourself.
 | Memories | Phase 5's vector search over the caller's enabled memories: top 5 above `MEMORY_MIN_SIMILARITY` |
 | A tool the assistant chose | Phase 7: at most one search per turn — `search_tasks`, `search_goals`, `search_notes` or `search_documents` — with a query the model picked, up to 5 results. These come **first**, marked with `tool` |
 | Knowledge graph | Phase 6's 1-hop lookup: up to 3 nodes whose label the question names as a whole word, each with what it is connected to |
+| Weak topics | Phase 10c: up to 3 of the caller's weak quiz topics, only when the message names one (or its plan or document) or asks how studying is going. See [Weak topics](#weak-topics) |
 | Tasks | Up to 5: in progress by recency, then pending by nearest deadline |
 | Goals | Up to 5 active goals by nearest deadline |
 | Notes | The 3 most recently updated |
@@ -1900,6 +1979,7 @@ none can delete.
 | `create_study_plan` | write | title, and optionally a description and one of your uploaded documents |
 | `generate_flashcards` | write | writes flashcards from one of your documents and proposes them — **the cards themselves are the proposal** |
 | `search_quizzes` | read | your quizzes: what each is on, how big it is, how many times you have taken it and your best score. **Never the questions or the answers** |
+| `get_weak_topics` | read | the quiz topics your answers are below the bar on (under 60% right over at least 3 answers), worst first, with the counts. No arguments |
 | `generate_quiz` | write | writes multiple-choice questions from one of your documents and proposes them — **the questions, their options and the answer key are the proposal** |
 
 **A read runs during the turn.** When a message looks like it asks to find

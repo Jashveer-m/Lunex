@@ -122,8 +122,9 @@ func newServerWithProvider(t *testing.T, pool *sql.DB, provider *ai.Mock) *httpt
 		Documents: docSvc, Memories: memorySvc, MemoryExtractor: memorySvc,
 		Graph: graphSvc, GraphExtractor: graphSvc,
 		Tasks: taskSvc, Goals: goalSvc, Notes: noteSvc, Calendar: calendarSvc,
-		Router: agents.NewRouter(provider, registry, discard, agents.Options{}),
-		Tools:  registry, Actions: actionSvc,
+		WeakTopics: studySvc,
+		Router:     agents.NewRouter(provider, registry, discard, agents.Options{}),
+		Tools:      registry, Actions: actionSvc,
 		Logger: discard,
 		Options: chat.Options{
 			// The memory floor is named here rather than left at its default.

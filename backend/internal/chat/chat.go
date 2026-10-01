@@ -137,6 +137,13 @@ const (
 	// exists to withhold until it is answered, so an assistant that could see
 	// them could spoil one by being helpful. See the study rule in prompt.go.
 	SourceQuiz = "quiz"
+	// SourceWeakTopic is a topic the user's own quiz answers show they keep
+	// getting wrong, with the counts that show it. Like a spending total it is
+	// a computation rather than a record, so it has no id; and like one, it
+	// exists so the arithmetic is done before the model sees it. It is the
+	// only source the assistant may call a "weak area" from -- see the study
+	// rule in prompt.go.
+	SourceWeakTopic = "weak_topic"
 )
 
 // Source is one retrieved item, recorded on the assistant message that was

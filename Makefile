@@ -33,10 +33,14 @@ test-integration:
 # appears in the uploaded document -- and then asks for a quiz from the same
 # handbook, checks the proposal shows every question with its options and the
 # answer key, approves it, takes it, and checks the score is the one the
-# answers support and every correct answer is in the document.
+# answers support and every correct answer is in the document -- and last
+# takes a quiz with some answers wrong, checks GET /study/weak-topics has the
+# exact counts, and asks the assistant about the topic, whose answer must give
+# those figures and invent none.
 # E2E_ONLY=actions runs just the action part, E2E_ONLY=calendar just the
 # calendar part, E2E_ONLY=finance just the finance part, E2E_ONLY=study the
-# study part (flashcards and quizzes) and E2E_ONLY=quiz just the quiz part.
+# study part (flashcards and quizzes), E2E_ONLY=quiz just the quiz part and
+# E2E_ONLY=weak just the weak-topic part.
 # Needs Postgres with pgvector and a running Ollama; see docs/testing.md.
 test-e2e:
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" ./scripts/e2e.sh
